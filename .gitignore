@@ -1,0 +1,20 @@
+# environments and build output
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+build/
+.pio/
+*.o
+*.elf
+*.hex
+
+# third-party code and fetched material (not ours to redistribute)
+compare/third_party/
+compare/audit/upstream/
+
+# large / regenerable data
+*.npz
+*.npy
+*.csv
+validate/results/*.out

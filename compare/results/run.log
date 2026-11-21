@@ -1,0 +1,207 @@
+model=phys  T=0.45  Qf=QF_TINY_PHYS  reference for gap: ours-python (continuous optimum), J_ref = 122.3327542
+row                                           J_cont       gap   gap_rel     viol  |x(T)|    iter  t_py[us] t_cpp[us]
+---------------------------------------------------------------------------------------------------------------------
+ours-python                               122.332754  0.00e+00  0.00e+00  2.8e-13  4.0859     452 56864003.3         -
+ours-cpp                                 PENDING (RuntimeError: lqocp_cli TINY is stale: its horizon is T=0.5, not 0.45 (Revision 5); reported cost 11)
+OSQP dt=0.0005 exactZOH (ref)             122.332766  1.23e-05  1.00e-07  2.7e-11  4.0859   12350 3999748.0 3979152.7
+OSQP dt=0.05 exactZOH                     122.534459  2.02e-01  1.65e-03  1.1e-16  4.1820     225    1739.2    1076.6
+OSQP dt=0.01 exactZOH                     122.358059  2.53e-02  2.07e-04  2.3e-14  4.0908     425   11634.1   10044.7
+OSQP dt=0.005 exactZOH                    122.342308  9.55e-03  7.81e-05  1.9e-13  4.0879     375   21014.6   18121.8
+OSQP dt=0.05 tinyQP-pub                   122.605054  2.72e-01  2.23e-03  2.2e-16  4.6451     225    1399.6     913.8
+OSQP dt=0.05 tinyQP-lib                   123.384291  1.05e+00  8.60e-03  2.0e-15  3.8300     375    1929.3    1456.8
+TinyMPC-pub dt=0.05 example               122.729270  3.97e-01  3.24e-03  0.0e+00  4.6605    5752   14601.3    7182.5
+TinyMPC-pub dt=0.05 teensy-bench          122.837066  5.04e-01  4.12e-03  0.0e+00  4.6672   4000*    5736.3    4728.6
+TinyMPC-pub dt=0.05 tight                 122.605054  2.72e-01  2.23e-03  0.0e+00  4.6451   10313   14866.8   12276.7
+TinyMPC-pub closed-loop (example)         137.604093  1.53e+01  1.25e-01  0.0e+00  4.0981 11.4/st*       5.5       3.1
+TinyMPC-lib2rho dt=0.05 example           123.391015  1.06e+00  8.65e-03  0.0e+00  3.8298    5881    8977.9    7274.4
+TinyMPC-lib2rho dt=0.05 teensy-bench      123.900706  1.57e+00  1.28e-02  0.0e+00  3.8268   4000*    5445.9    4730.2
+TinyMPC-lib2rho dt=0.05 tight             123.384221  1.05e+00  8.60e-03  0.0e+00  3.8300   90330  123058.2  107162.5
+TinyMPC-lib2rho closed-loop (example)     137.772608  1.54e+01  1.26e-01  0.0e+00  3.7440 8.8/st*       3.8       3.1
+
+EXTRAPOLATIONS (not TinyMPC's problem: its terminal weight dt*(Pinf-rho) changes with dt, so these
+TinyMPC rows solve a different terminal cost than TINY_CASE):
+---------------------------------------------------------------------------------------------------------------------
+OSQP dt=0.01 tinyQP-pub (extrap)          122.437967  1.05e-01  8.60e-04  1.9e-14  4.4740     350    5688.2    4664.2
+OSQP dt=0.01 tinyQP-lib (extrap)          123.388746  1.06e+00  8.63e-03  1.2e-13  3.7610     400    6182.0    5298.3
+TinyMPC-pub dt=0.01 example (extrap)      122.520558  1.88e-01  1.54e-03  0.0e+00  4.4647    1139    8027.5    6749.0
+TinyMPC-pub dt=0.01 teensy-bench (extrap)  122.436428  1.04e-01  8.47e-04  0.0e+00  4.4734    1780   12394.5   10114.1
+TinyMPC-pub dt=0.01 tight (extrap)        122.437967  1.05e-01  8.60e-04  0.0e+00  4.4740    5282   36032.9   29708.1
+TinyMPC-lib2rho dt=0.01 example (extrap)  123.356539  1.02e+00  8.37e-03  0.0e+00  3.7594    6440   42114.3   36441.2
+TinyMPC-lib2rho dt=0.01 teensy-bench (extrap)  123.631794  1.30e+00  1.06e-02  0.0e+00  3.7588   4000*   26161.5   22597.6
+TinyMPC-lib2rho dt=0.01 tight (extrap)    123.388572  1.06e+00  8.63e-03  0.0e+00  3.7610   28500  188543.6  161914.4
+OSQP dt=0.005 tinyQP-pub (extrap)         122.396467  6.37e-02  5.21e-04  1.5e-13  4.3471     325   14828.1   12253.5
+OSQP dt=0.005 tinyQP-lib (extrap)         123.395946  1.06e+00  8.69e-03  9.5e-13  3.7339     550   15857.5   14201.1
+TinyMPC-pub dt=0.005 example (extrap)     122.408113  7.54e-02  6.16e-04  0.0e+00  4.3304    1192   16740.1   13595.5
+TinyMPC-pub dt=0.005 teensy-bench (extrap)  122.388282  5.55e-02  4.54e-04  0.0e+00  4.3454    1842   25566.5   20863.0
+TinyMPC-pub dt=0.005 tight (extrap)       122.396467  6.37e-02  5.21e-04  0.0e+00  4.3471    5085   70001.5   57787.0
+TinyMPC-lib2rho dt=0.005 example (extrap)  123.365967  1.03e+00  8.45e-03  0.0e+00  3.7316    6456   85409.4   74714.9
+TinyMPC-lib2rho dt=0.005 teensy-bench (extrap)  123.582101  1.25e+00  1.02e-02  0.0e+00  3.7301   4000*   52558.6   45357.0
+TinyMPC-lib2rho dt=0.005 tight (extrap)   123.401208  1.07e+00  8.73e-03  0.0e+00  3.7331   24708  330517.2  284466.3
+
+TinyMPC-pub = TinyMPC as published (single rho: paper eq. 15, firmware cache); TinyMPC-lib2rho = tinympc 0.0.8
+library as shipped (tiny_setup double-rho bug). Tolerances: example = 1e-3/1e-3 (the example's defaults, cold, to
+convergence); teensy-bench = pri 1e-4 / dua 1e-3, max 4000 (paper's Teensy random-QP benchmark); tight = 1e-9.
+closed-loop = the example's warm-started loop (tol 1e-3, cap 100, 100 steps): iter = mean per step, times = median
+per step, J = the step-0 plan (capped at 100 iterations). iter*: max_iter hit without meeting the tolerance.
+t_py: per-solve Python wall time (median, cold, setup excluded). t_cpp: host C++ -- TinyMPC via cpp/tiny_bench
+(g++ -O3), OSQP = internal solve_time (factorization excluded), ours = lqocp_cli solve_time_us (median of 20).
+Host x86 only; NONE are Teensy numbers.
+terminal-cost check: {
+ "0.05": {
+  "terminal_vs_Qf_relfro": {
+   "pub": 4.822655679373257e-13,
+   "lib": 0.4879993341987298
+  },
+  "x0_cost_terminal": {
+   "pub": 118.482862138062,
+   "lib": 142.20619709885878
+  },
+  "stage_vs_rect_relfro": {
+   "pub": 0.0,
+   "lib": 0.04586283525935712
+  }
+ },
+ "0.01": {
+  "terminal_vs_Qf_relfro": {
+   "pub": 0.11906648174637285,
+   "lib": 0.3182679508601692
+  },
+  "x0_cost_terminal": {
+   "pub": 113.11010756189953,
+   "lib": 136.60376079982913
+  },
+  "stage_vs_rect_relfro": {
+   "pub": 0.0,
+   "lib": 0.04586283525935712
+  }
+ },
+ "0.005": {
+  "terminal_vs_Qf_relfro": {
+   "pub": 0.13131486445118917,
+   "lib": 0.29920198176023866
+  },
+  "x0_cost_terminal": {
+   "pub": 112.49100831615934,
+   "lib": 135.87738442889017
+  },
+  "stage_vs_rect_relfro": {
+   "pub": 0.0,
+   "lib": 0.04586283525935712
+  }
+ }
+}
+notes: {
+ "model": "phys",
+ "T": 0.45,
+ "umap_residual": 2.3333331889596755e-06,
+ "state_map_residual": 5.096839959225147e-08,
+ "maps_consistent": true,
+ "scoring_model_vs_Ac": 0.0,
+ "scoring_model_vs_Bc": 0.0,
+ "Qf_used_vs_QF_TINY_PHYS_relfro": 0.0,
+ "QF_TINY_vs_QF_CARE_relfro": 1.4019039016462307
+}
+model=spec  T=0.45  Qf=QF_TINY_PHYS  reference for gap: ours-python (continuous optimum), J_ref = 122.3327542
+row                                           J_cont       gap   gap_rel     viol  |x(T)|    iter  t_py[us] t_cpp[us]
+---------------------------------------------------------------------------------------------------------------------
+ours-python                               122.332754  0.00e+00  0.00e+00  2.8e-13  4.0859     452 7764678.6         -
+ours-cpp                                 PENDING (JSONDecodeError: Expecting value: line 1 column 10 (char 9))
+OSQP dt=0.0005 exactZOH (ref)             122.332815  6.10e-05  4.99e-07  2.7e-11  4.0859   12375 4061308.2 4041333.1
+OSQP dt=0.05 exactZOH                     122.534507  2.02e-01  1.65e-03  0.0e+00  4.1820     225    1722.1    1070.1
+OSQP dt=0.01 exactZOH                     122.358108  2.54e-02  2.07e-04  2.3e-14  4.0908     425   11587.7   10001.2
+OSQP dt=0.005 exactZOH                    122.342357  9.60e-03  7.85e-05  1.9e-13  4.0879     375   20717.5   17907.7
+OSQP dt=0.05 tinyQP-pub                   122.605104  2.72e-01  2.23e-03  2.2e-16  4.6451     225    1390.4     914.0
+OSQP dt=0.05 tinyQP-lib                   123.384339  1.05e+00  8.60e-03  2.0e-15  3.8300     375    1942.4    1476.3
+TinyMPC-pub dt=0.05 example               122.729315  3.97e-01  3.24e-03  0.0e+00  4.6605    5752   14397.9    6962.9
+TinyMPC-pub dt=0.05 teensy-bench          122.837107  5.04e-01  4.12e-03  0.0e+00  4.6672   4000*    5745.0    4704.2
+TinyMPC-pub dt=0.05 tight                 122.605104  2.72e-01  2.23e-03  0.0e+00  4.6451   10313   15292.6   12729.5
+TinyMPC-pub closed-loop (example)         137.604155  1.53e+01  1.25e-01  0.0e+00  4.0981 11.4/st*       8.4       3.1
+TinyMPC-lib2rho dt=0.05 example           123.391065  1.06e+00  8.65e-03  0.0e+00  3.8298    5881    8513.8    7226.1
+TinyMPC-lib2rho dt=0.05 teensy-bench      123.900767  1.57e+00  1.28e-02  0.0e+00  3.8268   4000*    5488.0    4754.8
+TinyMPC-lib2rho dt=0.05 tight             123.384269  1.05e+00  8.60e-03  0.0e+00  3.8300   90331  122944.3  106323.3
+TinyMPC-lib2rho closed-loop (example)     137.772668  1.54e+01  1.26e-01  0.0e+00  3.7440 8.8/st*       4.3       2.1
+
+EXTRAPOLATIONS (not TinyMPC's problem: its terminal weight dt*(Pinf-rho) changes with dt, so these
+TinyMPC rows solve a different terminal cost than TINY_CASE):
+---------------------------------------------------------------------------------------------------------------------
+OSQP dt=0.01 tinyQP-pub (extrap)          122.438016  1.05e-01  8.60e-04  1.9e-14  4.4740     350    8384.4    6897.3
+OSQP dt=0.01 tinyQP-lib (extrap)          123.388793  1.06e+00  8.63e-03  1.2e-13  3.7610     400    8955.9    7610.2
+TinyMPC-pub dt=0.01 example (extrap)      122.520616  1.88e-01  1.54e-03  0.0e+00  4.4647    1139    7955.8    6743.4
+TinyMPC-pub dt=0.01 teensy-bench (extrap)  122.436477  1.04e-01  8.48e-04  0.0e+00  4.4734    1780   12705.0   10072.1
+TinyMPC-pub dt=0.01 tight (extrap)        122.438016  1.05e-01  8.60e-04  0.0e+00  4.4740    5282   37035.5   30119.8
+TinyMPC-lib2rho dt=0.01 example (extrap)  123.356585  1.02e+00  8.37e-03  0.0e+00  3.7594    6440   42868.4   36639.8
+TinyMPC-lib2rho dt=0.01 teensy-bench (extrap)  123.631849  1.30e+00  1.06e-02  0.0e+00  3.7588   4000*   26199.3   23058.7
+TinyMPC-lib2rho dt=0.01 tight (extrap)    123.388619  1.06e+00  8.63e-03  0.0e+00  3.7610   28500  196638.3  167804.0
+OSQP dt=0.005 tinyQP-pub (extrap)         122.396516  6.38e-02  5.21e-04  1.5e-13  4.3471     325   15695.1   13095.8
+OSQP dt=0.005 tinyQP-lib (extrap)         123.395993  1.06e+00  8.69e-03  9.5e-13  3.7339     550   17022.5   15427.9
+TinyMPC-pub dt=0.005 example (extrap)     122.408162  7.54e-02  6.16e-04  0.0e+00  4.3304    1192   17059.5   13858.0
+TinyMPC-pub dt=0.005 teensy-bench (extrap)  122.388331  5.56e-02  4.54e-04  0.0e+00  4.3454    1842   26319.7   21374.0
+TinyMPC-pub dt=0.005 tight (extrap)       122.396516  6.38e-02  5.21e-04  0.0e+00  4.3471    5085   69795.9   58340.9
+TinyMPC-lib2rho dt=0.005 example (extrap)  123.366014  1.03e+00  8.45e-03  0.0e+00  3.7316    6456   87572.6   74515.6
+TinyMPC-lib2rho dt=0.005 teensy-bench (extrap)  123.582151  1.25e+00  1.02e-02  0.0e+00  3.7301   4000*   53454.6   45898.0
+TinyMPC-lib2rho dt=0.005 tight (extrap)   123.401254  1.07e+00  8.73e-03  0.0e+00  3.7331   24708  328230.8  293079.1
+
+TinyMPC-pub = TinyMPC as published (single rho: paper eq. 15, firmware cache); TinyMPC-lib2rho = tinympc 0.0.8
+library as shipped (tiny_setup double-rho bug). Tolerances: example = 1e-3/1e-3 (the example's defaults, cold, to
+convergence); teensy-bench = pri 1e-4 / dua 1e-3, max 4000 (paper's Teensy random-QP benchmark); tight = 1e-9.
+closed-loop = the example's warm-started loop (tol 1e-3, cap 100, 100 steps): iter = mean per step, times = median
+per step, J = the step-0 plan (capped at 100 iterations). iter*: max_iter hit without meeting the tolerance.
+t_py: per-solve Python wall time (median, cold, setup excluded). t_cpp: host C++ -- TinyMPC via cpp/tiny_bench
+(g++ -O3), OSQP = internal solve_time (factorization excluded), ours = lqocp_cli solve_time_us (median of 20).
+Host x86 only; NONE are Teensy numbers.
+terminal-cost check: {
+ "0.05": {
+  "terminal_vs_Qf_relfro": {
+   "pub": 6.45292666612152e-07,
+   "lib": 0.48800006514395794
+  },
+  "x0_cost_terminal": {
+   "pub": 118.48289963621119,
+   "lib": 142.2062352207589
+  },
+  "stage_vs_rect_relfro": {
+   "pub": 0.0,
+   "lib": 0.04586283525935712
+  }
+ },
+ "0.01": {
+  "terminal_vs_Qf_relfro": {
+   "pub": 0.11906595987003063,
+   "lib": 0.3182685833753323
+  },
+  "x0_cost_terminal": {
+   "pub": 113.11014500913096,
+   "lib": 136.60379875398763
+  },
+  "stage_vs_rect_relfro": {
+   "pub": 0.0,
+   "lib": 0.04586283525935712
+  }
+ },
+ "0.005": {
+  "terminal_vs_Qf_relfro": {
+   "pub": 0.13131434962889163,
+   "lib": 0.2992026005536664
+  },
+  "x0_cost_terminal": {
+   "pub": 112.49104575735001,
+   "lib": 135.8774224210542
+  },
+  "stage_vs_rect_relfro": {
+   "pub": 0.0,
+   "lib": 0.04586283525935712
+  }
+ }
+}
+notes: {
+ "model": "spec",
+ "T": 0.45,
+ "umap_residual": 2.3333331889596755e-06,
+ "state_map_residual": 5.096839959225147e-08,
+ "maps_consistent": true,
+ "scoring_model_vs_Ac": 4.999999999999867e-07,
+ "scoring_model_vs_Bc": 4.6183362749976265e-06,
+ "Qf_used_vs_QF_TINY_PHYS_relfro": 1.3997355810049508e-16,
+ "QF_TINY_vs_QF_CARE_relfro": 1.4019039016462307
+}
+rc=0
