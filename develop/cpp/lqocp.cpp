@@ -1162,6 +1162,44 @@ inline int mblk(const double* re, const double* im, int i, double L, double E[4]
     return 2;
 }
 
+// g[j] = t^j phi_j(lam t), j = 0..K, complex lam = (lr, li): phi_0 = e^z, phi_j(z) = sum_i z^i/(i+j)!,
+// the divided differences of e^{z} at (0, .., 0, z) that couple a slow centre mode to the nilpotent
+// block (g_j' = g_{j-1}, g_0' = lam g_0). |z| <= 4: phi_K by 40 terms of its series, then the stable
+// downward recurrence phi_{j-1} = z phi_j + 1/(j-1)!; |z| > 4: upward, phi_j = (phi_{j-1} - 1/(j-1)!)/z
+// from e^z. Relative error <= 1e-13 for K <= 10 (checked against 40-digit values): a fixed
+// evaluation of entire functions, like xexp.
+void gfun(double lr, double li, double t, int K, double (*g)[2]) {
+    const double zr = lr * t, zi = li * t, z2 = zr * zr + zi * zi;
+    if (z2 > 16.0) {
+        const double e = xexp(zr);
+        g[0][0] = e * cos(zi); g[0][1] = e * sin(zi);
+        double fk = 1.0;                               // 1/(j-1)!
+        for (int j = 1; j <= K; ++j) {
+            const double ar = g[j - 1][0] - fk, ai = g[j - 1][1];
+            g[j][0] = (ar * zr + ai * zi) / z2;
+            g[j][1] = (ai * zr - ar * zi) / z2;
+            fk /= j;
+        }
+    } else {
+        double fk = 1.0;                               // 1/K!
+        for (int j = 2; j <= K; ++j) fk /= j;
+        double sr = 0.0, si = 0.0, tr = fk, ti = 0.0;
+        for (int i = 1; i <= 40; ++i) {
+            sr += tr; si += ti;
+            const double nr = (tr * zr - ti * zi) / (i + K), ni = (tr * zi + ti * zr) / (i + K);
+            tr = nr; ti = ni;
+        }
+        g[K][0] = sr; g[K][1] = si;
+        for (int j = K; j >= 1; --j) {
+            fk *= j;                                   // 1/(j-1)!
+            g[j - 1][0] = zr * g[j][0] - zi * g[j][1] + fk;
+            g[j - 1][1] = zr * g[j][1] + zi * g[j][0];
+        }
+    }
+    double tj = 1.0;
+    for (int j = 0; j <= K; ++j) { g[j][0] *= tj; g[j][1] *= tj; tj *= t; }
+}
+
 // Householder reflection H with H x = alpha e_p for the column x = R[.][col] over the rows
 // R[0..nr-1] (eliminates that unknown; row p is its pivot). Column col is then replaced by eta,
 // the coefficients of the unknown that takes its place, and H is applied to columns [0, c1)
@@ -1208,25 +1246,6 @@ void rowmul(const double* row, const double* M, int n, int ld, double* t) {
         if (ri == 0.0) continue;
         const double* Mi = M + i * ld;
         for (int j = 0; j < n; ++j) t[j] += ri * Mi[j];
-    }
-}
-
-// rowmul for small cache-resident M (the centre block): four independent accumulators, since a
-// Cortex-M7 double FMA is not fully pipelined
-void rowmul4(const double* row, const double* M, int n, int ld, double* t) {
-    int j = 0;
-    for (; j + 4 <= n; j += 4) {
-        double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
-        for (int i = 0; i < n; ++i) {
-            const double r = row[i], *m = M + i * ld + j;
-            s0 += r * m[0]; s1 += r * m[1]; s2 += r * m[2]; s3 += r * m[3];
-        }
-        t[j] = s0; t[j + 1] = s1; t[j + 2] = s2; t[j + 3] = s3;
-    }
-    for (; j < n; ++j) {
-        double s = 0.0;
-        for (int i = 0; i < n; ++i) s += row[i] * M[i * ld + j];
-        t[j] = s;
     }
 }
 
@@ -1381,10 +1400,10 @@ bool GSolver::affine(uint16_t S, double P[MAXM][MAXM], double q[MAXM]) const {
         X[a * ldx + m_] = rhs_[idx[a]];
     }
     if (!lu_solve(G, na, MAXM, X, m_ + 1, ldx)) return false;
-    for (int i = 0; i < m_; ++i)
+    for (int i = 0; i < m_; ++i)                       // (every channel fixed: P = 0 exactly)
         for (int a = 0; a < na; ++a) {
             const double ai = rows_[idx[a]][i];
-            for (int j = 0; j < m_; ++j) P[i][j] -= ai * X[a * ldx + j];
+            for (int j = 0; j < m_; ++j) P[i][j] = (na == m_) ? 0.0 : P[i][j] - ai * X[a * ldx + j];
             q[i] += ai * X[a * ldx + m_];
         }
     return true;
@@ -1451,7 +1470,8 @@ bool GSolver::arc(int k, const uint16_t* seq, int N, const double* tau, Arc& a) 
     a.S = seq[k];
     a.b = bfn_(bctx_, basis_key(seq[k]));
     a.x = nullptr;
-    if (!a.b || !affine(seq[k], a.P, a.q)) return false;
+    if (!a.b) { bkey_ = basis_key(seq[k]); return false; }
+    if (!affine(seq[k], a.P, a.q)) return false;
     const SetBasis& b = *a.b;
     const int n2 = 2 * n_, s1 = b.ns + b.nc;
     double f[MAXM];
@@ -1478,49 +1498,107 @@ bool GSolver::arc(int k, const uint16_t* seq, int N, const double* tau, Arc& a) 
     return true;
 }
 
-// y <- e^{M L} y (column) or y <- y e^{M L} (row), M = [[Tc, aff ? yp_c : 0], [0, 0]];
-// y has nc + 1 entries. Matrix-free Taylor series (M is nearly nilpotent: it terminates in about nc
-// terms; a second step only when L tcr > 0.5, i.e. for long arcs).
+// y <- e^{M L} y (column) or y <- y e^{M L} (row), M = [[Tc, aff ? yp_c : 0], [0, 0]], y has nc + 1
+// entries; Tc = [[N, X], [0, Ls]] (SetBasis). Exact closed form (N^ni = 0):
+//   y_s(L) = G0 y_s + G1 g_s,  y_N(L) = sum_{k<ni} N^k [y_N L^k/k! + g_N L^(k+1)/(k+1)! + X (G(k+1) y_s + G(k+2) g_s)]
+// with the slow blocks' G(j) = L^j phi_j(Ls L) (gfun), the sum by Horner in N; the row form is its
+// transpose. No truncation, no substeps.
 void GSolver::cexp(const Arc& a, double L, double* y, bool row, bool aff) const {
     const SetBasis& b = *a.b;
-    const int nc = b.nc;
+    const int nc = b.nc, nz = b.nz, ni = b.ni;
     if (nc == 0 || L == 0.0) return;
-    const double* Tc = b.Tc;
+    const double* T = b.Tc;                            // row stride nc
     const double* g = a.yp + b.ns;
-    double gm = 0.0;
-    if (aff) for (int i = 0; i < nc; ++i) gm = fmax(gm, fabs(g[i]));
-    // Tc is nearly nilpotent but far from normal: the step count follows ||Tc^24||^(1/24), and
-    // the series runs until a term, times the worst one-step growth, is below round-off
-    int m = (int)ceil(fabs(L) * b.tcr / 0.5);
-    if (m < 1) m = 1;
-    const double hs = L / m, grow = 1.0 + (b.tcn + gm) * fabs(hs);
-    double t[N2 + 1], u[N2 + 1];
-    double* acc = y;
-    for (int st = 0; st < m; ++st) {
-        for (int i = 0; i <= nc; ++i) t[i] = y[i];
-        for (int k = 1; k < 200; ++k) {
-            const double f = hs / k;
-            if (!row) {
-                matvec(Tc, nc, nc, t, u);
-                for (int i = 0; i < nc; ++i) u[i] = (u[i] + (aff ? g[i] * t[nc] : 0.0)) * f;
-                u[nc] = 0.0;
-            } else {
-                rowmul4(t, Tc, nc, nc, u);
-                for (int j = 0; j < nc; ++j) u[j] *= f;
+    const double* bre = b.re + b.ns;
+    const double* bim = b.im + b.ns;
+    const double af = aff ? (row ? 1.0 : y[nc]) : 0.0;
+    double G[NSD][NPOLY + 2][2], fk[NPOLY + 2];
+    int nb = 0, cb[NSD + 1];
+    for (int c = nz; c < nc; c += (bim[c] != 0.0) ? 2 : 1) {
+        gfun(bre[c], bim[c], L, ni + 1, G[nb]);
+        cb[nb++] = c;
+    }
+    cb[nb] = nc;
+    fk[0] = 1.0;
+    for (int k = 1; k <= ni + 1; ++k) fk[k] = fk[k - 1] * L / k;
+    // block action of G(j) = [[gr, gi], [-gi, gr]] on a column (v0, v1) (1x1 block: gr)
+    auto col = [](const double* q, const double* v, int w, double* o, double s) {
+        if (w == 1) { o[0] += s * q[0] * v[0]; return; }
+        o[0] += s * (q[0] * v[0] + q[1] * v[1]);
+        o[1] += s * (q[0] * v[1] - q[1] * v[0]);
+    };
+    if (!row) {
+        double acc[N2], v[N2], xs[N2];
+        for (int k = ni - 1; k >= 0; --k) {
+            for (int l = nz; l < nc; ++l) xs[l] = 0.0;
+            for (int q = 0; q < nb; ++q) {
+                const int c = cb[q], w = cb[q + 1] - c;
+                col(G[q][k + 1], y + c, w, xs + c, 1.0);
+                col(G[q][k + 2], g + c, w, xs + c, af);
+            }
+            for (int i = 0; i < nz; ++i) {
+                double s = y[i] * fk[k] + af * g[i] * fk[k + 1];
+                for (int l = nz; l < nc; ++l) s += T[i * nc + l] * xs[l];
+                if (k < ni - 1)
+                    for (int l = i + 1; l < nz; ++l) s += T[i * nc + l] * acc[l];
+                v[i] = s;
+            }
+            for (int i = 0; i < nz; ++i) acc[i] = v[i];
+        }
+        for (int l = nz; l < nc; ++l) xs[l] = 0.0;
+        for (int q = 0; q < nb; ++q) {
+            const int c = cb[q], w = cb[q + 1] - c;
+            col(G[q][0], y + c, w, xs + c, 1.0);
+            col(G[q][1], g + c, w, xs + c, af);
+        }
+        for (int i = 0; i < nz; ++i) y[i] = acc[i];
+        for (int l = nz; l < nc; ++l) y[l] = xs[l];
+        return;
+    }
+    // row: w_k = r_N N^k; out_N = sum w_k L^k/k!, out_s = r_s G0 + sum (w_k X) G(k+1),
+    // affine slot += sum (w_k g_N) L^(k+1)/(k+1)! + r_s G1 g_s + sum (w_k X) G(k+2) g_s
+    auto rowa = [](const double* q, const double* r, int w, double* o) {
+        if (w == 1) { o[0] += r[0] * q[0]; return; }
+        o[0] += r[0] * q[0] - r[1] * q[1];
+        o[1] += r[0] * q[1] + r[1] * q[0];
+    };
+    double w[N2], wn[N2], out[N2 + 1], c[N2], t2[2];
+    for (int i = 0; i <= nc; ++i) out[i] = 0.0;
+    out[nc] = y[nc];
+    for (int q = 0; q < nb; ++q) {
+        const int c0 = cb[q], ww = cb[q + 1] - c0;
+        rowa(G[q][0], y + c0, ww, out + c0);
+        t2[0] = t2[1] = 0.0;
+        rowa(G[q][1], y + c0, ww, t2);
+        for (int l = 0; l < ww; ++l) out[nc] += af * t2[l] * g[c0 + l];
+    }
+    for (int i = 0; i < nz; ++i) w[i] = y[i];
+    for (int k = 0; k < ni; ++k) {
+        double wg = 0.0;
+        for (int i = 0; i < nz; ++i) { out[i] += w[i] * fk[k]; wg += w[i] * g[i]; }
+        out[nc] += af * wg * fk[k + 1];
+        for (int l = nz; l < nc; ++l) {
+            double s = 0.0;
+            for (int i = 0; i < nz; ++i) s += w[i] * T[i * nc + l];
+            c[l] = s;
+        }
+        for (int q = 0; q < nb; ++q) {
+            const int c0 = cb[q], ww = cb[q + 1] - c0;
+            rowa(G[q][k + 1], c + c0, ww, out + c0);
+            t2[0] = t2[1] = 0.0;
+            rowa(G[q][k + 2], c + c0, ww, t2);
+            for (int l = 0; l < ww; ++l) out[nc] += af * t2[l] * g[c0 + l];
+        }
+        if (k + 1 < ni) {
+            for (int j = 0; j < nz; ++j) {
                 double s = 0.0;
-                if (aff) for (int i = 0; i < nc; ++i) s += t[i] * g[i];
-                u[nc] = s * f;
+                for (int i = 0; i < j; ++i) s += w[i] * T[i * nc + j];
+                wn[j] = s;
             }
-            double tm = 0.0, am = 0.0;
-            for (int i = 0; i <= nc; ++i) {
-                t[i] = u[i];
-                acc[i] += u[i];
-                tm = fmax(tm, fabs(u[i]));
-                am = fmax(am, fabs(acc[i]));
-            }
-            if (tm * grow <= 1e-17 * am) break;
+            for (int i = 0; i < nz; ++i) w[i] = wn[i];
         }
     }
+    for (int i = 0; i <= nc; ++i) y[i] = out[i];
 }
 
 // z (augmented, z[2n] = 1) at t0 + sig on arc a
@@ -1593,7 +1671,7 @@ int GSolver::gphi(uint16_t S, int keys[2 * MAXM], double G[2 * MAXM][MAXM], doub
         if (ok)
             for (int a = 0; a < na; ++a) {
                 const double ai = rows_[idx[a]][i];
-                for (int j = 0; j < m_; ++j) P[i][j] -= ai * X[a * ldx + j];
+                for (int j = 0; j < m_; ++j) P[i][j] = (na == m_) ? 0.0 : P[i][j] - ai * X[a * ldx + j];
                 q[i] += ai * X[a * ldx + m_];
             }
     }
@@ -1623,7 +1701,7 @@ int GSolver::gphi(uint16_t S, int keys[2 * MAXM], double G[2 * MAXM][MAXM], doub
 // Channel j: wt_j(sig) = c_j + sum_k p_jk sig^k + sum_i Re[A_ji e^{lam_i (sig - anc_i)}] with the
 // modal eigenvalues lam_i (stable: anchor 0, unstable: anchor L; a complex pair stores P, Q of
 // A = P - iQ in its two slots) and the centre part e^{M sig} [c; 1], M = [[Tc, yp_c], [0, 0]],
-// a polynomial (M nearly nilpotent; terms until they are round-off over the whole arc).
+// a polynomial of ni + 1 terms (M^(ni+1) = 0).
 bool GSolver::chan(const Arc& a, ArcFn& F) const {
     const SetBasis& b = *a.b;
     const int n = n_, n2 = 2 * n, ns = b.ns, nc = b.nc, s1 = ns + nc;
@@ -1640,7 +1718,7 @@ bool GSolver::chan(const Arc& a, ArcFn& F) const {
     F.b = a.b;
     F.L = a.L;
     F.m = m_;
-    F.np = 0;
+    F.np = F.nsb = 0;
     for (int i = 0; i < n2;) {
         if (i == ns && nc) { i = s1; continue; }
         const double x0 = a.x[i] / b.cs[i];
@@ -1660,28 +1738,64 @@ bool GSolver::chan(const Arc& a, ArcFn& F) const {
     }
     if (!nc) return true;
     const double* g = a.yp + ns;
-    double v[N2 + 1], u[N2 + 1], gm = 0.0, am = 0.0, Lk = 1.0;
-    for (int i = 0; i < nc; ++i) { v[i] = a.x[ns + i] / b.cs[ns + i]; gm = fmax(gm, fabs(g[i])); }
-    v[nc] = 1.0;
-    const double grow = 1.0 + (b.tcn + gm) * a.L;
-    for (int k = 0; k < NPOLY; ++k) {                  // v = M^k [c; 1] / k!
-        double tm = 0.0;
-        for (int i = 0; i <= nc; ++i) tm = fmax(tm, fabs(v[i]));
-        tm *= Lk;
-        if (k > 0 && tm * grow <= 1e-17 * am) return true;
-        am = fmax(am, tm);
+    const int nz = b.nz, ni = b.ni;
+    double v[N2 + 1], u[N2 + 1], y0[N2];
+    for (int i = 0; i < nc; ++i) y0[i] = v[i] = a.x[ns + i] / b.cs[ns + i];
+    v[nz] = 1.0;
+    if (ni >= NPOLY) return false;
+    F.np = ni + 1;
+    for (int k = 0; k <= ni; ++k) {                    // N part: v = M^k [c_N; 1] / k!, M = [[N, g_N], [0, 0]]
         for (int j = 0; j < m_; ++j) {
             double s = 0.0;
-            for (int i = 0; i < nc; ++i) s += Bw[j][ns + i] * v[i];
+            for (int i = 0; i < nz; ++i) s += Bw[j][ns + i] * v[i];
             F.poly[j][k] = s;
         }
-        F.np = k + 1;
-        matvec(b.Tc, nc, nc, v, u);
-        for (int i = 0; i < nc; ++i) v[i] = (u[i] + g[i] * v[nc]) / (k + 1);
-        v[nc] = 0.0;
-        Lk *= a.L;
+        matvec(b.Tc, nz, nc, v, u);
+        for (int i = 0; i < nz; ++i) v[i] = (u[i] + g[i] * v[nz]) / (k + 1);
+        v[nz] = 0.0;
     }
-    return false;
+    // slow blocks: sum_k Re[A_k g_k(sig)] with A_0 = <Bw_s, y_s>, A_1 = <Bw_s, g_s> + <Bw_N X, y_s>,
+    // A_(k+1) += <Bw_N N^k X, y_s>, A_(k+2) += <Bw_N N^k X, g_s>; <c, v> of a pair = P - iQ,
+    // P = c0 v0 + c1 v1, Q = c0 v1 - c1 v0 (Re[(P - iQ) g] = c G v)
+    F.sk = ni + 2;
+    F.nz = nz;
+    for (int c = nz; c < nc; c += (b.im[ns + c] != 0.0) ? 2 : 1) F.sc[F.nsb++] = c;
+    if (!F.nsb) return true;
+    auto dot = [](const double* c, const double* v, int w, double* A0, double* A1) {
+        *A0 += c[0] * v[0] + ((w == 2) ? c[1] * v[1] : 0.0);
+        if (w == 2) *A1 -= c[0] * v[1] - c[1] * v[0];
+    };
+    for (int j = 0; j < m_; ++j) {
+        double r[N2], rn[N2], cx[N2];
+        for (int q = 0; q < nc - nz; ++q)
+            for (int k = 0; k < F.sk; ++k) F.sl[j][q][k] = 0.0;
+        for (int i = 0; i < nz; ++i) r[i] = Bw[j][ns + i];
+        for (int k = 0; k < ni; ++k) {
+            for (int l = nz; l < nc; ++l) {
+                double s = 0.0;
+                for (int i = 0; i < nz; ++i) s += r[i] * b.Tc[i * nc + l];
+                cx[l] = s;
+            }
+            for (int q = 0; q < F.nsb; ++q) {
+                const int c = F.sc[q], w = ((q + 1 < F.nsb) ? F.sc[q + 1] : nc) - c;
+                double* s0 = F.sl[j][c - nz];
+                double* s1 = F.sl[j][c - nz + w - 1];  // (= s0 for a real block, unused)
+                if (k == 0) {
+                    dot(Bw[j] + ns + c, y0 + c, w, s0, s1);
+                    dot(Bw[j] + ns + c, g + c, w, s0 + 1, s1 + 1);
+                }
+                dot(cx + c, y0 + c, w, s0 + k + 1, s1 + k + 1);
+                dot(cx + c, g + c, w, s0 + k + 2, s1 + k + 2);
+            }
+            for (int jj = 0; jj < nz; ++jj) {
+                double s = 0.0;
+                for (int i = 0; i < jj; ++i) s += r[i] * b.Tc[i * nc + jj];
+                rn[jj] = s;
+            }
+            for (int i = 0; i < nz; ++i) r[i] = rn[i];
+        }
+    }
+    return true;
 }
 
 // row function g0 + G wt on the arc of F
@@ -1696,7 +1810,38 @@ void GSolver::rowfn(const ArcFn& F, const double* G, double g0, RowFn& f) const 
         if (i < ns || i >= s1) sc += fabs(f.u(i));
     for (int k = 0; k < F.np; ++k) { sc += fabs(f.p(k)) * Lk; Lk *= F.L; }
     f.c0 = c0;
-    f.scale = sc + fabs(c0);
+    f.scale = sc + fabs(c0) + (F.nsb ? sbound(f, 0, F.L, false) : 0.0);
+}
+
+// Slow blocks of the row f (F.sl): coefficients A (complex, F.sk terms) of block q, differentiated
+// nder times (d/dsig sum A_k g_k = sum A'_k g_k with A'_0 = lam A_0 + A_1, A'_k = A_(k+1))
+void GSolver::scoef(const RowFn& f, int q, int nder, double (*A)[2]) const {
+    const ArcFn& F = *f.F;
+    const double lr = F.b->re[F.b->ns + F.sc[q]], li = F.b->im[F.b->ns + F.sc[q]];
+    for (int k = 0; k < F.sk; ++k) { A[k][0] = f.s(q, k, 0); A[k][1] = f.s(q, k, 1); }
+    for (int d = 0; d < nder; ++d) {
+        const double r0 = lr * A[0][0] - li * A[0][1] + A[1][0], i0 = lr * A[0][1] + li * A[0][0] + A[1][1];
+        A[0][0] = r0; A[0][1] = i0;
+        for (int k = 1; k < F.sk; ++k) {
+            A[k][0] = (k + 1 < F.sk) ? A[k + 1][0] : 0.0;
+            A[k][1] = (k + 1 < F.sk) ? A[k + 1][1] : 0.0;
+        }
+    }
+}
+
+// bound of |slow part^(nder)| on [0, t] (t >= 0; |g_k(t)| <= t^k/k! e^{max(0, Re lam t)}), or with
+// full = true the Taylor majorant at radius t (e^{|lam| t})
+double GSolver::sbound(const RowFn& f, int nder, double t, bool full) const {
+    const ArcFn& F = *f.F;
+    double B = 0.0, A[NPOLY + 1][2];
+    for (int q = 0; q < F.nsb; ++q) {
+        const double lr = F.b->re[F.b->ns + F.sc[q]], li = F.b->im[F.b->ns + F.sc[q]];
+        scoef(f, q, nder, A);
+        double s = 0.0, tk = 1.0;
+        for (int k = 0; k < F.sk; ++k) { s += sqrt(A[k][0] * A[k][0] + A[k][1] * A[k][1]) * tk; tk *= t / (k + 1); }
+        B += s * xexp(full ? sqrt(lr * lr + li * li) * t : fmax(0.0, lr * t));
+    }
+    return B;
 }
 
 // derivatives d[0..nd] of f at sig (closed form)
@@ -1726,6 +1871,21 @@ void GSolver::feval(const RowFn& f, double sig, int nd, double* d) const {
         }
     }
     ptaylor(f, sig, nd, d);
+    sadd(f, sig, nd, d);
+}
+
+// adds the derivatives 0..nd at sig of the slow blocks (sum_k Re[A_k g_k], closed form)
+void GSolver::sadd(const RowFn& f, double sig, int nd, double* d) const {
+    const ArcFn& F = *f.F;
+    for (int q = 0; q < F.nsb; ++q) {
+        double A[NPOLY + 1][2], gk[NPOLY + 2][2];
+        const double lr = F.b->re[F.b->ns + F.sc[q]], li = F.b->im[F.b->ns + F.sc[q]];
+        gfun(lr, li, sig, F.sk - 1, gk);
+        for (int n = 0; n <= nd; ++n) {
+            scoef(f, q, n, A);
+            for (int k = 0; k < F.sk; ++k) d[n] += A[k][0] * gk[k][0] - A[k][1] * gk[k][1];
+        }
+    }
 }
 
 // adds the derivatives 0..nd at sig of the centre polynomial: k! sum_j C(j, k) p_j sig^(j - k)
@@ -1782,6 +1942,13 @@ double GSolver::node(const RowFn& f, double lo, double hi, double* d, double* M2
         for (int k = 0; k + 2 < np; ++k) { s += fabs(pd[k + 2]) * hk; hk *= h / (k + 1); }
         d0 += pd[0]; d1 += pd[1]; M2 += s;
         v += pd[0]; v1 += pd[1]; M2s += s;
+    }
+    if (f.F->nsb) {                                    // slow blocks: exact f, f'; |f''| bound on [0, hi]
+        double sd[2] = {0.0, 0.0};
+        sadd(f, m, 1, sd);
+        const double s2 = sbound(f, 2, hi, false);
+        d0 += sd[0]; d1 += sd[1]; M2 += s2;
+        v += sd[0]; v1 += sd[1]; M2s += s2;
     }
     d[0] = d0;
     d[1] = d1;
@@ -1903,6 +2070,7 @@ double GSolver::lead(const ArcFn& F, const double* G, double g0, double sig, dou
             i += (om == 0.0) ? 1 : 2;
         }
         for (int k = 0; k < F.np; ++k) { B += fabs(f.p(k)) * x; x *= fabs(sig) + h; }
+        if (F.nsb) B += sbound(f, 0, fabs(sig) + h, true);
         feval(f, sig, 0, &d0);
         if (fabs(d0) > 1e-12 * B) { *tolp = 1e-12 * B; *ilead = 0; return d0; }
     }
@@ -2078,6 +2246,16 @@ void GSolver::wint(const ArcFn& F, double sa, double sb, double* I) const {
     for (int j = 0; j < m_; ++j) {
         double s = F.c[j] * len, ka = sa, kb = sb;
         for (int k = 0; k < F.np; ++k) { s += F.poly[j][k] * (kb - ka) / (k + 1); ka *= sa; kb *= sb; }
+        for (int q = 0; q < F.nsb; ++q) {              // slow: int g_k = g_(k+1)
+            double ga[NPOLY + 2][2], gb[NPOLY + 2][2];
+            const double lr = b.re[ns + F.sc[q]], li = b.im[ns + F.sc[q]];
+            gfun(lr, li, sa, F.sk, ga);
+            gfun(lr, li, sb, F.sk, gb);
+            const double* s0 = F.sl[j][F.sc[q] - F.nz];
+            const double* s1 = F.sl[j][F.sc[q] - F.nz + ((li != 0.0) ? 1 : 0)];
+            for (int k = 0; k < F.sk; ++k)
+                s += s0[k] * (gb[k + 1][0] - ga[k + 1][0]) - ((li != 0.0) ? s1[k] : 0.0) * (gb[k + 1][1] - ga[k + 1][1]);
+        }
         I[j] = s;
     }
     for (int i = 0; i < n2;) {
@@ -2868,6 +3046,21 @@ void GSolver::begin(GResult& R, int max_its) {
     budget_ = max_its;
     cert_ = false;
     wthr_ = 0.0;
+    bkey_ = 0xFFFFu;
+}
+
+// "basis/dichotomy failed for key k" when a basis was missing (BasisFn returned null), else null
+const char* GSolver::bfail() {
+    if (bkey_ == 0xFFFFu) return nullptr;
+    static const char pre[] = "basis/dichotomy failed for key ";
+    int i = 0, k = bkey_;
+    for (; pre[i]; ++i) why_[i] = pre[i];
+    char d[6];
+    int nd = 0;
+    do { d[nd++] = (char)('0' + k % 10); k /= 10; } while (k);
+    while (nd) why_[i++] = d[--nd];
+    why_[i] = 0;
+    return why_;
 }
 
 bool GSolver::solve(GResult& R) { return cold(R, MAX_GEN_ITS); }
@@ -2882,7 +3075,7 @@ bool GSolver::cold(GResult& R, int max_its) {
     bool conv = false;
     const char* why = nullptr;
     if (!bvp(aseq_, 1, atau_)) {
-        R.failure = "linear BVP singular (infeasible endpoint or missing basis)";
+        R.failure = bfail() ? bfail() : "linear BVP singular (infeasible endpoint?)";
         return false;
     }
     if (!p_->has_bounds) {
@@ -3016,7 +3209,7 @@ bool GSolver::finish(GResult& R, bool conv, const char* why, int its, int nsteps
     if (conv && !(R.pmp_violation <= VTOL * R_)) { conv = false; why = "optimality check failed"; }
     R.cost = loose ? HUGE_VAL : gcost(R.S, R.narcs, R.t1, gends(R.S, R.narcs, R.t1));
     R.converged = conv;
-    R.failure = conv ? nullptr : (why ? why : "not converged");
+    R.failure = conv ? nullptr : bfail() ? bfail() : (why ? why : "not converged");
     return conv;
 }
 

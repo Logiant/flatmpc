@@ -11,7 +11,8 @@ namespace lqocp {
 
 namespace {
 
-const double DELTA_FAC[3] = {1.0, 0.5, 2.0};
+const double YMAX = 8.0;    // lift |y| / |u| above which a slow mode stays coupled in the centre
+const double ZMAX = 12.0;   // ... if |Re lambda| T <= ZMAX (anchored at the arc start: growth <= e^ZMAX)
 
 bool lu(double* A, int n, double* B, int nrhs) {       // A (n x n), B (n x nrhs), in place
     for (int k = 0; k < n; ++k) {
@@ -48,8 +49,10 @@ void mmul(const double* A, const double* B, double* C, int n) {
         }
 }
 
-// matrix sign function (scaled Newton); S in/out (n x n), W1, W2 scratch
+// matrix sign function (scaled Newton); S in/out (n x n), W1, W2 scratch. Converged at a relative
+// step <= 1e-14, or at the round-off floor (a step <= 1e-10 that no longer halves: ill-conditioned)
 bool sign_fn(double* S, int n, double* W1, double* W2) {
+    double prev = HUGE_VAL;
     for (int it = 0; it < 60; ++it) {
         for (int i = 0; i < n * n; ++i) W1[i] = S[i];
         for (int i = 0; i < n * n; ++i) W2[i] = 0.0;
@@ -75,9 +78,48 @@ bool sign_fn(double* S, int n, double* W1, double* W2) {
             dn = fmax(dn, a);
             sn = fmax(sn, b);
         }
-        if (dn <= 1e-14 * sn) return true;
+        if (dn <= 1e-14 * sn || (it >= 20 && dn <= 1e-10 * sn && dn > 0.5 * prev)) return true;
+        prev = dn;
     }
     return false;
+}
+
+// Orthonormal basis of null(A) (A: k x k, row stride lda) by QR with column pivoting of A^T:
+// A^T P = Qk R, columns r.. of Qk span null(A) (pivot norms <= tol from column r on). Returns r.
+int null_basis(const double* A, int k, int lda, double tol, double* Qk, double* B) {
+    for (int i = 0; i < k; ++i)
+        for (int j = 0; j < k; ++j) { B[i * k + j] = A[j * lda + i]; Qk[i * k + j] = (i == j) ? 1.0 : 0.0; }
+    int r = 0;
+    for (; r < k; ++r) {
+        int piv = r;
+        double bn = -1.0;
+        for (int j = r; j < k; ++j) {
+            double t = 0.0;
+            for (int i = r; i < k; ++i) t += B[i * k + j] * B[i * k + j];
+            if (t > bn) { bn = t; piv = j; }
+        }
+        if (sqrt(bn) <= tol) break;
+        for (int i = 0; i < k; ++i) { const double t = B[i * k + r]; B[i * k + r] = B[i * k + piv]; B[i * k + piv] = t; }
+        double v[N2], vv = 0.0;
+        const double sg = sqrt(bn);
+        for (int i = r; i < k; ++i) v[i] = B[i * k + r];
+        v[r] -= (v[r] > 0) ? -sg : sg;
+        for (int i = r; i < k; ++i) vv += v[i] * v[i];
+        if (vv == 0.0) continue;
+        for (int j = r; j < k; ++j) {
+            double t = 0.0;
+            for (int i = r; i < k; ++i) t += v[i] * B[i * k + j];
+            t *= 2.0 / vv;
+            for (int i = r; i < k; ++i) B[i * k + j] -= t * v[i];
+        }
+        for (int i = 0; i < k; ++i) {
+            double t = 0.0;
+            for (int l = r; l < k; ++l) t += Qk[i * k + l] * v[l];
+            t *= 2.0 / vv;
+            for (int l = r; l < k; ++l) Qk[i * k + l] -= t * v[l];
+        }
+    }
+    return r;
 }
 
 // r columns spanning range(P) (n x n) by Gram-Schmidt with column pivoting -> Wb cols c0..
@@ -272,13 +314,21 @@ const SetBasis* BasisBuilder::get(uint16_t S) {
     S = basis_key(S);
     for (int i = 0; i < n_; ++i)
         if (sb_[i].S == S) return &sb_[i];
-    if (!g_ || n_ >= MAXSETS || !build(S, n_)) return nullptr;
-    return &sb_[n_++];
+    for (int i = 0; i < nbad_; ++i)                    // failed builds are not retried
+        if (bad_[i] == S) return nullptr;
+    if (g_ && n_ < MAXSETS && build(S, n_)) return &sb_[n_++];
+    if (nbad_ < MAXSETS) bad_[nbad_++] = S;
+    return nullptr;
 }
 
+// H_S (balanced) = Q [[N, X], [0, H22]] Q^T: the staircase (repeated null spaces) splits off the
+// exactly nilpotent part N of the zero eigenvalues (saturated channels: index <= 2 MAXK). H22 has no
+// eigenvalue on the imaginary axis: the sign function splits it into stable and unstable parts,
+// which are diagonalised (real 2x2 blocks for pairs). Each modal vector u (H22 u = u Lam) is lifted
+// to [y; u] with N y - y Lam = -X u, y = sum_j N^j X u Lam^-(j+1) (a finite sum: N^ni = 0).
 bool BasisBuilder::build(uint16_t S, int slot) {
-    static double H[N2 * N2], Pu[N2 * N2], Ps[N2 * N2], M4[N2 * N2], M5[N2 * N2], Wb[N2 * N2],
-        Wk[N2 * N2], V[N2 * N2];
+    static double H[N2 * N2], A[N2 * N2], Q[N2 * N2], Qk[N2 * N2], Pu[N2 * N2], Ps[N2 * N2],
+        M4[N2 * N2], M5[N2 * N2], Wb[N2 * N2], Wk[N2 * N2], V[N2 * N2], H2[N2 * N2];
     const int n = g_->n2();
     if (!g_->hmat(S, H)) return false;
     double dsc[N2];                                    // balancing: Hb = D^-1 H D
@@ -302,73 +352,214 @@ bool BasisBuilder::build(uint16_t S, int slot) {
         }
         if (!changed) break;
     }
-    double hmax = 0.0;
-    for (int i = 0; i < n * n; ++i) hmax = fmax(hmax, fabs(H[i]));
-    int ns = -1, nu = -1;
-    for (int fi = 0; fi < 3 && ns < 0; ++fi) {         // dichotomy, centre half-width delta
-        const double de = DELTA_FAC[fi] / g_->horizon();
-        for (int i = 0; i < n * n; ++i) { Pu[i] = H[i]; Ps[i] = H[i]; }
-        for (int i = 0; i < n; ++i) { Pu[i * n + i] -= de; Ps[i * n + i] += de; }
-        if (!sign_fn(Pu, n, M4, M5) || !sign_fn(Ps, n, M4, M5)) continue;
-        double tu = 0.0, ts = 0.0;
-        for (int i = 0; i < n * n; ++i) { Pu[i] *= 0.5; Ps[i] *= -0.5; }
-        for (int i = 0; i < n; ++i) {
-            Pu[i * n + i] += 0.5; Ps[i * n + i] += 0.5;
-            tu += Pu[i * n + i]; ts += Ps[i * n + i];
+    double hn = 0.0;                                   // ||Hb||_1
+    for (int j = 0; j < n; ++j) {
+        double c = 0.0;
+        for (int i = 0; i < n; ++i) c += fabs(H[i * n + j]);
+        hn = fmax(hn, c);
+    }
+    // staircase: A = Q^T Hb Q, block b (columns blk[b] .. blk[b+1]) = null space of the trailing block
+    for (int i = 0; i < n * n; ++i) { A[i] = H[i]; Q[i] = 0.0; }
+    for (int i = 0; i < n; ++i) Q[i * n + i] = 1.0;
+    int p = 0, ni = 0, blk[N2 + 1];
+    blk[0] = 0;
+    while (p < n) {
+        const int k = n - p, r = null_basis(A + p * n + p, k, n, 1e-11 * hn, Qk, Wk);
+        if (r == k) break;
+        for (int i = 0; i < k; ++i)                    // G: null vectors first
+            for (int j = 0; j < k; ++j) M4[i * k + j] = Qk[i * k + ((j < k - r) ? r + j : j - (k - r))];
+        for (int i = 0; i < n; ++i) {                  // A <- A G, Q <- Q G (columns p..)
+            double ta[N2], tq[N2];
+            for (int j = 0; j < k; ++j) {
+                double sa = 0.0, sq = 0.0;
+                for (int l = 0; l < k; ++l) {
+                    sa += A[i * n + p + l] * M4[l * k + j];
+                    sq += Q[i * n + p + l] * M4[l * k + j];
+                }
+                ta[j] = sa;
+                tq[j] = sq;
+            }
+            for (int j = 0; j < k; ++j) { A[i * n + p + j] = ta[j]; Q[i * n + p + j] = tq[j]; }
         }
-        if (fabs(tu - floor(tu + 0.5)) > 1e-6 || fabs(ts - floor(ts + 0.5)) > 1e-6) continue;
-        bool ok = true;
-        for (int w = 0; w < 2 && ok; ++w) {            // invariance residual (I - P) H P
+        for (int j = 0; j < n; ++j) {                  // A <- G^T A (rows p..)
+            double t[N2];
+            for (int i = 0; i < k; ++i) {
+                double s = 0.0;
+                for (int l = 0; l < k; ++l) s += M4[l * k + i] * A[(p + l) * n + j];
+                t[i] = s;
+            }
+            for (int i = 0; i < k; ++i) A[(p + i) * n + j] = t[i];
+        }
+        p += k - r;
+        blk[++ni] = p;
+    }
+    if (ni + 1 > NPOLY) return false;
+    double err = 0.0;                                  // exact structure: zero what the staircase made
+    for (int b = 0; b < ni; ++b)                       // round-off (block b's own and later rows)
+        for (int j = blk[b]; j < blk[b + 1]; ++j)
+            for (int i = blk[b]; i < n; ++i) { err = fmax(err, fabs(A[i * n + j])); A[i * n + j] = 0.0; }
+    if (err > 1e-9 * hn) return false;
+    // H22 = A[p.., p..]: stable / unstable by the sign function
+    const int k = n - p;
+    for (int i = 0; i < k; ++i)
+        for (int j = 0; j < k; ++j) H2[i * k + j] = A[(p + i) * n + p + j];
+    int ns = 0, nu = 0;
+    if (k > 0) {
+        for (int i = 0; i < k * k; ++i) Pu[i] = H2[i];
+        if (!sign_fn(Pu, k, M4, M5)) return false;
+        double tu = 0.0;
+        for (int i = 0; i < k * k; ++i) { Pu[i] *= 0.5; Ps[i] = -Pu[i]; }
+        for (int i = 0; i < k; ++i) { Pu[i * k + i] += 0.5; Ps[i * k + i] += 0.5; tu += Pu[i * k + i]; }
+        if (fabs(tu - floor(tu + 0.5)) > 1e-6) return false;
+        double h2 = 0.0;
+        for (int i = 0; i < k * k; ++i) h2 = fmax(h2, fabs(H2[i]));
+        for (int w = 0; w < 2; ++w) {                  // invariance residual (I - P) H P
             const double* P = w ? Ps : Pu;
-            mmul(H, P, M4, n);
-            mmul(P, M4, M5, n);
+            mmul(H2, P, M4, k);
+            mmul(P, M4, M5, k);
             double res = 0.0, pn = 1.0;
-            for (int i = 0; i < n * n; ++i) res = fmax(res, fabs(M4[i] - M5[i]));
-            for (int i = 0; i < n; ++i) {
+            for (int i = 0; i < k * k; ++i) res = fmax(res, fabs(M4[i] - M5[i]));
+            for (int i = 0; i < k; ++i) {
                 double r = 0.0;
-                for (int j = 0; j < n; ++j) r += fabs(P[i * n + j]);
+                for (int j = 0; j < k; ++j) r += fabs(P[i * k + j]);
                 pn = fmax(pn, r);
             }
             // round-off in P grows with its norm (nearly parallel subspaces): ||P||^2 eps ||H||
-            if (res > 1e-10 * hmax * pn * pn && hmax > 0) ok = false;
+            if (res > 1e-10 * h2 * pn * pn) return false;
         }
-        if (!ok) continue;
         nu = (int)floor(tu + 0.5);
-        ns = (int)floor(ts + 0.5);
+        ns = k - nu;
+        range_basis(Ps, k, ns, Wb, 0, Wk);
+        range_basis(Pu, k, nu, Wb, ns, Wk);
+        mmul(H2, Wb, M5, k);                           // T2 = Wb^-1 H22 Wb
+        for (int i = 0; i < k * k; ++i) M4[i] = Wb[i];
+        if (!lu(M4, k, M5, k)) return false;
     }
-    if (ns < 0) return false;
-    const int nc = n - ns - nu;
-    for (int i = 0; i < n * n; ++i) M4[i] = -Pu[i] - Ps[i];   // Pc
-    for (int i = 0; i < n; ++i) M4[i * n + i] += 1.0;
-    range_basis(Ps, n, ns, Wb, 0, Wk);
-    range_basis(M4, n, nc, Wb, ns, Wk);
-    range_basis(Pu, n, nu, Wb, ns + nc, Wk);
-    mmul(H, Wb, M5, n);                                // T = Wb^-1 Hb Wb
-    for (int i = 0; i < n * n; ++i) M4[i] = Wb[i];
-    if (!lu(M4, n, M5, n)) return false;
-    // modal stable/unstable blocks: V = diag(Vs, I, Vu)
+    // modal blocks of H22: columns of U = Wb diag(Vs, Vu) (k x k), eigenvalues rk/ik
+    double rk[N2], ik[N2];
+    for (int i = 0; i < k * k; ++i) V[i] = 0.0;
+    const int off[2] = {0, ns}, sz[2] = {ns, nu};
+    for (int b = 0; b < 2; ++b) {
+        const int kb = sz[b], o = off[b];
+        double Ab[MAXN * MAXN], Vb[MAXN * MAXN];
+        if (kb > MAXN) return false;
+        for (int i = 0; i < kb; ++i)
+            for (int j = 0; j < kb; ++j) Ab[i * kb + j] = M5[(o + i) * k + o + j];
+        if (!modal(Ab, kb, Vb, rk + o, ik + o)) return false;
+        for (int i = 0; i < kb; ++i)
+            for (int j = 0; j < kb; ++j) V[(o + i) * k + o + j] = Vb[i * kb + j];
+    }
+    mmul(Wb, V, M4, k);                                // U (k x k)
+    // per modal block: X u (XU) and the lift y (Y, p x k): t = (N^it X u) Lam^-(it+1), y = sum t
+    static double XU[N2 * N2], Y[N2 * N2];
+    double lift[N2];
+    for (int c = 0; c < k;) {
+        const int w = (ik[c] != 0.0) ? 2 : 1;
+        double t[2][N2], u2[2][N2];
+        const double a = rk[c], bi = ik[c], d = a * a + bi * bi;
+        for (int q = 0; q < w; ++q)
+            for (int i = 0; i < p; ++i) {
+                double s = 0.0;
+                for (int l = 0; l < k; ++l) s += A[i * n + p + l] * M4[l * k + c + q];
+                XU[i * k + c + q] = u2[q][i] = s;
+                Y[i * k + c + q] = 0.0;
+            }
+        for (int it = 0; it < ni; ++it) {
+            if (it > 0)
+                for (int q = 0; q < w; ++q)
+                    for (int i = 0; i < p; ++i) {
+                        double s = 0.0;
+                        for (int l = 0; l < p; ++l) s += A[i * n + l] * t[q][l];
+                        u2[q][i] = s;
+                    }
+            for (int i = 0; i < p; ++i) {
+                if (w == 1) t[0][i] = u2[0][i] / a;
+                else {                                 // [t0 t1] Lam^-1, Lam = [[a, b], [-b, a]]
+                    t[0][i] = (u2[0][i] * a + u2[1][i] * bi) / d;
+                    t[1][i] = (u2[1][i] * a - u2[0][i] * bi) / d;
+                }
+                for (int q = 0; q < w; ++q) Y[i * k + c + q] += t[q][i];
+            }
+        }
+        double yn = 0.0, un = 0.0;
+        for (int q = 0; q < w; ++q) {
+            for (int i = 0; i < p; ++i) yn = fmax(yn, fabs(Y[i * k + c + q]));
+            for (int i = 0; i < k; ++i) un = fmax(un, fabs(M4[i * k + c + q]));
+        }
+        // a large lift (slow mode close to the zero block: ill-conditioned eigenvectors) keeps the
+        // mode coupled to N in the centre, if its exponential stays moderate over the horizon
+        lift[c] = (yn > YMAX * un && fabs(a) * g_->horizon() <= ZMAX) ? yn / un : 0.0;
+        if (w == 2) lift[c + 1] = -1.0;
+        c += w;
+    }
+    int r = 0;                                         // up to NSD slow dimensions, largest lifts first
+    for (;;) {
+        int best = -1;
+        for (int c = 0; c < k; ++c)
+            if (lift[c] > 0.0 && (best < 0 || lift[c] > lift[best])) best = c;
+        if (best < 0) break;
+        const int w = (ik[best] != 0.0) ? 2 : 1;
+        if (r + w > NSD) { lift[best] = 0.0; continue; }
+        lift[best] = -2.0;                             // -2: slow (both columns of a pair)
+        if (w == 2) lift[best + 1] = -2.0;
+        r += w;
+    }
+    // final columns: stable decoupled | N (p) | slow (r) | unstable decoupled
+    const int nc = p + r;
+    int col[N2], fc = 0;                               // col[c]: final column of H22 column c
+    for (int pass = 0; pass < 3; ++pass) {
+        if (pass == 1) fc += p;
+        for (int c = 0; c < k;) {
+            const int w = (ik[c] != 0.0) ? 2 : 1;
+            const bool slow = lift[c] == -2.0, stable = c < ns;
+            if ((pass == 0 && !slow && stable) || (pass == 1 && slow) || (pass == 2 && !slow && !stable))
+                for (int q = 0; q < w; ++q) col[c + q] = fc++;
+            c += w;
+        }
+    }
+    int nsd = 0;
+    for (int c = 0; c < ns; ++c) nsd += lift[c] != -2.0;
     double* re = re_[slot];
     double* im = im_[slot];
-    for (int i = 0; i < n * n; ++i) V[i] = 0.0;
-    for (int i = 0; i < n; ++i) { re[i] = im[i] = 0.0; }
-    for (int i = 0; i < nc; ++i) V[(ns + i) * n + ns + i] = 1.0;
-    const int off[2] = {0, ns + nc}, sz[2] = {ns, nu};
-    for (int blk = 0; blk < 2; ++blk) {
-        const int k = sz[blk], o = off[blk];
-        double A[MAXN * MAXN], Vb[MAXN * MAXN];
-        if (k > MAXN) return false;
-        for (int i = 0; i < k; ++i)
-            for (int j = 0; j < k; ++j) A[i * k + j] = M5[(o + i) * n + o + j];
-        if (!modal(A, k, Vb, re + o, im + o)) return false;
-        for (int i = 0; i < k; ++i)
-            for (int j = 0; j < k; ++j) V[(o + i) * n + o + j] = Vb[i * k + j];
+    double* Tc = Tc_[slot];
+    for (int i = 0; i < n; ++i) re[i] = im[i] = 0.0;
+    for (int i = 0; i < n * n; ++i) { Wk[i] = 0.0; V[i] = 0.0; }   // Wa (A coordinates), T (n x n)
+    for (int j = 0; j < p; ++j) {
+        Wk[j * n + nsd + j] = 1.0;
+        for (int l = 0; l < p; ++l) V[(nsd + l) * n + nsd + j] = A[l * n + j];
+    }
+    for (int c = 0; c < k; ++c) {
+        const int f = col[c];
+        const bool slow = lift[c] == -2.0;
+        re[f] = rk[c];
+        im[f] = ik[c];
+        for (int i = 0; i < k; ++i) Wk[(p + i) * n + f] = M4[i * k + c];
+        if (slow)
+            for (int i = 0; i < p; ++i) V[(nsd + i) * n + f] = XU[i * k + c];   // coupling X u
+        else
+            for (int i = 0; i < p; ++i) Wk[i * n + f] = Y[i * k + c];          // lift
+    }
+    for (int c = 0; c < k;) {                          // modal blocks of T
+        const int f = col[c];
+        V[f * n + f] = rk[c];
+        if (ik[c] == 0.0) { ++c; continue; }
+        V[f * n + f + 1] = ik[c];
+        V[(f + 1) * n + f] = -ik[c];
+        V[(f + 1) * n + f + 1] = rk[c];
+        c += 2;
     }
     double* W = W_[slot];
     double* Wi = Wi_[slot];
-    double* Tc = Tc_[slot];
-    mmul(Wb, V, M4, n);                                // W = D Wb V
+    mmul(Q, Wk, Wb, n);                                // W = D Q Wa
+    {   // check Hb (Q Wa) = (Q Wa) T
+        mmul(H, Wb, M5, n);
+        mmul(Wb, V, M4, n);
+        double res = 0.0, wn = 0.0;
+        for (int i = 0; i < n * n; ++i) { res = fmax(res, fabs(M5[i] - M4[i])); wn = fmax(wn, fabs(Wb[i])); }
+        if (res > 1e-9 * hn * wn) return false;
+    }
     for (int i = 0; i < n; ++i)
-        for (int j = 0; j < n; ++j) W[i * n + j] = dsc[i] * M4[i * n + j];
+        for (int j = 0; j < n; ++j) W[i * n + j] = dsc[i] * Wb[i * n + j];
     double* cs = cs_[slot];                            // column norms: stored x is scaled by them
     for (int j = 0; j < n; ++j) {
         double q = 0.0;
@@ -382,35 +573,17 @@ bool BasisBuilder::build(uint16_t S, int slot) {
     for (int i = 0; i < nc; ++i) {
         double s = 0.0;
         for (int j = 0; j < nc; ++j) {
-            Tc[i * nc + j] = M5[(ns + i) * n + ns + j];
+            Tc[i * nc + j] = V[(nsd + i) * n + nsd + j];
             s += fabs(Tc[i * nc + j]);
         }
         tcn = fmax(tcn, s);
     }
-    double tcr = 0.0;                                  // ||Tc^24||^(1/24)
-    if (nc) {
-        for (int i = 0; i < nc * nc; ++i) M4[i] = Tc[i];
-        for (int k = 1; k < 24; ++k) {
-            for (int i = 0; i < nc; ++i)
-                for (int j = 0; j < nc; ++j) {
-                    double s = 0.0;
-                    for (int l = 0; l < nc; ++l) s += M4[i * nc + l] * Tc[l * nc + j];
-                    M5[i * nc + j] = s;
-                }
-            for (int i = 0; i < nc * nc; ++i) M4[i] = M5[i];
-        }
-        for (int i = 0; i < nc; ++i) {
-            double s = 0.0;
-            for (int j = 0; j < nc; ++j) s += fabs(M4[i * nc + j]);
-            tcr = fmax(tcr, s);
-        }
-        tcr = pow(tcr, 1.0 / 24);
-    }
     SetBasis& b = sb_[slot];
-    b.tcr = tcr;
     b.S = S;
-    b.ns = (uint8_t)ns;
+    b.ns = (uint8_t)nsd;
     b.nc = (uint8_t)nc;
+    b.nz = (uint8_t)p;
+    b.ni = (uint8_t)ni;
     b.tcn = tcn;
     b.W = W;
     b.Wi = Wi;

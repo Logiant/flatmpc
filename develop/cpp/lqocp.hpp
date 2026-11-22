@@ -51,7 +51,8 @@ constexpr int MAX_TAU_NEWTON = 8;    // Newton iterations on the junction times 
 constexpr double KAP_PLAIN = 3.0;    // violation ratio up to which kappa0 -> 1 is tried in one step
 constexpr int MAX_GEN_ITS = 1000;    // total Newton iterations, general cost (all homotopy steps)
 constexpr double DL_MIN = 1e-3;      // homotopy stall (feasible runs use steps >= 0.03 in log kappa)
-constexpr int NPOLY = 32;            // max terms of an arc's centre polynomial (general cost)
+constexpr int NPOLY = 2 * MAXK + 1;  // terms of an arc's centre polynomial: nilpotency index + 1
+constexpr int NSD = 8;               // max slow modal dimensions coupled into the centre (general cost)
 
 enum Method { METHOD_TAU = 0, METHOD_NEWTON = 1 };
 
@@ -202,15 +203,18 @@ static_assert(NB >= 1 && NCK >= 1, "LQOCP_NB and LQOCP_NCK must be >= 1");
 
 // Bound-independent primitive of one active set S: H_S = W diag(Ls, Tc, Lu) W^-1, where the
 // stable/unstable parts are modal (1x1 real or 2x2 [[re, im], [-im, re]] blocks) and Tc is the
-// centre block (|Re eig| <= 1/T, nearly nilpotent). H_S depends only on WHICH rows are
+// centre block Tc = [[N, X], [0, Ls]]: N (nz x nz) holds the zero eigenvalues of the saturated
+// channels, exactly nilpotent (staircase form, strictly block upper triangular, N^ni = 0); Ls holds
+// the slow modal blocks whose eigenvectors are too close to N's subspace to split off (re/im of
+// their columns are set), coupled to N by X. e^{Tc L} is then exact in closed form: a polynomial
+// in N plus the phi-functions of the slow eigenvalues (NOTES.md section 12). H_S depends only on WHICH rows are
 // active, not on the side, so one basis serves S and its mirror: key basis_key(S). Arrays may
 // live in flash.
 inline uint16_t basis_key(uint16_t S) { return (uint16_t)((S | (S >> 1)) & 0x5555u); }
 struct SetBasis {
     uint16_t S;                      // basis_key of the sets it serves
-    uint8_t ns, nc;                  // nu = 2n - ns - nc
+    uint8_t ns, nc, nz, ni;          // nu = 2n - ns - nc; nz: size of N; ni: index of N (<= 2 MAXK)
     double tcn;                      // ||Tc||_inf
-    double tcr;                      // ||Tc^24||_inf^(1/24) (Taylor radius of e^{Tc L})
     const double* W;                 // 2n x 2n, row-major
     const double* Wi;                // W^-1
     const double* re;                // 2n modal real parts (stable / unstable columns)
@@ -272,8 +276,12 @@ private:
         double L;
         int m;                       // channels (rows j >= m are not filled)
         int np;                      // centre polynomial terms
+        int nsb, sk, nz;             // slow blocks, phi terms per block (ni + 2), size of N
+        int sc[NSD];                 // first centre column of each slow block
         double amp[MAXM][N2];        // modal amplitudes (a pair: P, Q of A = P - iQ)
         double poly[MAXM][NPOLY];
+        double sl[MAXM][NSD][NPOLY + 1];      // slow block q: sum_k Re[A_k g_k(sig)], A_k = (P, -Q)
+                                              // in the slots of its columns sc[q] - nz (+1: pair)
         double c[MAXM];
     };
     struct RowFn {                   // one switching row g0 + G wt on the arc of F
@@ -281,6 +289,12 @@ private:
         double G[MAXM], c0, scale;
         double u(int i) const { double s = 0.0; for (int j = 0; j < F->m; ++j) s += G[j] * F->amp[j][i]; return s; }
         double p(int k) const { double s = 0.0; for (int j = 0; j < F->m; ++j) s += G[j] * F->poly[j][k]; return s; }
+        double s(int q, int k, int c) const {
+            if (c && F->b->im[F->b->ns + F->sc[q]] == 0.0) return 0.0;
+            double t = 0.0;
+            for (int j = 0; j < F->m; ++j) t += G[j] * F->sl[j][F->sc[q] - F->nz + c][k];
+            return t;
+        }
     };
     const Problem* p_;
     BasisFn bfn_;
@@ -298,6 +312,8 @@ private:
     int budget_;                     // Newton iterations left (iteration cap)
     bool cert_;                      // the BVP solution in place was certified by the walk
     double wthr_;                    // largest switching-row level the walk certified
+    mutable uint16_t bkey_;          // basis key whose BasisFn lookup failed (0xFFFF: none)
+    char why_[40];                   // failure text of bfail()
     GResult* R_out;
     // homotopy / structure
     int an_, hn_, wn_;
@@ -332,6 +348,9 @@ private:
     bool chan(const Arc& a, ArcFn& F) const;
     void rowfn(const ArcFn& F, const double* G, double g0, RowFn& f) const;
     void feval(const RowFn& f, double sig, int nd, double* d) const;
+    void scoef(const RowFn& f, int q, int nder, double (*A)[2]) const;
+    double sbound(const RowFn& f, int nder, double t, bool full) const;
+    void sadd(const RowFn& f, double sig, int nd, double* d) const;
     __attribute__((noinline)) void ptaylor(const RowFn& f, double sig, int nd, double* d) const;
     double node(const RowFn& f, double lo, double hi, double* d, double* M2) const;
     double froot(const RowFn& f, double lo, double hi) const;
@@ -372,15 +391,17 @@ private:
     bool propose(const uint16_t* seq, int N, const double* tau, int* ndeg);
     bool correct(int* its, int* outer, int* ndeg, int rounds);
     void begin(GResult& R, int max_its);
+    const char* bfail();
     bool cold(GResult& R, int max_its);
     bool finish(GResult& R, bool conv, const char* why, int its, int nsteps, int ndeg);
     double zmax(const uint16_t* seq, int N, const double* tau) const;
 };
 
-// Host helper: computes SetBasis data on demand (sign-function dichotomy + modal blocks).
+// Host helper: computes SetBasis data on demand (staircase + sign function + modal blocks).
+// A key whose build failed is remembered and not rebuilt.
 class BasisBuilder {
 public:
-    void attach(const GSolver* g) { g_ = g; n_ = 0; }
+    void attach(const GSolver* g) { g_ = g; n_ = nbad_ = 0; }
     static const SetBasis* fn(void* ctx, uint16_t S) { return static_cast<BasisBuilder*>(ctx)->get(S); }
     const SetBasis* get(uint16_t S);
     int count() const { return n_; }
@@ -388,7 +409,8 @@ public:
 
 private:
     const GSolver* g_ = nullptr;
-    int n_ = 0;
+    int n_ = 0, nbad_ = 0;
+    uint16_t bad_[MAXSETS];
     SetBasis sb_[MAXSETS];
     double W_[MAXSETS][N2 * N2], Wi_[MAXSETS][N2 * N2], re_[MAXSETS][N2], im_[MAXSETS][N2],
         Tc_[MAXSETS][N2 * N2], cs_[MAXSETS][N2];

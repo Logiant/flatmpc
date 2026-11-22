@@ -105,8 +105,8 @@ int main(int argc, char** argv) {
     std::fprintf(f, "static const lqocp::SetBasis TINY_BASES[%d] LQOCP_FLASH = {\n", nb);
     for (int s = 0; s < nb; ++s) {
         const lqocp::SetBasis& b = g_basis.at(s);
-        std::fprintf(f, "  {%u, %u, %u, %.17g, %.17g, TB_W%d, TB_Wi%d, TB_re%d, TB_im%d, TB_Tc%d, TB_cs%d},\n",
-                     b.S, b.ns, b.nc, b.tcn, b.tcr, s, s, s, s, s, s);
+        std::fprintf(f, "  {%u, %u, %u, %u, %u, %.17g, TB_W%d, TB_Wi%d, TB_re%d, TB_im%d, TB_Tc%d, TB_cs%d},\n",
+                     b.S, b.ns, b.nc, b.nz, b.ni, b.tcn, s, s, s, s, s, s);
     }
     std::fprintf(f, "};\n");
     std::fclose(f);
