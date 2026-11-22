@@ -1134,8 +1134,10 @@ double xexp(double x) {
     if (x > 709.0) return HUGE_VAL;
     const double k = floor(x * 1.4426950408889634 + 0.5);
     const double r = (x - k * 6.93147180369123816490e-01) - k * 1.90821492927058770002e-10;
-    double p = 1.0;
-    for (int i = 13; i >= 1; --i) p = 1.0 + p * r / i;
+    static const double inv[14] = {0, 1.0, 1.0 / 2, 1.0 / 3, 1.0 / 4, 1.0 / 5, 1.0 / 6, 1.0 / 7,
+                                   1.0 / 8, 1.0 / 9, 1.0 / 10, 1.0 / 11, 1.0 / 12, 1.0 / 13};
+    double p = 1.0;                                    // (no divisions: slow on a Cortex-M7)
+    for (int i = 13; i >= 1; --i) p = 1.0 + p * r * inv[i];
     return ldexp(p, (int)k);
 }
 
@@ -1726,14 +1728,18 @@ void GSolver::feval(const RowFn& f, double sig, int nd, double* d) const {
     if (nd > 1) d[2] += p2;
 }
 
-// adds the derivatives 0..nd at sig of the centre polynomial (Taylor shift)
+// adds the derivatives 0..nd at sig of the centre polynomial: k! sum_j C(j, k) p_j sig^(j - k)
 void GSolver::ptaylor(const RowFn& f, double sig, int nd, double* d) const {
     const int np = f.F->np;
-    double q[NPOLY], fk = 1.0;
-    for (int k = 0; k < np; ++k) q[k] = f.p(k);
+    double fk = 1.0;
     for (int k = 0; k <= nd && k < np; ++k) {
-        for (int i = np - 2; i >= k; --i) q[i] += sig * q[i + 1];
-        d[k] += fk * q[k];
+        double s = 0.0, c = 1.0, sp = 1.0;
+        for (int j = k; j < np; ++j) {
+            s += f.p(j) * c * sp;
+            c = c * (j + 1) / (j + 1 - k);
+            sp *= sig;
+        }
+        d[k] += fk * s;
         fk *= k + 1;
     }
 }
@@ -1771,13 +1777,16 @@ double GSolver::node(const RowFn& f, double lo, double hi, double* d, double* M2
         else { v += x; v1 += x1; M2s += A * l2 * ee; }
     }
     if (np > 0) {
-        double q[NPOLY], p0 = 0.0, p1 = 0.0, s = 0.0, hk = 1.0;
+        double p0 = 0.0, p1 = 0.0, s = 0.0, hk = 1.0;
         for (int k = np - 1; k >= 0; --k) { p1 = p1 * m + p0; p0 = p0 * m + f.p(k); }
-        const int nq = np - 2;                         // p'' at m + t: Taylor shift to m
-        for (int k = 0; k < nq; ++k) q[k] = (k + 2.0) * (k + 1.0) * f.p(k + 2);
-        for (int k = 0; k < nq; ++k) {
-            for (int i = nq - 2; i >= k; --i) q[i] += m * q[i + 1];
-            s += fabs(q[k]) * hk;
+        for (int k = 0; k + 2 < np; ++k) {             // p''(m + t) = sum_k q_k t^k
+            double q = 0.0, c = 1.0, mp = 1.0;         // q_k = sum_j j (j-1) p_j C(j-2, k) m^(j-2-k)
+            for (int j = k + 2; j < np; ++j) {
+                q += j * (j - 1.0) * f.p(j) * c * mp;
+                c = c * (j - 1) / (j - 1 - k);
+                mp *= m;
+            }
+            s += fabs(q) * hk;
             hk *= h;
         }
         d0 += p0; d1 += p1; M2 += s;
