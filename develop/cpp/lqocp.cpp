@@ -1874,19 +1874,20 @@ void GSolver::rtaylor(const ArcFn& F, const double* G, double g0, double sig, do
     for (int k = 1; k < GN; ++k) { fk *= k; cs[k] /= fk; }
 }
 
-bool GSolver::glex_ok(uint16_t S, const ArcFn& F, double sig, double h) const {
+bool GSolver::glex_ok(uint16_t S, const ArcFn& F, double sig, double h, double* tol) const {
     int keys[2 * MAXM], il;
-    double G[2 * MAXM][MAXM], g0[2 * MAXM], tol;
+    double G[2 * MAXM][MAXM], g0[2 * MAXM];
     const int nk = gphi(S, keys, G, g0);
     for (int r = 0; r < nk; ++r)
-        if (lead(F, G[r], g0[r], sig, h, &tol, &il) > 0) return false;
+        if (lead(F, G[r], g0[r], sig, h, &tol[r], &il) > 0) return false;
     return true;
 }
 
-bool GSolver::glex_set(const ArcFn& F, double sig, double h, uint16_t guess, uint16_t* out) const {
-    if (guess != 0xFFFFu && valid_set(guess) && glex_ok(guess, F, sig, h)) { *out = guess; return true; }
+// the minimiser's set just right of sig; tol[r] gets the lead() tolerances of its rows
+bool GSolver::glex_set(const ArcFn& F, double sig, double h, uint16_t guess, uint16_t* out, double* tol) const {
+    if (guess != 0xFFFFu && valid_set(guess) && glex_ok(guess, F, sig, h, tol)) { *out = guess; return true; }
     return for_sets([&](uint16_t S) {
-        if (!glex_ok(S, F, sig, h)) return false;
+        if (!glex_ok(S, F, sig, h, tol)) return false;
         *out = S;
         return true;
     });
@@ -1926,16 +1927,17 @@ double GSolver::lead(const ArcFn& F, const double* G, double g0, double sig, dou
 }
 
 // Events of set S's switching rows on (sig, L] of the arc of F (a row whose leading Taylor
-// coefficient at sig is positive switches at sig): first root per row, *s1 the earliest.
+// coefficient at sig is positive switches at sig; when glex_ok(S) at sig just passed, lexed holds
+// its row tolerances and none does): first root per row, *s1 the earliest.
 int GSolver::events(const ArcFn& F, uint16_t S, double sig, double h, double* rootk, bool* simplek,
-                    int* keyk, double* s1p) {
+                    int* keyk, double* s1p, const double* lexed) {
     int keys[2 * MAXM], nc = 0;
     double G[2 * MAXM][MAXM], g0[2 * MAXM], s1 = HUGE_VAL;
     const int nk = gphi(S, keys, G, g0);
     for (int r = 0; r < nk; ++r) {
-        double tol;
+        double tol = lexed ? lexed[r] : 0.0;           // lexed: glex_ok(S) at sig passed, no lead > 0
         int ilead;
-        if (lead(F, G[r], g0[r], sig, h, &tol, &ilead) > 0) {
+        if (!lexed && lead(F, G[r], g0[r], sig, h, &tol, &ilead) > 0) {
             rootk[nc] = sig; simplek[nc] = (ilead == 1); keyk[nc++] = keys[r];
             if (sig < s1) s1 = sig;
             continue;
@@ -1976,9 +1978,12 @@ bool GSolver::gwalk(const uint16_t* seq, int N, const double* tau, int* ndeg) {
         a.x = R_out->x[ka];
         if (!chan(a, F)) return false;
         const double h = hloc(*a.b), t0 = a.t0;
+        double ltol[2 * MAXM];
+        bool lexed = false;
         if (S == 0xFFFFu) {
-            if (!glex_set(F, 0.0, h, 0, &S)) return false;    // (a) initial set
+            if (!glex_set(F, 0.0, h, 0, &S, ltol)) return false;    // (a) initial set
             wseq_[ns++] = S;
+            lexed = true;
         }
         double sig = 0.0;
         int stall = 0;
@@ -1986,7 +1991,8 @@ bool GSolver::gwalk(const uint16_t* seq, int N, const double* tau, int* ndeg) {
             double rootk[2 * MAXM], s1 = HUGE_VAL;
             bool simplek[2 * MAXM];
             int keyk[2 * MAXM];
-            const int nc = events(F, S, sig, h, rootk, simplek, keyk, &s1);
+            const int nc = events(F, S, sig, h, rootk, simplek, keyk, &s1, lexed ? ltol : nullptr);
+            lexed = false;
             if (nc == 0) break;
             if (t0 + s1 >= T * (1 - 1e-14)) break;
             int ngroup = 0, gkey = -1;
@@ -2005,7 +2011,8 @@ bool GSolver::gwalk(const uint16_t* seq, int N, const double* tau, int* ndeg) {
             if (Snew == 0xFFFFu) {
                 ++*ndeg;
                 const uint16_t guess = (uint16_t)(S ^ gmask);
-                if (!glex_set(F, s1, h, valid_set(guess) ? guess : 0xFFFFu, &Snew)) return false;
+                if (!glex_set(F, s1, h, valid_set(guess) ? guess : 0xFFFFu, &Snew, ltol)) return false;
+                lexed = true;
             }
             if (Snew != S) {
                 if (ns >= NA) { capfail_ = true; return false; }
@@ -2814,11 +2821,11 @@ bool GSolver::correct(int* its, int* outer, int* ndeg, int rounds) {
             for (int i = 0; i + 1 < N; ++i) atau_[i] = tau[i];
             return true;
         }
+        if (budget_ <= 0) { ok = false; break; }        // cap: return the Newton iterate
         N = wn_;
         for (int i = 0; i < N; ++i) seq[i] = wseq_[i];
         for (int i = 0; i + 1 < N; ++i) tau[i] = wtau_[i];
         ++*outer;
-        if (budget_ <= 0) { ok = false; break; }        // cap: return the walked structure
     }
     an_ = N;
     for (int i = 0; i < N; ++i) aseq_[i] = seq[i];

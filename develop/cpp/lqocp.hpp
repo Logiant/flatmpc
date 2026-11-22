@@ -337,12 +337,12 @@ private:
     void wint(const ArcFn& F, double sa, double sb, double* I) const;
     void rtaylor(const ArcFn& F, const double* G, double g0, double sig, double* cs) const;
     void gscale(double kap);
-    bool glex_ok(uint16_t S, const ArcFn& F, double sig, double h) const;
-    bool glex_set(const ArcFn& F, double sig, double h, uint16_t guess, uint16_t* out) const;
+    bool glex_ok(uint16_t S, const ArcFn& F, double sig, double h, double* tol) const;
+    bool glex_set(const ArcFn& F, double sig, double h, uint16_t guess, uint16_t* out, double* tol) const;
     __attribute__((noinline)) double lead(const ArcFn& F, const double* G, double g0, double sig, double h,
                                           double* tol, int* ilead) const;
     __attribute__((noinline)) int events(const ArcFn& F, uint16_t S, double sig, double h, double* rootk,
-                                         bool* simplek, int* keyk, double* s1);
+                                         bool* simplek, int* keyk, double* s1, const double* lexed);
     bool gwalk(const uint16_t* seq, int N, const double* tau, int* ndeg);
     double gverify(const uint16_t* seq, int N, const double* tau);
     __attribute__((noinline)) double gends(const uint16_t* seq, int N, const double* tau) const;
