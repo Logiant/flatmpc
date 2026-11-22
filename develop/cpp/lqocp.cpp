@@ -1687,7 +1687,7 @@ void GSolver::rowfn(const ArcFn& F, const double* G, double g0, RowFn& f) const 
     f.scale = sc + fabs(c0);
 }
 
-// derivatives d[0..nd] of f at sig (closed form)
+// derivatives d[0..nd] of f at sig (closed form; for nd > 2 without the centre polynomial)
 void GSolver::feval(const RowFn& f, double sig, int nd, double* d) const {
     const SetBasis& b = *f.F->b;
     const double L = f.F->L;
@@ -1714,7 +1714,22 @@ void GSolver::feval(const RowFn& f, double sig, int nd, double* d) const {
             i += 2;
         }
     }
-    double q[NPOLY], fk = 1.0;                         // polynomial: Taylor shift to sig
+    if (nd > 2) return;                                // (the caller adds ptaylor)
+    double p0 = 0.0, p1 = 0.0, p2 = 0.0;              // polynomial and 2 derivatives: Horner
+    for (int k = np - 1; k >= 0; --k) {
+        p2 = p2 * sig + 2.0 * p1;
+        p1 = p1 * sig + p0;
+        p0 = p0 * sig + f.p(k);
+    }
+    d[0] += p0;
+    if (nd > 0) d[1] += p1;
+    if (nd > 1) d[2] += p2;
+}
+
+// adds the derivatives 0..nd at sig of the centre polynomial (Taylor shift)
+void GSolver::ptaylor(const RowFn& f, double sig, int nd, double* d) const {
+    const int np = f.F->np;
+    double q[NPOLY], fk = 1.0;
     for (int k = 0; k < np; ++k) q[k] = f.p(k);
     for (int k = 0; k <= nd && k < np; ++k) {
         for (int i = np - 2; i >= k; --i) q[i] += sig * q[i + 1];
@@ -1826,28 +1841,17 @@ void GSolver::rtaylor(const ArcFn& F, const double* G, double g0, double sig, do
     RowFn f;
     rowfn(F, G, g0, f);
     feval(f, sig, GN - 1, cs);
+    ptaylor(f, sig, GN - 1, cs);
     double fk = 1.0;
     for (int k = 1; k < GN; ++k) { fk *= k; cs[k] /= fk; }
 }
 
 bool GSolver::glex_ok(uint16_t S, const ArcFn& F, double sig, double h) const {
-    int keys[2 * MAXM];
-    double G[2 * MAXM][MAXM], g0[2 * MAXM], cs[GN];
+    int keys[2 * MAXM], il;
+    double G[2 * MAXM][MAXM], g0[2 * MAXM], tol;
     const int nk = gphi(S, keys, G, g0);
-    for (int r = 0; r < nk; ++r) {
-        rtaylor(F, G[r], g0[r], sig, cs);
-        double tol = 0.0, hp = 1.0;
-        for (int k = 0; k < GN; ++k) { tol += fabs(cs[k]) * hp; hp *= h; }
-        tol = 1e-12 * (tol + R_);
-        hp = 1.0;
-        for (int k = 0; k < GN; ++k) {
-            if (fabs(cs[k]) * hp > tol) {
-                if (cs[k] > 0) return false;
-                break;
-            }
-            hp *= h;
-        }
-    }
+    for (int r = 0; r < nk; ++r)
+        if (lead(F, G[r], g0[r], sig, h, &tol, &il) > 0) return false;
     return true;
 }
 
@@ -1858,6 +1862,52 @@ bool GSolver::glex_set(const ArcFn& F, double sig, double h, uint16_t guess, uin
         *out = S;
         return true;
     });
+}
+
+// Leading Taylor coefficient at sig of the row g0 + G wt (coefficients that matter at scale h;
+// 0 if none), its order and the tolerance used
+double GSolver::lead(const ArcFn& F, const double* G, double g0, double sig, double h, double* tolp,
+                     int* ilead) const {
+    double cs[GN], tol = 0.0, hk = 1.0;
+    rtaylor(F, G, g0, sig, cs);
+    for (int k = 0; k < GN; ++k) { tol += fabs(cs[k]) * hk; hk *= h; }
+    tol = 1e-12 * (tol + R_);
+    *tolp = tol;
+    *ilead = 0;
+    hk = 1.0;
+    for (int k = 0; k < GN; ++k, hk *= h)
+        if (fabs(cs[k]) * hk > tol) { *ilead = k; return cs[k]; }
+    return 0.0;
+}
+
+// Events of set S's switching rows on (sig, L] of the arc of F (a row whose leading Taylor
+// coefficient at sig is positive switches at sig): first root per row, *s1 the earliest.
+int GSolver::events(const ArcFn& F, uint16_t S, double sig, double h, double* rootk, bool* simplek,
+                    int* keyk, double* s1p) {
+    int keys[2 * MAXM], nc = 0;
+    double G[2 * MAXM][MAXM], g0[2 * MAXM], s1 = HUGE_VAL;
+    const int nk = gphi(S, keys, G, g0);
+    for (int r = 0; r < nk; ++r) {
+        double tol;
+        int ilead;
+        if (lead(F, G[r], g0[r], sig, h, &tol, &ilead) > 0) {
+            rootk[nc] = sig; simplek[nc] = (ilead == 1); keyk[nc++] = keys[r];
+            if (sig < s1) s1 = sig;
+            continue;
+        }
+        RowFn f;
+        rowfn(F, G[r], g0[r], f);
+        double root;
+        bool simple;
+        const double thr = fmax(tol, 1e-12 * (f.scale + R_));
+        wthr_ = fmax(wthr_, thr);
+        if (sig < F.L && bb(f, sig, F.L, thr, 0.0, true, &root, &simple) > 0) {
+            rootk[nc] = root; simplek[nc] = simple; keyk[nc++] = keys[r];
+            if (root < s1) s1 = root;
+        }
+    }
+    *s1p = s1;
+    return nc;
 }
 
 // Exact event walk of the pointwise H-minimiser along the current BVP solution -> wseq_/wtau_.
@@ -1888,41 +1938,10 @@ bool GSolver::gwalk(const uint16_t* seq, int N, const double* tau, int* ndeg) {
         double sig = 0.0;
         int stall = 0;
         for (;;) {
-            int keys[2 * MAXM];
-            double G[2 * MAXM][MAXM], g0[2 * MAXM];
-            const int nk = gphi(S, keys, G, g0);
-            if (nk == 0) break;
-            double rootk[2 * MAXM];
+            double rootk[2 * MAXM], s1 = HUGE_VAL;
             bool simplek[2 * MAXM];
-            int keyk[2 * MAXM], nc = 0;
-            double s1 = HUGE_VAL;
-            for (int r = 0; r < nk; ++r) {
-                double cs[GN];
-                rtaylor(F, G[r], g0[r], sig, cs);
-                double tol = 0.0, hk = 1.0;
-                for (int k = 0; k < GN; ++k) { tol += fabs(cs[k]) * hk; hk *= h; }
-                tol = 1e-12 * (tol + R_);
-                double lead = 0.0;
-                int ilead = 0;
-                hk = 1.0;
-                for (int k = 0; k < GN; ++k, hk *= h)
-                    if (fabs(cs[k]) * hk > tol) { lead = cs[k]; ilead = k; break; }
-                if (lead > 0) {
-                    rootk[nc] = sig; simplek[nc] = (ilead == 1); keyk[nc++] = keys[r];
-                    if (sig < s1) s1 = sig;
-                    continue;
-                }
-                RowFn f;
-                rowfn(F, G[r], g0[r], f);
-                double root;
-                bool simple;
-                const double thr = fmax(tol, 1e-12 * (f.scale + R_));
-                wthr_ = fmax(wthr_, thr);
-                if (sig < a.L && bb(f, sig, a.L, thr, 0.0, true, &root, &simple) > 0) {
-                    rootk[nc] = root; simplek[nc] = simple; keyk[nc++] = keys[r];
-                    if (root < s1) s1 = root;
-                }
-            }
+            int keyk[2 * MAXM];
+            const int nc = events(F, S, sig, h, rootk, simplek, keyk, &s1);
             if (nc == 0) break;
             if (t0 + s1 >= T * (1 - 1e-14)) break;
             int ngroup = 0, gkey = -1;
@@ -2028,14 +2047,20 @@ void GSolver::wint(const ArcFn& F, double sa, double sb, double* I) const {
     }
 }
 
-// J in closed form. Along an extremal d/dt (lambda's) = -s'Qs - |vt|^2 - mu'b (mu' (Mt vt - b) = 0),
+// lambda(0)'x0 - lambda(T)'s(T)
+double GSolver::gends(const uint16_t* seq, int N, const double* tau) const {
+    double z0[N2 + 1], J = 0.0;
+    zstart(seq, N, tau, 0, z0);
+    for (int i = 0; i < n_; ++i) J += z0[n_ + i] * x0_[i] - zT_[n_ + i] * zT_[i];
+    return J;
+}
+
+// J in closed form (ends = gends()). Along an extremal d/dt (lambda's) = -s'Qs - |vt|^2 - mu'b (mu' (Mt vt - b) = 0),
 // so J = 1/2 [lambda(0)'x0 - lambda(T)'s(T) - int mu'b dt] + terminal cost; mu is linear in wt
 // on a saturated arc, and int wt = sum of modal phi1 terms + the integrated polynomial.
-double GSolver::gcost(const uint16_t* seq, int N, const double* tau) {
+double GSolver::gcost(const uint16_t* seq, int N, const double* tau, double ends) {
     const int n = n_;
-    double z0[N2 + 1], J = 0.0, mub = 0.0;
-    zstart(seq, N, tau, 0, z0);
-    for (int i = 0; i < n; ++i) J += z0[n + i] * x0_[i] - zT_[n + i] * zT_[i];
+    double J = ends, mub = 0.0;
     ArcFn F;
     for (int ka = 0; ka < N; ++ka) {
         if (!seq[ka]) continue;
@@ -2917,7 +2942,7 @@ bool GSolver::finish(GResult& R, bool conv, const char* why, int its, int nsteps
     // the walk's certificate suffices when its levels are below the verification tolerance
     R.pmp_violation = (cert && wthr_ <= VTOL * R_) ? wthr_ : gverify(R.S, R.narcs, R.t1);
     if (conv && !(R.pmp_violation <= VTOL * R_)) { conv = false; why = "optimality check failed"; }
-    R.cost = gcost(R.S, R.narcs, R.t1);
+    R.cost = gcost(R.S, R.narcs, R.t1, gends(R.S, R.narcs, R.t1));
     R.converged = conv;
     R.failure = conv ? nullptr : (why ? why : "not converged");
     return conv;

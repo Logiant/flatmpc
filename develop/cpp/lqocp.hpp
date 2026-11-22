@@ -328,6 +328,7 @@ private:
     bool chan(const Arc& a, ArcFn& F) const;
     void rowfn(const ArcFn& F, const double* G, double g0, RowFn& f) const;
     void feval(const RowFn& f, double sig, int nd, double* d) const;
+    __attribute__((noinline)) void ptaylor(const RowFn& f, double sig, int nd, double* d) const;
     double fbound2(const RowFn& f, double lo, double hi) const;
     double froot(const RowFn& f, double lo, double hi) const;
     double bb(const RowFn& f, double a, double b, double thr, double atol, bool first, double* root,
@@ -338,9 +339,14 @@ private:
     void gscale(double kap);
     bool glex_ok(uint16_t S, const ArcFn& F, double sig, double h) const;
     bool glex_set(const ArcFn& F, double sig, double h, uint16_t guess, uint16_t* out) const;
+    __attribute__((noinline)) double lead(const ArcFn& F, const double* G, double g0, double sig, double h,
+                                          double* tol, int* ilead) const;
+    __attribute__((noinline)) int events(const ArcFn& F, uint16_t S, double sig, double h, double* rootk,
+                                         bool* simplek, int* keyk, double* s1);
     bool gwalk(const uint16_t* seq, int N, const double* tau, int* ndeg);
     double gverify(const uint16_t* seq, int N, const double* tau);
-    double gcost(const uint16_t* seq, int N, const double* tau);
+    __attribute__((noinline)) double gends(const uint16_t* seq, int N, const double* tau) const;
+    double gcost(const uint16_t* seq, int N, const double* tau, double ends);
     double gmax_ratio(const uint16_t* seq, int N, const double* tau);
     void init_rel(int nb);
     bool fstep(const Arc& a, int nb);
