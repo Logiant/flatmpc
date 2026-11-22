@@ -322,9 +322,15 @@ bool BasisBuilder::build(uint16_t S, int slot) {
             const double* P = w ? Ps : Pu;
             mmul(H, P, M4, n);
             mmul(P, M4, M5, n);
-            double res = 0.0;
+            double res = 0.0, pn = 1.0;
             for (int i = 0; i < n * n; ++i) res = fmax(res, fabs(M4[i] - M5[i]));
-            if (res > 1e-10 * hmax && hmax > 0) ok = false;
+            for (int i = 0; i < n; ++i) {
+                double r = 0.0;
+                for (int j = 0; j < n; ++j) r += fabs(P[i * n + j]);
+                pn = fmax(pn, r);
+            }
+            // round-off in P grows with its norm (nearly parallel subspaces): ||P||^2 eps ||H||
+            if (res > 1e-10 * hmax * pn * pn && hmax > 0) ok = false;
         }
         if (!ok) continue;
         nu = (int)floor(tu + 0.5);
