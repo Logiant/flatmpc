@@ -189,7 +189,9 @@ def compare_switches(dev, r, tol):
 
 # ================================================================================================
 P_IMC = ([pytest.param(i, m, c, id=f"{i}-{m}-{c}") for i in IMPLS for m in METHODS for c in CASES]
-         + [pytest.param(i, "newton", c, id=f"{i}-newton-{c}") for i in IMPLS for c in LQ_CASES])
+         + [pytest.param(i, "newton", c, id=f"{i}-newton-{c}") for i in IMPLS for c in LQ_CASES]
+         # option C: method="riccati" (section-8 PDAS/Riccati solver) is Python-only for a general cost
+         + [pytest.param("py", "riccati", c, id=f"py-riccati-{c}") for c in LQ_CASES])
 
 
 def _gauss_general(c, ufun, xfun, T, nsub, breaks=(), order=8):
@@ -676,3 +678,22 @@ def test_lq_tau_behaviour(impl, refs, record):
         record("outcome", f"rc={s.returncode} converged={j.get('converged')}")
         if j.get("converged") is True:
             assert abs(float(j["cost"]) - Jr) <= TOL_COST_REF * Jr, f"tau converged with cost {j['cost']} vs ref {Jr}"
+
+
+# ---- option C: riccati vs newton (Python, general cost) and C++ riccati exit code ----------------
+@pytest.mark.parametrize("case", LQ_CASES)
+def test_py_riccati_vs_newton(case, refs, record):
+    a = get_solution("py", case, "riccati")
+    b = get_solution("py", case, "newton")
+    msgs, _ = _agree(a, b, get_ref(refs, case), record)
+    assert not msgs, "py riccati vs newton disagree: " + ", ".join(msgs)
+
+
+@pytest.mark.parametrize("case", LQ_CASES)
+def test_cpp_riccati_general_exit(case, record):
+    """C++ 'riccati' with a general cost is documented as not ported: must exit 3 cleanly, no crash."""
+    if not harness.cpp_available():
+        pytest.skip("implementation not found")
+    s = harness.run_cpp(case, "riccati")
+    record("returncode", s.returncode)
+    assert s.returncode == 3, f"rc={s.returncode} (expected documented exit 3)"
