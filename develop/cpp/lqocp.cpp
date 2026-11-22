@@ -2746,7 +2746,7 @@ bool GSolver::propose(const uint16_t* seq, int N, const double* tau, int* ndeg) 
 bool GSolver::correct(int* its, int* outer, int* ndeg, int rounds) {
     uint16_t seq[NA];
     double tau[NA];
-    int N = an_, retry = 1;
+    int N = an_, retry = (rounds > 3) ? rounds : 1;   // walks after a failed Newton (warm: every round)
     for (int i = 0; i < N; ++i) seq[i] = aseq_[i];
     for (int i = 0; i + 1 < N; ++i) tau[i] = atau_[i];
     bool ok = true;
@@ -2754,7 +2754,7 @@ bool GSolver::correct(int* its, int* outer, int* ndeg, int rounds) {
         int k = 0;
         ok = newton_tau(seq, &N, tau, &k);
         *its += k;
-        if (!ok && (o > 0 || retry-- == 0)) break;
+        if (!ok && (budget_ <= 0 || retry-- == 0 || (o > 0 && rounds <= 3))) break;
         ok = propose(seq, N, tau, ndeg);
         if (!ok) break;
         bool same = (wn_ == N);
@@ -2773,6 +2773,7 @@ bool GSolver::correct(int* its, int* outer, int* ndeg, int rounds) {
         for (int i = 0; i < N; ++i) seq[i] = wseq_[i];
         for (int i = 0; i + 1 < N; ++i) tau[i] = wtau_[i];
         ++*outer;
+        if (budget_ <= 0) { ok = false; break; }        // cap: return the walked structure
     }
     an_ = N;
     for (int i = 0; i < N; ++i) aseq_[i] = seq[i];
@@ -2903,7 +2904,7 @@ bool GSolver::solve_warm(GResult& R, double dt, int max_its) {
     }
     begin(R, max_its);
     int its = 0, outer = 0, ndeg = 0;
-    if (correct(&its, &outer, &ndeg, 6)) return finish(R, true, nullptr, its, 0, ndeg);
+    if (correct(&its, &outer, &ndeg, 12)) return finish(R, true, nullptr, its, 0, ndeg);
     if (budget_ > 0 && !capfail_) {                    // cold fallback with the iterations left
         const bool ok = cold(R, budget_);
         R.iterations += its;
