@@ -158,7 +158,7 @@ int main(int argc, char** argv) {
     for (int j = 0; j < m; ++j) std::fprintf(f, ",u%d", j);
     std::fprintf(f, "\n");
     const int K = 1001;
-    double x[lqocp::MAXN], u[lqocp::MAXM];
+    double x[lqocp::MAXN], u[lqocp::MAXM] = {0.0, 0.0, 0.0, 0.0};   // (a failed eval_u leaves u)
     for (int k = 0; k < K; ++k) {
         const double t = (k == K - 1) ? p.T : p.T * k / (K - 1);
         if (general) {

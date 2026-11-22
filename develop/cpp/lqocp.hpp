@@ -21,8 +21,6 @@
 
 namespace lqocp {
 
-// Storage precision of the large arrays (bases, carried relations, substep states).
-// Arithmetic is always double. Build with -DLQOCP_FLOAT for float storage.
 // Storage precision of the junction Jacobian and sensitivities of the general-cost solver
 // (-DLQOCP_FLOAT: float). Arithmetic, relations and arc coefficients are always double: TINY's
 // R (cond 2e6) amplifies float round-off in the costate beyond the junction tolerance.
@@ -34,7 +32,7 @@ typedef double real;
 
 constexpr int MAXM = 4;              // inputs / chains
 constexpr int MAXN = 12;             // states = sum of chain orders
-constexpr int MAXK = 4;              // max chain order (4-pt Gauss-Legendre exact for 2K-2 <= 7)
+constexpr int MAXK = 4;              // max chain order (energy cost: 4-pt Gauss-Legendre is exact, |v|^2 has degree 2K-2)
 constexpr int MAXARC = 64;           // max switch times printed by the CLI
 constexpr int MAXJ = MAXARC - 1;     // max junctions (switch times)
 constexpr int MAXARC_E = 32;         // energy-cost buffers (tau / energy newton)
@@ -47,15 +45,13 @@ constexpr int MAXSETS = 81;          // 3^MAXM candidate active sets
 constexpr int MAX_OUTER = 50;
 constexpr int MAX_NEWTON = 50;
 constexpr int MAX_TAU_TOTAL = 500;   // total junction-time Newton iterations (tau method)
-constexpr int MAX_PDAS = 30;         // PDAS iterations per continuation step
-constexpr int MAX_CONT = 400;        // continuation steps
 constexpr int N2 = 2 * MAXN;         // Hamiltonian state (s, lambda)
 constexpr int GN = 24;               // Taylor order of the sign tests at an event (general cost)
 constexpr int MAX_TAU_NEWTON = 8;    // Newton iterations on the junction times per corrector
 constexpr double KAP_PLAIN = 3.0;    // violation ratio up to which kappa0 -> 1 is tried in one step
 constexpr int MAX_GEN_ITS = 1000;    // total Newton iterations, general cost (all homotopy steps)
-constexpr double DL_MIN = 1e-3;
-constexpr int NPOLY = 32;            // max terms of an arc's centre polynomial (general cost)      // homotopy stall (feasible runs use steps >= 0.03 in log kappa)
+constexpr double DL_MIN = 1e-3;      // homotopy stall (feasible runs use steps >= 0.03 in log kappa)
+constexpr int NPOLY = 32;            // max terms of an arc's centre polynomial (general cost)
 
 enum Method { METHOD_TAU = 0, METHOD_NEWTON = 1 };
 
@@ -103,7 +99,7 @@ struct Result {
 class Solver {
 public:
     bool setup(const Problem& p);
-    // Returns r.converged. METHOD_TAU with a general cost returns false (unsupported).
+    // Returns r.converged. A general cost returns false (use GSolver).
     bool solve(Result& r, int method = METHOD_NEWTON);
     void eval_u(const Result& r, double t, double u[MAXM]) const;
     void eval_x(const Result& r, double t, double x[MAXN]) const;
@@ -201,6 +197,8 @@ constexpr int NR = NA;               // max junction residual rows
 constexpr int NCK = LQOCP_NCK;
 constexpr int NB = LQOCP_NB;
 constexpr int NCOL = N2 + 1 + NB;    // relation row: z | rhs | sensitivities
+static_assert(NA >= 1 && NA <= 127, "LQOCP_NA: 1..127 (junction indices are int8_t)");
+static_assert(NB >= 1 && NCK >= 1, "LQOCP_NB and LQOCP_NCK must be >= 1");
 
 // Bound-independent primitive of one active set S: H_S = W diag(Ls, Tc, Lu) W^-1, where the
 // stable/unstable parts are modal (1x1 real or 2x2 [[re, im], [-im, re]] blocks) and Tc is the
@@ -245,10 +243,13 @@ public:
     // MPC warm start from the previous solution in r (x0 updated in the Problem; junction times
     // shifted by -dt); at most max_its Newton iterations (then r is the current iterate)
     bool solve_warm(GResult& r, double dt, int max_its);
-    void set_x0(const double* x0) { for (int i = 0; i < n_; ++i) x0_[i] = x0[i]; }   // (setup copies p.x0)
-    void eval_u(const GResult& r, double t, double u[MAXM]) const;
+    // (setup copies p.x0) false if x0 is not finite: the next solve then fails
+    bool set_x0(const double* x0);
+    // eval_u and mean_u (mean u on [t0, t1], what a zero-order hold should apply) saturate u to the
+    // bounds lo <= M u <= hi (a capped warm step's iterate can leave them); false: no plan (hold u)
+    bool eval_u(const GResult& r, double t, double u[MAXM]) const;
     void eval_x(const GResult& r, double t, double x[MAXN]) const;
-    void mean_u(const GResult& r, double t0, double t1, double u[MAXM]) const;   // mean u on [t0, t1]
+    bool mean_u(const GResult& r, double t0, double t1, double u[MAXM]) const;
     int switch_times(const GResult& r, double* out, int maxout) const;
     // for basis builders
     int n2() const { return 2 * n_; }
@@ -269,6 +270,7 @@ private:
     struct ArcFn {                   // wt on one arc as exponential-polynomials (NOTES.md 11)
         const SetBasis* b;
         double L;
+        int m;                       // channels (rows j >= m are not filled)
         int np;                      // centre polynomial terms
         double amp[MAXM][N2];        // modal amplitudes (a pair: P, Q of A = P - iQ)
         double poly[MAXM][NPOLY];
@@ -277,24 +279,25 @@ private:
     struct RowFn {                   // one switching row g0 + G wt on the arc of F
         const ArcFn* F;
         double G[MAXM], c0, scale;
-        double u(int i) const { double s = 0.0; for (int j = 0; j < MAXM; ++j) s += G[j] * F->amp[j][i]; return s; }
-        double p(int k) const { double s = 0.0; for (int j = 0; j < MAXM; ++j) s += G[j] * F->poly[j][k]; return s; }
+        double u(int i) const { double s = 0.0; for (int j = 0; j < F->m; ++j) s += G[j] * F->amp[j][i]; return s; }
+        double p(int k) const { double s = 0.0; for (int j = 0; j < F->m; ++j) s += G[j] * F->poly[j][k]; return s; }
     };
     const Problem* p_;
     BasisFn bfn_;
     void* bctx_;
     int n_, m_, off_[MAXM], end_[MAXM];
     double x0_[MAXN];
+    bool x0ok_;
     double rows_[2 * MAXM][MAXM], rhs_[2 * MAXM], rhs0_[2 * MAXM], rownorm2_[2 * MAXM];
     bool finite_[2 * MAXM];
     int nsets_;
     double R_;
     double LiT_[MAXM][MAXM];         // Lc^-T: B~ = B Lc^-T has row end_[j] = LiT_[j]
     double Lc_[MAXM][MAXM];
-    bool capfail_;
+    bool capfail_;                   // an arc/row capacity (NA, NR) was exceeded
     int budget_;                     // Newton iterations left (iteration cap)
     bool cert_;                      // the BVP solution in place was certified by the walk
-    double wthr_;                    // largest switching-row level the walk certified                   // an arc/row capacity (NA, NR) was exceeded
+    double wthr_;                    // largest switching-row level the walk certified
     GResult* R_out;
     // homotopy / structure
     int an_, hn_, wn_;
@@ -338,6 +341,7 @@ private:
     void wint(const ArcFn& F, double sa, double sb, double* I) const;
     void rtaylor(const ArcFn& F, const double* G, double g0, double sig, double* cs) const;
     void gscale(double kap);
+    void clampu(double* u) const;
     bool glex_ok(uint16_t S, const ArcFn& F, double sig, double h, double* tol) const;
     bool glex_set(const ArcFn& F, double sig, double h, uint16_t guess, uint16_t* out, double* tol) const;
     __attribute__((noinline)) double lead(const ArcFn& F, const double* G, double g0, double sig, double h,
@@ -349,7 +353,7 @@ private:
     __attribute__((noinline)) double gends(const uint16_t* seq, int N, const double* tau) const;
     double gcost(const uint16_t* seq, int N, const double* tau, double ends);
     double gmax_ratio(const uint16_t* seq, int N, const double* tau);
-    void init_rel(int nb);
+    void init_rel();
     bool fstep(const Arc& a, int nb);
     void jump(const uint16_t* seq, int N, const double* tau, int j, double* D) const;
     void inject(int k, int b0, int nb);

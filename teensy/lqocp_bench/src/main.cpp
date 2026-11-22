@@ -45,7 +45,7 @@ static void closed_loop(int cap) {
     const int STEPS = 100;
     const double dt = 0.05;
     const lqocp::Problem& p = BENCH_PROB[2];
-    double x[lqocp::MAXN], u[lqocp::MAXM], J = 0.0;
+    double x[lqocp::MAXN], u[lqocp::MAXM] = {0.0, 0.0, 0.0, 0.0}, J = 0.0;
     float t[STEPS];
     int itot = 0, itmax = 0, nconv = 0;
     for (int i = 0; i < 12; ++i) x[i] = p.x0[i];
@@ -56,7 +56,7 @@ static void closed_loop(int cap) {
         const bool ok = (k == 0) ? gs.solve(gr) : gs.solve_warm(gr, dt, cap);
         const uint32_t c1 = ARM_DWT_CYCCNT, m1 = micros();
         t[k] = (m1 - m0 > 1000000u) ? (float)(m1 - m0) : cyc_us(c1 - c0);   // the cycle counter wraps after 7.2 s
-        gs.mean_u(gr, 0.0, dt, u);
+        gs.mean_u(gr, 0.0, dt, u);                    // saturated to the bounds; false: holds u
         itot += gr.iterations;
         itmax = std::max(itmax, gr.iterations);
         nconv += ok;
