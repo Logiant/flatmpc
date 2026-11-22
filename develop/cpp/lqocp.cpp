@@ -2430,7 +2430,7 @@ bool GSolver::recover(const Arc& a, int nb, bool aff, double* xout, double* zb) 
 
 // Linear BVP for fixed junction times -> arc coefficients R_out->x, zT_
 bool GSolver::bvp(const uint16_t* seq, int N, const double* tau) {
-    if (N > NA) return false;
+    if (N > NA) { capfail_ = true; return false; }
     int stride;
     if (!forward(seq, N, tau, 0, 0, &stride) || !terminal(0, zT_)) return false;
     double zb[N2];
@@ -2456,7 +2456,7 @@ int GSolver::jrows(const uint16_t* seq, int N) {
             const int nk = gphi(side, keys, Gs, gs);
             for (int q = 0; q < nk; ++q)
                 if (keys[q] == key) {
-                    if (nr >= NR) return -1;
+                    if (nr >= NR) { capfail_ = true; return -1; }
                     jq_[nr] = (int8_t)j;
                     jk_[nr] = (int8_t)key;
                     ++nr;
@@ -2822,6 +2822,7 @@ bool GSolver::solve(GResult& R) {
                     kap = kt;
                     dl *= 1.5;
                 } else {
+                    if (capfail_) { why = "arc capacity NA exceeded"; break; }
                     dl *= 0.5;
                     gscale(kap);
                     an_ = sn;

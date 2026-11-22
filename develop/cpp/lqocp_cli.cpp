@@ -181,8 +181,8 @@ int main(int argc, char** argv) {
     const double cost = general ? g_gresult.cost : g_result.cost;
     const int its = general ? g_gresult.iterations : g_result.iterations;
     const bool conv = ok && (general ? g_gresult.converged : g_result.converged);
-    // JSON has no inf/nan: print null for a non-finite cost (failed or infeasible solve)
-    if (std::isfinite(cost)) std::printf("{\"cost\": %.17g, \"switch_times\": [", cost);
+    // a failed solve has no valid cost (and JSON has no inf/nan): print null
+    if (conv && std::isfinite(cost)) std::printf("{\"cost\": %.17g, \"switch_times\": [", cost);
     else std::printf("{\"cost\": null, \"switch_times\": [");
     for (int i = 0; i < ns; ++i) std::printf("%s%.17g", i ? ", " : "", st[i]);
     std::printf("], \"iterations\": %d, \"solve_time_us\": %.3f, \"converged\": %s, \"method\": \"%s\"",
