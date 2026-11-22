@@ -53,7 +53,8 @@ constexpr int GN = 24;               // Taylor order per substep (event detectio
 constexpr int MAX_TAU_NEWTON = 8;    // Newton iterations on the junction times per corrector
 constexpr double KAP_PLAIN = 3.0;    // violation ratio up to which kappa0 -> 1 is tried in one step
 constexpr int MAX_GEN_ITS = 1000;    // total Newton iterations, general cost (all homotopy steps)
-constexpr double DL_MIN = 1e-3;      // homotopy stall (feasible runs use steps >= 0.03 in log kappa)
+constexpr double DL_MIN = 1e-3;
+constexpr int NPOLY = 48;            // max terms of an arc's centre polynomial (general cost)      // homotopy stall (feasible runs use steps >= 0.03 in log kappa)
 
 enum Method { METHOD_TAU = 0, METHOD_NEWTON = 1 };
 
@@ -259,6 +260,20 @@ private:
         double yp[N2];               // particular part (modal); centre entries: forcing
         const double* x;
     };
+    struct ArcFn {                   // wt on one arc as exponential-polynomials (NOTES.md 11)
+        const SetBasis* b;
+        double L;
+        int np;                      // centre polynomial terms
+        double amp[MAXM][N2];        // modal amplitudes (a pair: P, Q of A = P - iQ)
+        double poly[MAXM][NPOLY];
+        double c[MAXM];
+    };
+    struct RowFn {                   // one switching row g0 + G wt on an arc
+        const SetBasis* b;
+        double L;
+        int np;
+        double u[N2], p[NPOLY], c0, scale;
+    };
     const Problem* p_;
     BasisFn bfn_;
     void* bctx_;
@@ -269,8 +284,7 @@ private:
     double R_;
     double LiT_[MAXM][MAXM];         // Lc^-T: B~ = B Lc^-T has row end_[j] = LiT_[j]
     double Lc_[MAXM][MAXM];
-    struct NrmC { uint16_t S; double nrm, h; } nc_[8];   // ||H_S^24|| cache (bound dependent)
-    int ncn_;
+    bool capfail_;                   // an arc/row capacity (NA, NR) was exceeded
     GResult* R_out;
     // homotopy / structure
     int an_, hn_, wn_;
@@ -298,17 +312,23 @@ private:
     template <class F> bool for_sets(F f) const;
     int gphi(uint16_t S, int keys[2 * MAXM], double G[2 * MAXM][MAXM], double g0[2 * MAXM]) const;
     bool rowphi(const uint16_t* seq, int q, double G[MAXM], double* g0) const;
-    bool nrm(uint16_t S, const double P[MAXM][MAXM], const double* q, double* nrmN, double* h);
     bool arc(int k, const uint16_t* seq, int N, const double* tau, Arc& a) const;
     __attribute__((noinline)) void zat(const Arc& a, double sig, double* z) const;
     void zstart(const uint16_t* seq, int N, const double* tau, int k, double* z) const;
     void cexp(const Arc& a, double L, double* y, bool row, bool aff) const;
-    __attribute__((noinline)) void taylor_w(const Arc& a, double sig0, double h, double W[MAXM][GN], double* Zb) const;
+    bool chan(const Arc& a, ArcFn& F) const;
+    void rowfn(const ArcFn& F, const double* G, double g0, RowFn& f) const;
+    void feval(const RowFn& f, double sig, int nd, double* d) const;
+    double fbound2(const RowFn& f, double lo, double hi) const;
+    double froot(const RowFn& f, double lo, double hi) const;
+    double bb(const RowFn& f, double a, double b, double thr, double atol, bool first, double* root,
+              bool* simple) const;
+    double hloc(const SetBasis& b) const;
+    void rtaylor(const ArcFn& F, const double* G, double g0, double sig, double* cs) const;
     void gscale(double kap);
-    bool glex_ok(uint16_t S, const double W[MAXM][GN], double sig, double h) const;
-    bool glex_set(const double W[MAXM][GN], double sig, double h, uint16_t guess, uint16_t* out) const;
+    bool glex_ok(uint16_t S, const ArcFn& F, double sig, double h) const;
+    bool glex_set(const ArcFn& F, double sig, double h, uint16_t guess, uint16_t* out) const;
     bool gwalk(const uint16_t* seq, int N, const double* tau, int* ndeg);
-    template <class F> bool substeps(const uint16_t* seq, int N, const double* tau, F f);
     double gverify(const uint16_t* seq, int N, const double* tau);
     double gcost(const uint16_t* seq, int N, const double* tau);
     double gmax_ratio(const uint16_t* seq, int N, const double* tau);

@@ -1124,13 +1124,6 @@ bool Solver::solve_newton(Result& R) {
 // =====================================================================================
 namespace {
 
-const double GL10_X[10] = {-0.97390652851717172008, -0.86506336668898451073,
-                           -0.67940956829902440623, -0.43339539412924719080,
-                           -0.14887433898163121088, 0.14887433898163121088,
-                           0.43339539412924719080, 0.67940956829902440623,
-                           0.86506336668898451073, 0.97390652851717172008};
-const double GL10_W[10] = {0.066671344308688069, 0.14945134915058036, 0.21908636251598201, 0.26926671930999652, 0.29552422471475298, 0.29552422471475298, 0.26926671930999652, 0.21908636251598201, 0.14945134915058036, 0.066671344308688069};
-const double SUB_TOL = 1e-16;
 const double GTOL = 1e-12;           // junction residual tolerance (relative to R)
 const double STOL = 1e-9;            // walked vs Newton junction times (relative to T)
 const double VTOL = 1e-9;            // PMP verification tolerance (relative to R)
@@ -1154,77 +1147,6 @@ double xlog(double x) {
     double p = 0.0;
     for (int i = 23; i >= 1; i -= 2) p = p * s2 + 1.0 / i;
     return 2.0 * s * p + e * 0.69314718055994530942;
-}
-
-// coefficients of p(a + w x) from those of p(sigma): Taylor shift by synthetic division
-void tshift(const double* c, double a, double w, double* q) {
-    for (int i = 0; i < GN; ++i) q[i] = c[i];
-    for (int i = 0; i < GN - 1; ++i)
-        for (int j = GN - 2; j >= i; --j) q[j] += a * q[j + 1];
-    double wp = 1.0;
-    for (int j = 0; j < GN; ++j) { q[j] *= wp; wp *= w; }
-}
-
-// max of the Bernstein coefficients on [0, 1]: b_i = sum_j C(i,j)/C(n,j) q_j (Pascal transform)
-double bern_max(const double* q, bool* mono) {
-    const int n = GN - 1;
-    double b[GN], cnj = 1.0;
-    for (int j = 0; j <= n; ++j) {
-        b[j] = q[j] / cnj;
-        cnj = cnj * (n - j) / (j + 1);
-    }
-    for (int k = 1; k <= n; ++k)
-        for (int i = n; i >= k; --i) b[i] += b[i - 1];
-    double mx = -HUGE_VAL;
-    bool mon = true;
-    for (int i = 0; i <= n; ++i) {
-        if (b[i] > mx) mx = b[i];
-        if (i > 0 && b[i] < b[i - 1]) mon = false;
-    }
-    if (mono) *mono = mon;
-    return mx;
-}
-
-// First up-crossing of p on (a, h] that exceeds tol (Bernstein enclosures + remainder eps).
-// Depth-first, left to right, over the dyadic subintervals; node (level, k) is
-// [a + k w, a + (k + 1) w] with w = (h - a) 2^-level, so no interval stack is needed.
-__attribute__((noinline)) bool first_exceed(const double* c, double a, double h, double tol,
-                                            double eps, double minw, double* root, bool* simple) {
-    double q[GN];
-    int level = 0;
-    uint64_t k = 0;
-    double last_nonpos = a;
-    tol += eps;
-    for (;;) {
-        const double w = ldexp(h - a, -level), lo = a + (double)k * w;
-        const double hi = (k + 1 == ((uint64_t)1 << level)) ? h : lo + w;
-        tshift(c, lo, hi - lo, q);
-        bool mono;
-        const double bmax = bern_max(q, &mono);
-        bool leaf = true;
-        if (bmax <= tol) {
-            if (pval(c, GN, hi) <= 0) last_nonpos = hi;
-        } else if (mono || hi - lo <= minw || level >= 62) {
-            const double phi = pval(c, GN, hi);
-            if (phi > tol) {
-                if (pval(c, GN, last_nonpos) <= 0) {
-                    *root = bisect(c, GN, last_nonpos, hi);
-                    *simple = mono && last_nonpos == lo;
-                } else {
-                    *root = last_nonpos;
-                    *simple = false;
-                }
-                return true;
-            }
-            if (phi <= 0) last_nonpos = hi;
-        } else {
-            leaf = false;
-        }
-        if (!leaf) { ++level; k *= 2; continue; }      // descend to the left child
-        while (level > 0 && (k & 1)) { --level; k >>= 1; }   // up while a right child
-        if (level == 0) return false;
-        ++k;                                           // right sibling
-    }
 }
 
 // exponential of the modal block at column i over L: 1x1 or 2x2 (row-major), returns the size
@@ -1324,11 +1246,6 @@ void matvec(const double* M, int n, int ld, const double* v, double* t) {
         for (int j = 0; j < n; ++j) s += M[i * ld + j] * v[j];
         t[i] = s;
     }
-}
-
-double eps_of(double nrmN, double h, double Zb, double bmax) {
-    const double c = nrmN * ipow(h, GN) / fact(GN);
-    return c * Zb / fmax(1e-300, 1.0 - c) * bmax;
 }
 
 }  // namespace
@@ -1516,33 +1433,6 @@ bool GSolver::hmat(uint16_t S, double* H) const {
     return true;
 }
 
-// ||H_S^GN||_inf of the augmented H (bound dependent) and the Taylor substep length; cached
-bool GSolver::nrm(uint16_t S, const double P[MAXM][MAXM], const double* q, double* nrmN, double* h) {
-    const int nn = ncn_ < 8 ? ncn_ : 8;
-    for (int i = 0; i < nn; ++i)
-        if (nc_[i].S == S) { *nrmN = nc_[i].nrm; *h = nc_[i].h; return true; }
-    const int gz = 2 * n_ + 1;
-    double rowsum[N2 + 1], a[N2 + 1], b[N2 + 1];
-    for (int i = 0; i < gz; ++i) rowsum[i] = 0.0;
-    for (int c = 0; c < gz; ++c) {
-        for (int i = 0; i < gz; ++i) a[i] = (i == c) ? 1.0 : 0.0;
-        for (int k = 0; k < GN; ++k) {
-            hmul(P, q, a, b);
-            for (int i = 0; i < gz; ++i) a[i] = b[i];
-        }
-        for (int i = 0; i < gz; ++i) rowsum[i] += fabs(a[i]);
-    }
-    double nr = 0.0;
-    for (int i = 0; i < gz; ++i) nr = fmax(nr, rowsum[i]);
-    NrmC& e = nc_[ncn_++ % 8];
-    e.S = S;
-    e.nrm = nr;
-    e.h = (nr == 0.0) ? p_->T : fmin(p_->T, xexp(xlog(fact(GN) * SUB_TOL / nr) / GN));
-    *nrmN = e.nrm;
-    *h = e.h;
-    return true;
-}
-
 // arc k of the structure (seq, tau): basis, projection, particular part
 bool GSolver::arc(int k, const uint16_t* seq, int N, const double* tau, Arc& a) const {
     a.t0 = (k == 0) ? 0.0 : tau[k - 1];
@@ -1663,26 +1553,6 @@ void GSolver::zstart(const uint16_t* seq, int N, const double* tau, int k, doubl
     zat(ac_, 0.0, z);
 }
 
-// Taylor coefficients of wt on the substep starting at t0 + sig0 (no z storage), sum_k |Z_k|_1 h^k
-void GSolver::taylor_w(const Arc& a, double sig0, double h, double W[MAXM][GN], double* Zb) const {
-    const int gz = 2 * n_ + 1;
-    double cur[N2 + 1], nxt[N2 + 1], wt[MAXM], hp = 1.0, zb = 0.0;
-    zat(a, sig0, cur);
-    for (int k = 0; k < GN; ++k) {
-        if (k > 0) {
-            hmul(a.P, a.q, cur, nxt);
-            for (int i = 0; i < gz; ++i) cur[i] = nxt[i] / k;
-        }
-        wt_of(cur + n_, wt);
-        for (int j = 0; j < m_; ++j) W[j][k] = wt[j];
-        double s = 0.0;
-        for (int i = 0; i < gz; ++i) s += fabs(cur[i]);
-        zb += s * hp;
-        hp *= h;
-    }
-    *Zb = zb;
-}
-
 // Switching rows of set S (one solve for the projection and the multipliers): inactive rows ->
 // gap a_r vt - b_r = G wt + g0; active rows -> -mu_r |a_r|^2. Both must stay <= 0.
 int GSolver::gphi(uint16_t S, int keys[2 * MAXM], double G[2 * MAXM][MAXM], double g0[2 * MAXM]) const {
@@ -1737,17 +1607,242 @@ int GSolver::gphi(uint16_t S, int keys[2 * MAXM], double G[2 * MAXM][MAXM], doub
     return nk;
 }
 
-bool GSolver::glex_ok(uint16_t S, const double W[MAXM][GN], double sig, double h) const {
+// ---- wt on an arc as exponential-polynomials (NOTES.md section 11) ----
+// Channel j: wt_j(sig) = c_j + sum_k p_jk sig^k + sum_i Re[A_ji e^{lam_i (sig - anc_i)}] with the
+// modal eigenvalues lam_i (stable: anchor 0, unstable: anchor L; a complex pair stores P, Q of
+// A = P - iQ in its two slots) and the centre part e^{M sig} [c; 1], M = [[Tc, yp_c], [0, 0]],
+// a polynomial (M nearly nilpotent; terms until they are round-off over the whole arc).
+bool GSolver::chan(const Arc& a, ArcFn& F) const {
+    const SetBasis& b = *a.b;
+    const int n = n_, n2 = 2 * n, ns = b.ns, nc = b.nc, s1 = ns + nc;
+    double Bw[MAXM][N2];                               // wt = Bw y (y: modal coordinates)
+    for (int j = 0; j < m_; ++j) {
+        for (int i = 0; i < n2; ++i) Bw[j][i] = 0.0;
+        for (int l = 0; l < m_; ++l) {
+            const double f = -LiT_[l][j];
+            const double* Wr = b.W + (n + end_[l]) * n2;
+            for (int i = 0; i < n2; ++i) Bw[j][i] += f * Wr[i];
+        }
+        F.c[j] = 0.0;
+    }
+    F.b = a.b;
+    F.L = a.L;
+    F.np = 0;
+    for (int i = 0; i < n2;) {
+        if (i == ns && nc) { i = s1; continue; }
+        const double x0 = a.x[i] / b.cs[i];
+        if (b.im[i] == 0.0) {
+            for (int j = 0; j < m_; ++j) { F.amp[j][i] = Bw[j][i] * x0; F.c[j] += Bw[j][i] * a.yp[i]; }
+            ++i;
+        } else {
+            const double x1 = a.x[i + 1] / b.cs[i + 1];
+            for (int j = 0; j < m_; ++j) {
+                F.amp[j][i] = Bw[j][i] * x0 + Bw[j][i + 1] * x1;
+                F.amp[j][i + 1] = Bw[j][i] * x1 - Bw[j][i + 1] * x0;
+                F.c[j] += Bw[j][i] * a.yp[i] + Bw[j][i + 1] * a.yp[i + 1];
+            }
+            i += 2;
+        }
+    }
+    if (!nc) return true;
+    const double* g = a.yp + ns;
+    double v[N2 + 1], u[N2 + 1], gm = 0.0, am = 0.0, Lk = 1.0;
+    for (int i = 0; i < nc; ++i) { v[i] = a.x[ns + i] / b.cs[ns + i]; gm = fmax(gm, fabs(g[i])); }
+    v[nc] = 1.0;
+    const double grow = 1.0 + (b.tcn + gm) * a.L;
+    for (int k = 0; k < NPOLY; ++k) {                  // v = M^k [c; 1] / k!
+        double tm = 0.0;
+        for (int i = 0; i <= nc; ++i) tm = fmax(tm, fabs(v[i]));
+        tm *= Lk;
+        if (k > 0 && tm * grow <= 1e-17 * am) return true;
+        am = fmax(am, tm);
+        for (int j = 0; j < m_; ++j) {
+            double s = 0.0;
+            for (int i = 0; i < nc; ++i) s += Bw[j][ns + i] * v[i];
+            F.poly[j][k] = s;
+        }
+        F.np = k + 1;
+        matvec(b.Tc, nc, nc, v, u);
+        for (int i = 0; i < nc; ++i) v[i] = (u[i] + g[i] * v[nc]) / (k + 1);
+        v[nc] = 0.0;
+        Lk *= a.L;
+    }
+    return false;
+}
+
+// row function g0 + G wt on the arc of F
+void GSolver::rowfn(const ArcFn& F, const double* G, double g0, RowFn& f) const {
+    const SetBasis& b = *F.b;
+    const int n2 = 2 * n_, ns = b.ns, s1 = ns + b.nc;
+    double c0 = g0, sc = 0.0, Lk = 1.0;
+    for (int j = 0; j < m_; ++j) c0 += G[j] * F.c[j];
+    for (int i = 0; i < n2; ++i) {
+        double s = 0.0;
+        if (i < ns || i >= s1)
+            for (int j = 0; j < m_; ++j) s += G[j] * F.amp[j][i];
+        f.u[i] = s;
+        sc += fabs(s);
+    }
+    for (int k = 0; k < F.np; ++k) {
+        double s = 0.0;
+        for (int j = 0; j < m_; ++j) s += G[j] * F.poly[j][k];
+        f.p[k] = s;
+        sc += fabs(s) * Lk;
+        Lk *= F.L;
+    }
+    f.b = F.b;
+    f.L = F.L;
+    f.np = F.np;
+    f.c0 = c0;
+    f.scale = sc + fabs(c0);
+}
+
+// derivatives d[0..nd] of f at sig (closed form)
+void GSolver::feval(const RowFn& f, double sig, int nd, double* d) const {
+    const SetBasis& b = *f.b;
+    const int n2 = 2 * n_, ns = b.ns, s1 = ns + b.nc;
+    for (int k = 0; k <= nd; ++k) d[k] = 0.0;
+    d[0] = f.c0;
+    for (int i = 0; i < n2;) {
+        if (i == ns && s1 > ns) { i = s1; continue; }
+        const double re = b.re[i], t = sig - ((i < ns) ? 0.0 : f.L), e = xexp(re * t);
+        if (b.im[i] == 0.0) {
+            double v = f.u[i] * e;
+            for (int k = 0; k <= nd; ++k) { d[k] += v; v *= re; }
+            ++i;
+        } else {
+            const double om = b.im[i], c = cos(om * t), sn = sin(om * t), P = f.u[i], Q = f.u[i + 1];
+            double x = e * (P * c + Q * sn), y = e * (P * sn - Q * c);
+            for (int k = 0; k <= nd; ++k) {
+                d[k] += x;
+                const double xn = re * x - om * y;
+                y = re * y + om * x;
+                x = xn;
+            }
+            i += 2;
+        }
+    }
+    double q[NPOLY], fk = 1.0;                         // polynomial: Taylor shift to sig
+    for (int k = 0; k < f.np; ++k) q[k] = f.p[k];
+    for (int k = 0; k <= nd && k < f.np; ++k) {
+        for (int i = f.np - 2; i >= k; --i) q[i] += sig * q[i + 1];
+        d[k] += fk * q[k];
+        fk *= k + 1;
+    }
+}
+
+// M2 >= |f''| on [lo, hi]: modal envelopes (largest at the end nearer the anchor) plus the
+// centre polynomial's second derivative bounded by its Taylor coefficients at the midpoint
+double GSolver::fbound2(const RowFn& f, double lo, double hi) const {
+    const SetBasis& b = *f.b;
+    const int n2 = 2 * n_, ns = b.ns, s1 = ns + b.nc;
+    double M = 0.0;
+    for (int i = 0; i < n2;) {
+        if (i == ns && s1 > ns) { i = s1; continue; }
+        const double re = b.re[i], e = xexp(re * (((re > 0) ? hi : lo) - ((i < ns) ? 0.0 : f.L)));
+        if (b.im[i] == 0.0) { M += fabs(f.u[i]) * re * re * e; ++i; }
+        else {
+            M += sqrt(f.u[i] * f.u[i] + f.u[i + 1] * f.u[i + 1]) * (re * re + b.im[i] * b.im[i]) * e;
+            i += 2;
+        }
+    }
+    const int nq = f.np - 2;
+    if (nq > 0) {
+        const double m = 0.5 * (lo + hi), h = 0.5 * (hi - lo);
+        double q[NPOLY], s = 0.0, hk = 1.0;
+        for (int k = 0; k < nq; ++k) q[k] = (k + 2.0) * (k + 1.0) * f.p[k + 2];
+        for (int k = 0; k < nq; ++k) {
+            for (int i = nq - 2; i >= k; --i) q[i] += m * q[i + 1];
+            s += fabs(q[k]) * hk;
+            hk *= h;
+        }
+        M += s;
+    }
+    return M;
+}
+
+// root of f in [lo, hi] with f(lo) <= 0 < f(hi): safeguarded Newton
+double GSolver::froot(const RowFn& f, double lo, double hi) const {
+    double x = 0.5 * (lo + hi), d[2];
+    for (int it = 0; it < 200; ++it) {
+        feval(f, x, 1, d);
+        if (d[0] <= 0.0) lo = x;
+        else hi = x;
+        double xn = (d[1] != 0.0) ? x - d[0] / d[1] : 0.5 * (lo + hi);
+        if (!(xn > lo && xn < hi)) xn = 0.5 * (lo + hi);
+        if (xn <= lo || xn >= hi || xn == x) break;
+        x = xn;
+    }
+    return 0.5 * (lo + hi);
+}
+
+// Branch and bound over the dyadic subintervals of [a, b], depth-first, left to right (no stack).
+// A node [lo, hi] (midpoint m, half-width h) is cleared when f(m) + |f'(m)| h + M2 h^2 / 2 is at
+// most the level, or when f is monotone on it (|f'(m)| >= M2 h; its maximum is then an end).
+// first: the first point where f > thr; *root is the crossing of 0 that brackets it, *simple when
+// f is increasing there. Otherwise: max f to within atol above max(level, floor), returned.
+double GSolver::bb(const RowFn& f, double a, double b, double thr, double atol, bool first,
+                   double* root, bool* simple) const {
+    const double minw = 1e-14 * p_->T;
+    double best = -HUGE_VAL;
+    int level = 0;
+    uint64_t k = 0;
+    for (;;) {
+        const double w = ldexp(b - a, -level), lo = a + (double)k * w;
+        const double hi = (k + 1 == ((uint64_t)1 << level)) ? b : lo + w;
+        const double m = 0.5 * (lo + hi), h = 0.5 * (hi - lo);
+        double d[2], e[1];
+        feval(f, m, 1, d);
+        const double M2 = fbound2(f, lo, hi);
+        const double lvl = first ? thr : fmax(fmax(best, d[0]), thr) + atol;
+        best = fmax(best, d[0]);
+        const bool inc = d[1] - M2 * h >= 0.0, dec = d[1] + M2 * h <= 0.0;
+        bool leaf = true;
+        if (d[0] + fabs(d[1]) * h + 0.5 * M2 * h * h <= lvl) {
+        } else if (dec) {                              // max at lo
+            if (!first) { feval(f, lo, 0, e); best = fmax(best, e[0]); }
+        } else if (inc || h <= minw || level >= 60) {
+            feval(f, hi, 0, e);
+            best = fmax(best, e[0]);
+            if (first && fmax(d[0], e[0]) > thr) {
+                const double x1 = (!inc && d[0] > e[0]) ? m : hi;
+                feval(f, lo, 0, e);
+                if (e[0] <= 0.0) { *root = froot(f, lo, x1); *simple = inc; }
+                else { *root = lo; *simple = false; }
+                return 1.0;
+            }
+        } else {
+            leaf = false;
+        }
+        if (!leaf) { ++level; k *= 2; continue; }      // descend to the left child
+        while (level > 0 && (k & 1)) { --level; k >>= 1; }   // up while a right child
+        if (level == 0) return first ? 0.0 : best;
+        ++k;                                           // right sibling
+    }
+}
+
+// local scale of the Taylor sign tests: |lam| h <= 2 for the fastest mode
+double GSolver::hloc(const SetBasis& b) const {
+    double r = b.tcn;
+    for (int i = 0; i < 2 * n_; ++i) r = fmax(r, sqrt(b.re[i] * b.re[i] + b.im[i] * b.im[i]));
+    return fmin(p_->T, 2.0 / fmax(r, 1e-300));
+}
+
+// Taylor coefficients cs[0..GN) at sig of the row g0 + G wt
+void GSolver::rtaylor(const ArcFn& F, const double* G, double g0, double sig, double* cs) const {
+    RowFn f;
+    rowfn(F, G, g0, f);
+    feval(f, sig, GN - 1, cs);
+    double fk = 1.0;
+    for (int k = 1; k < GN; ++k) { fk *= k; cs[k] /= fk; }
+}
+
+bool GSolver::glex_ok(uint16_t S, const ArcFn& F, double sig, double h) const {
     int keys[2 * MAXM];
     double G[2 * MAXM][MAXM], g0[2 * MAXM], cs[GN];
     const int nk = gphi(S, keys, G, g0);
     for (int r = 0; r < nk; ++r) {
-        for (int k = 0; k < GN; ++k) {
-            double a = (k == 0) ? g0[r] : 0.0;
-            for (int j = 0; j < m_; ++j) a += G[r][j] * W[j][k];
-            cs[k] = a;
-        }
-        tshift(cs, sig, 1.0, cs);
+        rtaylor(F, G[r], g0[r], sig, cs);
         double tol = 0.0, hp = 1.0;
         for (int k = 0; k < GN; ++k) { tol += fabs(cs[k]) * hp; hp *= h; }
         tol = 1e-12 * (tol + R_);
@@ -1763,35 +1858,18 @@ bool GSolver::glex_ok(uint16_t S, const double W[MAXM][GN], double sig, double h
     return true;
 }
 
-bool GSolver::glex_set(const double W[MAXM][GN], double sig, double h, uint16_t guess,
-                       uint16_t* out) const {
-    if (guess != 0xFFFFu && valid_set(guess) && glex_ok(guess, W, sig, h)) { *out = guess; return true; }
+bool GSolver::glex_set(const ArcFn& F, double sig, double h, uint16_t guess, uint16_t* out) const {
+    if (guess != 0xFFFFu && valid_set(guess) && glex_ok(guess, F, sig, h)) { *out = guess; return true; }
     return for_sets([&](uint16_t S) {
-        if (!glex_ok(S, W, sig, h)) return false;
+        if (!glex_ok(S, F, sig, h)) return false;
         *out = S;
         return true;
     });
 }
 
-// Calls f(arc, j, h, ||H^GN||) on every Taylor substep (arc split into equal substeps <= h_S).
-template <class F>
-bool GSolver::substeps(const uint16_t* seq, int N, const double* tau, F f) {
-    for (int k = 0; k < N; ++k) {
-        Arc& a = ac_;
-        if (!arc(k, seq, N, tau, a)) return false;
-        a.x = R_out->x[k];
-        double nN, h;
-        if (!nrm(seq[k], a.P, a.q, &nN, &h)) return false;
-        int K = (int)ceil(a.L / h * (1 - 1e-12));
-        if (K < 1) K = 1;
-        const double hs = a.L / K;
-        for (int j = 0; j < K; ++j)
-            if (!f(a, j, hs, nN)) return false;
-    }
-    return true;
-}
-
-// Exact event walk of the pointwise H-minimiser along the current BVP solution -> wseq_/wtau_
+// Exact event walk of the pointwise H-minimiser along the current BVP solution -> wseq_/wtau_.
+// Per arc of the iterate, the switching rows are exponential-polynomials: the first crossing is
+// found by bb() (certified, no grid), the set after it by the Taylor sign tests at the event.
 bool GSolver::gwalk(const uint16_t* seq, int N, const double* tau, int* ndeg) {
     const double T = p_->T;
     *ndeg = 0;
@@ -1801,20 +1879,16 @@ bool GSolver::gwalk(const uint16_t* seq, int N, const double* tau, int* ndeg) {
         wn_ = 1;
         return true;
     }
-    double bmax = 0.0;
-    for (int k = 0; k < m_; ++k) {
-        double s = 0.0;
-        for (int j = 0; j < m_; ++j) s += fabs(LiT_[j][k]);
-        bmax = fmax(bmax, s);
-    }
     uint16_t S = 0xFFFFu;
-    const bool ok = substeps(seq, N, tau, [&](const Arc& a, int j, double h, double nN) {
-        const double t0 = a.t0 + j * h;
-        double W[MAXM][GN], Zb;
-        taylor_w(a, j * h, h, W, &Zb);
-        const double eps0 = eps_of(nN, h, Zb, bmax);
+    ArcFn F;
+    for (int ka = 0; ka < N; ++ka) {
+        Arc& a = ac_;
+        if (!arc(ka, seq, N, tau, a)) return false;
+        a.x = R_out->x[ka];
+        if (!chan(a, F)) return false;
+        const double h = hloc(*a.b), t0 = a.t0;
         if (S == 0xFFFFu) {
-            if (!glex_set(W, 0.0, h, 0, &S)) return false;    // (a) initial set
+            if (!glex_set(F, 0.0, h, 0, &S)) return false;    // (a) initial set
             wseq_[ns++] = S;
         }
         double sig = 0.0;
@@ -1829,18 +1903,8 @@ bool GSolver::gwalk(const uint16_t* seq, int N, const double* tau, int* ndeg) {
             int keyk[2 * MAXM], nc = 0;
             double s1 = HUGE_VAL;
             for (int r = 0; r < nk; ++r) {
-                double c[GN], gn = 0.0;
-                auto poly = [&]() {                    // row polynomial in sigma
-                    for (int k = 0; k < GN; ++k) {
-                        double v = (k == 0) ? g0[r] : 0.0;
-                        for (int jj = 0; jj < m_; ++jj) v += G[r][jj] * W[jj][k];
-                        c[k] = v;
-                    }
-                };
-                for (int jj = 0; jj < m_; ++jj) gn += fabs(G[r][jj]);
-                poly();
-                double* cs = c;                        // shifted to the current point, in place
-                tshift(c, sig, 1.0, cs);
+                double cs[GN];
+                rtaylor(F, G[r], g0[r], sig, cs);
                 double tol = 0.0, hk = 1.0;
                 for (int k = 0; k < GN; ++k) { tol += fabs(cs[k]) * hk; hk *= h; }
                 tol = 1e-12 * (tol + R_);
@@ -1854,10 +1918,12 @@ bool GSolver::gwalk(const uint16_t* seq, int N, const double* tau, int* ndeg) {
                     if (sig < s1) s1 = sig;
                     continue;
                 }
+                RowFn f;
+                rowfn(F, G[r], g0[r], f);
                 double root;
                 bool simple;
-                poly();
-                if (first_exceed(c, sig, h, tol, eps0 * gn, 1e-14 * T, &root, &simple)) {
+                if (sig < a.L &&
+                    bb(f, sig, a.L, fmax(tol, 1e-12 * (f.scale + R_)), 0.0, true, &root, &simple) > 0) {
                     rootk[nc] = root; simplek[nc] = simple; keyk[nc++] = keys[r];
                     if (root < s1) s1 = root;
                 }
@@ -1880,10 +1946,10 @@ bool GSolver::gwalk(const uint16_t* seq, int N, const double* tau, int* ndeg) {
             if (Snew == 0xFFFFu) {
                 ++*ndeg;
                 const uint16_t guess = (uint16_t)(S ^ gmask);
-                if (!glex_set(W, s1, h, valid_set(guess) ? guess : 0xFFFFu, &Snew)) return false;
+                if (!glex_set(F, s1, h, valid_set(guess) ? guess : 0xFFFFu, &Snew)) return false;
             }
             if (Snew != S) {
-                if (ns >= NA) return false;
+                if (ns >= NA) { capfail_ = true; return false; }
                 wtau_[ns - 1] = t0 + s1;
                 wseq_[ns++] = Snew;
                 S = Snew;
@@ -1893,100 +1959,134 @@ bool GSolver::gwalk(const uint16_t* seq, int N, const double* tau, int* ndeg) {
             }
             sig = s1;
         }
-        return true;
-    });
-    if (!ok) return false;
+    }
     wn_ = ns;
     return true;
 }
 
+// max over the trajectory of the switching rows of each arc's own set (<= 0 at a PMP point)
 double GSolver::gverify(const uint16_t* seq, int N, const double* tau) {
-    double bmax = 0.0, worst = 0.0;
-    for (int k = 0; k < m_; ++k) {
-        double s = 0.0;
-        for (int j = 0; j < m_; ++j) s += fabs(LiT_[j][k]);
-        bmax = fmax(bmax, s);
-    }
-    const bool ok = substeps(seq, N, tau, [&](const Arc& a, int j, double h, double nN) {
+    double worst = 0.0;
+    const double lv = 0.1 * VTOL * R_;
+    ArcFn F;
+    RowFn f;
+    for (int ka = 0; ka < N; ++ka) {
+        Arc& a = ac_;
+        if (!arc(ka, seq, N, tau, a)) return HUGE_VAL;
+        a.x = R_out->x[ka];
         int keys[2 * MAXM];
         double G[2 * MAXM][MAXM], g0[2 * MAXM];
         const int nk = gphi(a.S, keys, G, g0);
-        if (nk == 0) return true;
-        double W[MAXM][GN], Zb;
-        taylor_w(a, j * h, h, W, &Zb);
-        const double eps0 = eps_of(nN, h, Zb, bmax);
+        if (nk == 0) continue;
+        if (!chan(a, F)) return HUGE_VAL;
         for (int r = 0; r < nk; ++r) {
-            double c[GN], q[GN], gn = 0.0;
-            for (int jj = 0; jj < m_; ++jj) gn += fabs(G[r][jj]);
-            for (int k = 0; k < GN; ++k) {
-                double v = (k == 0) ? g0[r] : 0.0;
-                for (int jj = 0; jj < m_; ++jj) v += G[r][jj] * W[jj][k];
-                c[k] = v;
-            }
-            tshift(c, 0.0, h, q);
-            worst = fmax(worst, bern_max(q, nullptr) + eps0 * gn);
+            rowfn(F, G[r], g0[r], f);
+            worst = fmax(worst, bb(f, 0.0, a.L, lv, lv, false, nullptr, nullptr));
         }
-        return true;
-    });
-    return ok ? worst : HUGE_VAL;
+    }
+    return worst;
 }
 
-double GSolver::gcost(const uint16_t* seq, int N, const double* tau) {
-    double J = 0.0;
-    const bool ok = substeps(seq, N, tau, [&](const Arc& a, int j, double h, double) {
-        for (int q = 0; q < 10; ++q) {
-            double z[N2 + 1], wt[MAXM], val = 0.0;
-            zat(a, j * h + 0.5 * h * (GL10_X[q] + 1.0), z);
-            wt_of(z + n_, wt);
-            for (int i = 0; i < m_; ++i) {
-                double vt = a.q[i];
-                for (int k = 0; k < m_; ++k) vt += a.P[i][k] * wt[k];
-                val += vt * vt;
-            }
-            for (int i = 0; i < n_; ++i) {
-                double qs = 0.0;
-                for (int k = 0; k < n_; ++k) qs += p_->Q[i][k] * z[k];
-                val += z[i] * qs;
-            }
-            J += 0.25 * h * GL10_W[q] * val;
+namespace {
+// phi1(z) = (e^z - 1) / z for complex z = (zr, zi) with zr <= ~0
+void cphi1(double zr, double zi, double* or_, double* oi) {
+    if (zr * zr + zi * zi < 0.25) {                    // series: sum z^k / (k+1)!
+        double tr = 1.0, ti = 0.0, sr = 1.0, si = 0.0;
+        for (int k = 1; k < 20; ++k) {
+            const double nr = (tr * zr - ti * zi) / (k + 1), ni = (tr * zi + ti * zr) / (k + 1);
+            tr = nr; ti = ni;
+            sr += tr; si += ti;
         }
-        return true;
-    });
-    if (!ok) return HUGE_VAL;
+        *or_ = sr; *oi = si;
+        return;
+    }
+    const double e = xexp(zr), nr = e * cos(zi) - 1.0, ni = e * sin(zi), d = zr * zr + zi * zi;
+    *or_ = (nr * zr + ni * zi) / d;
+    *oi = (ni * zr - nr * zi) / d;
+}
+}  // namespace
+
+// J in closed form. Along an extremal d/dt (lambda's) = -s'Qs - |vt|^2 - mu'b (mu' (Mt vt - b) = 0),
+// so J = 1/2 [lambda(0)'x0 - lambda(T)'s(T) - int mu'b dt] + terminal cost; mu is linear in wt
+// on a saturated arc, and int wt = sum of modal phi1 terms + the integrated polynomial.
+double GSolver::gcost(const uint16_t* seq, int N, const double* tau) {
+    const int n = n_;
+    double z0[N2 + 1], J = 0.0, mub = 0.0;
+    zstart(seq, N, tau, 0, z0);
+    for (int i = 0; i < n; ++i) J += z0[n + i] * p_->x0[i] - zT_[n + i] * zT_[i];
+    ArcFn F;
+    for (int ka = 0; ka < N; ++ka) {
+        if (!seq[ka]) continue;
+        Arc& a = ac_;
+        if (!arc(ka, seq, N, tau, a)) return HUGE_VAL;
+        a.x = R_out->x[ka];
+        if (!chan(a, F)) return HUGE_VAL;
+        const SetBasis& b = *a.b;
+        const int n2 = 2 * n, ns = b.ns, s1 = ns + b.nc;
+        double I[MAXM];                                // int_0^L wt_j
+        for (int j = 0; j < m_; ++j) {
+            double s = F.c[j] * a.L, Lk = a.L;
+            for (int k = 0; k < F.np; ++k) { s += F.poly[j][k] * Lk / (k + 1); Lk *= a.L; }
+            I[j] = s;
+        }
+        for (int i = 0; i < n2;) {
+            if (i == ns && s1 > ns) { i = s1; continue; }
+            const double sg = (i < ns) ? a.L : -a.L;   // stable: L phi1(lam L), unstable: L phi1(-lam L)
+            const bool pair = b.im[i] != 0.0;
+            double pr, pi;
+            cphi1(b.re[i] * sg, pair ? b.im[i] * sg : 0.0, &pr, &pi);
+            for (int j = 0; j < m_; ++j) {
+                const double P = F.amp[j][i], Q = pair ? F.amp[j][i + 1] : 0.0;
+                I[j] += a.L * (P * pr + Q * pi);       // Re[(P - iQ)(pr + i pi)]
+            }
+            i += pair ? 2 : 1;
+        }
+        int keys[2 * MAXM];
+        double G[2 * MAXM][MAXM], g0[2 * MAXM];
+        const int nk = gphi(seq[ka], keys, G, g0);
+        for (int r = 0; r < nk; ++r) {
+            if (!(seq[ka] & (1u << keys[r]))) continue;   // active row: -mu |a|^2 = G wt + g0
+            double v = g0[r] * a.L;
+            for (int j = 0; j < m_; ++j) v += G[r][j] * I[j];
+            mub -= rhs_[keys[r]] * v / rownorm2_[keys[r]];
+        }
+    }
+    J = 0.5 * (J - mub);
     if (p_->has_Qf)
-        for (int i = 0; i < n_; ++i)
-            for (int k = 0; k < n_; ++k)
+        for (int i = 0; i < n; ++i)
+            for (int k = 0; k < n; ++k)
                 J += 0.5 * (zT_[i] - p_->xf[i]) * p_->Qf[i][k] * (zT_[k] - p_->xf[k]);
     return J;
 }
 
 void GSolver::gscale(double kap) {
     for (int k = 0; k < 2 * m_; ++k) rhs_[k] = rhs0_[k] * kap;
-    ncn_ = 0;                                  // ||H^24|| depends on q, i.e. on the bounds
 }
 
+// max_t of (row r of the unscaled bounds) / bound along the current trajectory (exact max)
 double GSolver::gmax_ratio(const uint16_t* seq, int N, const double* tau) {
     double r = 0.0;
-    const bool ok = substeps(seq, N, tau, [&](const Arc& a, int j, double h, double) {
-        for (int q = 0; q < 10; ++q) {
-            double z[N2 + 1], wt[MAXM], vt[MAXM];
-            zat(a, j * h + 0.5 * h * (GL10_X[q] + 1.0), z);
-            wt_of(z + n_, wt);
-            for (int i = 0; i < m_; ++i) {
-                double sum = a.q[i];
-                for (int k = 0; k < m_; ++k) sum += a.P[i][k] * wt[k];
-                vt[i] = sum;
+    ArcFn F;
+    RowFn f;
+    for (int ka = 0; ka < N; ++ka) {
+        Arc& a = ac_;
+        if (!arc(ka, seq, N, tau, a)) return HUGE_VAL;
+        a.x = R_out->x[ka];
+        if (!chan(a, F)) return HUGE_VAL;
+        for (int k = 0; k < 2 * m_; ++k) {
+            if (!finite_[k] || !(rhs0_[k] > 0)) continue;
+            double G[MAXM], g0 = 0.0;                  // rows_[k] (P wt + q) / rhs0
+            for (int j = 0; j < m_; ++j) {
+                double s = 0.0;
+                for (int i = 0; i < m_; ++i) s += rows_[k][i] * a.P[i][j];
+                G[j] = s / rhs0_[k];
+                g0 += rows_[k][j] * a.q[j] / rhs0_[k];
             }
-            for (int k = 0; k < 2 * m_; ++k) {
-                if (!finite_[k] || !(rhs0_[k] > 0)) continue;
-                double gk = 0.0;
-                for (int i = 0; i < m_; ++i) gk += rows_[k][i] * vt[i];
-                r = fmax(r, gk / rhs0_[k]);
-            }
+            rowfn(F, G, g0, f);
+            r = fmax(r, bb(f, 0.0, a.L, -HUGE_VAL, 1e-6, false, nullptr, nullptr));
         }
-        return true;
-    });
-    return ok ? r : HUGE_VAL;
+    }
+    return r;
 }
 
 // ---- linear BVP for fixed junction times ----
@@ -2661,8 +2761,8 @@ bool GSolver::solve(GResult& R) {
     R.failure = nullptr;
     R.narcs = 0;
     for (int k = 0; k < 2 * m_; ++k) rhs_[k] = rhs0_[k];
-    ncn_ = 0;
     events_ = 0;
+    capfail_ = false;
     int its = 0, outer = 0, ndeg = 0, nsteps = 0;
     an_ = 1;
     aseq_[0] = 0;
