@@ -1940,6 +1940,8 @@ double GSolver::froot(const RowFn& f, double lo, double hi) const {
 // NaN when f is not finite.
 double GSolver::bb(const RowFn& f, double a, double b, double thr, double atol, bool first,
                    double* root, bool* simple) const {
+    const SetBasis& sb = *f.F->b;
+    if (sb.nc == 2 * n_ && !f.F->nsb) return pbb(f, a, b, thr, first, root, simple);
     const double minw = 1e-14 * p_->T;
     double best = -HUGE_VAL;
     int level = 0;
@@ -1976,6 +1978,58 @@ double GSolver::bb(const RowFn& f, double a, double b, double thr, double atol, 
         if (level == 0) return first ? 0.0 : best;
         ++k;                                           // right sibling
     }
+}
+
+// bb() for a pure polynomial row (a vertex arc: H nilpotent, no modes), exactly: the critical points
+// are the roots of p', isolated from the roots of p'', ... (each derivative is monotone between the
+// roots of the next one; one root per sign change, safeguarded Newton). Same contract as bb().
+double GSolver::pbb(const RowFn& f, double a, double b, double thr, bool first, double* root,
+                    bool* simple) const {
+    const int np = f.F->np;
+    double P[NPOLY][NPOLY] = {{0.0}}, x[NPOLY + 1], y[NPOLY + 1];   // P[l]: coefficients of p^(l)
+    for (int k = 0; k < np; ++k) P[0][k] = f.p(k) + ((k == 0) ? f.c0 : 0.0);
+    if (!isfinite(P[0][0])) return NAN;
+    for (int l = 1; l < np; ++l)
+        for (int k = 0; k + l < np; ++k) P[l][k] = P[l - 1][k + 1] * (k + 1);
+    auto val = [&](int l, double t) { double s = 0.0; for (int k = np - 1 - l; k >= 0; --k) s = s * t + P[l][k]; return s; };
+    auto zero = [&](int l, double lo, double hi) {    // the root of p^(l), monotone on [lo, hi]
+        const double flo = val(l, lo);
+        double t = 0.5 * (lo + hi);
+        for (int it = 0; it < 200; ++it) {
+            const double ft = val(l, t), d = val(l + 1, t);
+            if ((ft > 0) == (flo > 0)) lo = t; else hi = t;
+            double tn = (d != 0.0) ? t - ft / d : 0.5 * (lo + hi);
+            if (!(tn > lo && tn < hi)) tn = 0.5 * (lo + hi);
+            if (tn == t || !(hi > lo)) break;
+            t = tn;
+        }
+        return t;
+    };
+    int nx = 0;                                        // roots of p^(l) in (a, b), sorted, l = np-2 .. 1
+    for (int l = np - 2; l >= 1; --l) {
+        int ny = 0;
+        double lo = a, vlo = val(l, a);
+        for (int i = 0; i <= nx; ++i) {
+            const double hi = (i < nx) ? x[i] : b, vhi = val(l, hi);
+            if ((vlo < 0 && vhi > 0) || (vlo > 0 && vhi < 0)) y[ny++] = zero(l, lo, hi);
+            lo = hi; vlo = vhi;
+        }
+        for (int i = 0; i < ny; ++i) x[i] = y[i];
+        nx = ny;
+    }
+    // p is monotone between a, x[0..nx), b
+    double best = -HUGE_VAL, lo = a, vlo = val(0, a);
+    for (int i = 0; i <= nx; ++i) {
+        const double hi = (i < nx) ? x[i] : b, vhi = val(0, hi);
+        best = fmax(best, fmax(vlo, vhi));
+        if (first && fmax(vlo, vhi) > thr) {
+            if (vlo <= 0.0 && vhi > 0.0) { *root = zero(0, lo, hi); *simple = true; }
+            else { *root = lo; *simple = false; }
+            return 1.0;
+        }
+        lo = hi; vlo = vhi;
+    }
+    return first ? 0.0 : best;
 }
 
 // local scale of the Taylor sign tests: |lam| h <= 2 for the fastest mode

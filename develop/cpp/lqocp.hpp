@@ -351,6 +351,7 @@ private:
     __attribute__((noinline)) void ptaylor(const RowFn& f, double sig, int nd, double* d) const;
     double node(const RowFn& f, double lo, double hi, double* d, double* M2) const;
     double froot(const RowFn& f, double lo, double hi) const;
+    double pbb(const RowFn& f, double a, double b, double thr, bool first, double* root, bool* simple) const;
     double bb(const RowFn& f, double a, double b, double thr, double atol, bool first, double* root,
               bool* simple) const;
     double hloc(const SetBasis& b) const;
