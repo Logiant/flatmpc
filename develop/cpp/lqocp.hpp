@@ -329,7 +329,7 @@ private:
     void rowfn(const ArcFn& F, const double* G, double g0, RowFn& f) const;
     void feval(const RowFn& f, double sig, int nd, double* d) const;
     __attribute__((noinline)) void ptaylor(const RowFn& f, double sig, int nd, double* d) const;
-    double fbound2(const RowFn& f, double lo, double hi) const;
+    double node(const RowFn& f, double lo, double hi, double* d, double* M2) const;
     double froot(const RowFn& f, double lo, double hi) const;
     double bb(const RowFn& f, double a, double b, double thr, double atol, bool first, double* root,
               bool* simple) const;

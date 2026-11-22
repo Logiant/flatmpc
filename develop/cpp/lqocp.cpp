@@ -1738,35 +1738,55 @@ void GSolver::ptaylor(const RowFn& f, double sig, int nd, double* d) const {
     }
 }
 
-// M2 >= |f''| on [lo, hi]: modal envelopes (largest at the end nearer the anchor) plus the
-// centre polynomial's second derivative bounded by its Taylor coefficients at the midpoint
-double GSolver::fbound2(const RowFn& f, double lo, double hi) const {
+// One node [lo, hi] of bb(): d = (f, f') at the midpoint m, *M2 >= |f''| on the node (modal
+// envelopes, largest at the end nearer the anchor, plus the centre polynomial's second derivative
+// bounded by its Taylor coefficients at m). Returns an upper bound of f on the node: the smaller of
+// f(m) + |f'(m)| h + M2 h^2 / 2 and the same bound for the slow modes plus the envelopes
+// |A| e^{Re lam (t - anc)} of the fast ones (|lam| h > 1), which only decay away from their anchor.
+double GSolver::node(const RowFn& f, double lo, double hi, double* d, double* M2p) const {
     const SetBasis& b = *f.F->b;
-    const int n2 = 2 * n_, ns = b.ns, s1 = ns + b.nc;
-    double M = 0.0;
+    const int n2 = 2 * n_, ns = b.ns, s1 = ns + b.nc, np = f.F->np;
+    const double m = 0.5 * (lo + hi), h = 0.5 * (hi - lo), L = f.F->L;
+    double d0 = f.c0, d1 = 0.0, M2 = 0.0, v = f.c0, v1 = 0.0, M2s = 0.0, E = 0.0;
     for (int i = 0; i < n2;) {
         if (i == ns && s1 > ns) { i = s1; continue; }
-        const double re = b.re[i], e = xexp(re * (((re > 0) ? hi : lo) - ((i < ns) ? 0.0 : f.F->L)));
-        if (b.im[i] == 0.0) { M += fabs(f.u(i)) * re * re * e; ++i; }
-        else {
-            const double P = f.u(i), Q = f.u(i + 1);
-            M += sqrt(P * P + Q * Q) * (re * re + b.im[i] * b.im[i]) * e;
+        const double re = b.re[i], anc = (i < ns) ? 0.0 : L, om = b.im[i];
+        const double e = xexp(re * (m - anc)), ee = xexp(re * (((re > 0) ? hi : lo) - anc));
+        double x, x1, A;
+        if (om == 0.0) {
+            const double u = f.u(i);
+            x = u * e; x1 = re * x; A = fabs(u);
+            ++i;
+        } else {
+            const double P = f.u(i), Q = f.u(i + 1), c = cos(om * (m - anc)), sn = sin(om * (m - anc));
+            x = e * (P * c + Q * sn);
+            const double y = e * (P * sn - Q * c);
+            x1 = re * x - om * y;
+            A = sqrt(P * P + Q * Q);
             i += 2;
         }
+        const double l2 = re * re + om * om;
+        d0 += x; d1 += x1; M2 += A * l2 * ee;
+        if (l2 * h * h > 1.0) E += A * ee;
+        else { v += x; v1 += x1; M2s += A * l2 * ee; }
     }
-    const int nq = f.F->np - 2;
-    if (nq > 0) {
-        const double m = 0.5 * (lo + hi), h = 0.5 * (hi - lo);
-        double q[NPOLY], s = 0.0, hk = 1.0;
+    if (np > 0) {
+        double q[NPOLY], p0 = 0.0, p1 = 0.0, s = 0.0, hk = 1.0;
+        for (int k = np - 1; k >= 0; --k) { p1 = p1 * m + p0; p0 = p0 * m + f.p(k); }
+        const int nq = np - 2;                         // p'' at m + t: Taylor shift to m
         for (int k = 0; k < nq; ++k) q[k] = (k + 2.0) * (k + 1.0) * f.p(k + 2);
         for (int k = 0; k < nq; ++k) {
             for (int i = nq - 2; i >= k; --i) q[i] += m * q[i + 1];
             s += fabs(q[k]) * hk;
             hk *= h;
         }
-        M += s;
+        d0 += p0; d1 += p1; M2 += s;
+        v += p0; v1 += p1; M2s += s;
     }
-    return M;
+    d[0] = d0;
+    d[1] = d1;
+    *M2p = M2;
+    return fmin(d0 + fabs(d1) * h + 0.5 * M2 * h * h, v + fabs(v1) * h + 0.5 * M2s * h * h + E);
 }
 
 // root of f in [lo, hi] with f(lo) <= 0 < f(hi): safeguarded Newton
@@ -1785,8 +1805,8 @@ double GSolver::froot(const RowFn& f, double lo, double hi) const {
 }
 
 // Branch and bound over the dyadic subintervals of [a, b], depth-first, left to right (no stack).
-// A node [lo, hi] (midpoint m, half-width h) is cleared when f(m) + |f'(m)| h + M2 h^2 / 2 is at
-// most the level, or when f is monotone on it (|f'(m)| >= M2 h; its maximum is then an end).
+// A node [lo, hi] (midpoint m, half-width h) is cleared when its upper bound (node()) is at most
+// the level, or when f is monotone on it (|f'(m)| >= M2 h; its maximum is then an end).
 // first: the first point where f > thr; *root is the crossing of 0 that brackets it, *simple when
 // f is increasing there. Otherwise: max f to within atol above max(level, floor), returned.
 double GSolver::bb(const RowFn& f, double a, double b, double thr, double atol, bool first,
@@ -1799,14 +1819,13 @@ double GSolver::bb(const RowFn& f, double a, double b, double thr, double atol, 
         const double w = ldexp(b - a, -level), lo = a + (double)k * w;
         const double hi = (k + 1 == ((uint64_t)1 << level)) ? b : lo + w;
         const double m = 0.5 * (lo + hi), h = 0.5 * (hi - lo);
-        double d[2], e[1];
-        feval(f, m, 1, d);
-        const double M2 = fbound2(f, lo, hi);
+        double d[2], e[1], M2;
+        const double ub = node(f, lo, hi, d, &M2);
         const double lvl = first ? thr : fmax(fmax(best, d[0]), thr) + atol;
         best = fmax(best, d[0]);
         const bool inc = d[1] - M2 * h >= 0.0, dec = d[1] + M2 * h <= 0.0;
         bool leaf = true;
-        if (d[0] + fabs(d[1]) * h + 0.5 * M2 * h * h <= lvl) {
+        if (ub <= lvl) {
         } else if (dec) {                              // max at lo
             if (!first) { feval(f, lo, 0, e); best = fmax(best, e[0]); }
         } else if (inc || h <= minw || level >= 60) {
@@ -1868,6 +1887,23 @@ bool GSolver::glex_set(const ArcFn& F, double sig, double h, uint16_t guess, uin
 // 0 if none), its order and the tolerance used
 double GSolver::lead(const ArcFn& F, const double* G, double g0, double sig, double h, double* tolp,
                      int* ilead) const {
+    {   // cheap case: f(sig) above a bound of the tolerance (sum_k |c_k| h^k <= this sum)
+        RowFn f;
+        rowfn(F, G, g0, f);
+        const SetBasis& b = *F.b;
+        const int n2 = 2 * n_, ns = b.ns, s1 = ns + b.nc;
+        double B = fabs(f.c0) + R_, d0, x = 1.0;
+        for (int i = 0; i < n2;) {
+            if (i == ns && s1 > ns) { i = s1; continue; }
+            const double re = b.re[i], om = b.im[i], t = sig - ((i < ns) ? 0.0 : F.L);
+            const double A = (om == 0.0) ? fabs(f.u(i)) : sqrt(f.u(i) * f.u(i) + f.u(i + 1) * f.u(i + 1));
+            B += A * xexp(re * t + sqrt(re * re + om * om) * h);
+            i += (om == 0.0) ? 1 : 2;
+        }
+        for (int k = 0; k < F.np; ++k) { B += fabs(f.p(k)) * x; x *= fabs(sig) + h; }
+        feval(f, sig, 0, &d0);
+        if (fabs(d0) > 1e-12 * B) { *tolp = 1e-12 * B; *ilead = 0; return d0; }
+    }
     double cs[GN], tol = 0.0, hk = 1.0;
     rtaylor(F, G, g0, sig, cs);
     for (int k = 0; k < GN; ++k) { tol += fabs(cs[k]) * hk; hk *= h; }
