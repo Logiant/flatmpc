@@ -10,7 +10,7 @@
 //                  primitives, Newton on the junction times with exact derivatives and exact
 //                  collapse events, event-driven bound-scale homotopy (NOTES.md section 9);
 //                  closed-form walk/cost and the MPC warm start GSolver::solve_warm (section 11).
-//   METHOD_TAU    : junction-time Gauss-Newton, sequence read off a time grid (energy only).
+//   METHOD_TAU    : junction-time Gauss-Newton, sequence from the exact event walk (energy only).
 //
 // Embedded-friendly core: fixed-size arrays only, no heap allocation, no exceptions, no STL.
 // Sizes are reported in NOTES.md. Declare Solver/Result static/global on a microcontroller.
@@ -40,7 +40,6 @@ constexpr int MAXJ_E = MAXARC_E - 1;
 constexpr int MAXJ_TAU = 16;         // max junctions handled by the tau method
 constexpr int MAXRES = 2 * MAXJ_TAU;
 constexpr int MAXTOUCH = 16;         // recorded tangential touch points (energy newton)
-constexpr int NGRID = 2000;          // grid used by the tau method only
 constexpr int MAXSETS = 81;          // 3^MAXM candidate active sets
 constexpr int MAX_OUTER = 50;
 constexpr int MAX_NEWTON = 50;
@@ -155,10 +154,8 @@ private:
     void set_times(Arc* arcs, int nseq, const double* tau) const;
     void assemble(const Arc* arcs, int narcs, double* G, double* h) const;
     bool solve_c(const Arc* arcs, int narcs, double* c) const;
-    bool detect(const double* c, uint16_t* seq, int* nseq, double* tau) const;
     bool residual(Arc* arcs, int nseq, const double* tau, double* res, int* nres, double* c) const;
     bool newton(Arc* arcs, int nseq, double* tau, double* c, int* its, double* resmax) const;
-    double pmp_violation(const Arc* arcs, int narcs, const double* c) const;
     double cost(const Arc* arcs, int narcs, const double* c) const;
     void v_on(const Arc& a, const double* c, double t, double* v) const;
     bool solve_tau(Result& r);

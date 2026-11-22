@@ -331,29 +331,6 @@ bool Solver::solve_c(const Arc* arcs, int narcs, double* c) const {
     return true;
 }
 
-bool Solver::detect(const double* c, uint16_t* seq, int* nseq, double* tau) const {
-    uint16_t S = 0xFFFFu;
-    int ns = 0;
-    const double dt = p_.T / NGRID;
-    double w[MAXM], v[MAXM];
-    for (int g = 0; g <= NGRID; ++g) {
-        const double t = g * dt;
-        w_of(c, t, w);
-        uint16_t Sn;
-        project(w, S, v, &Sn);
-        if (g == 0) {
-            seq[ns++] = Sn;
-        } else if (Sn != S) {
-            if (ns >= MAXJ_TAU + 1) return false;
-            tau[ns - 1] = t - 0.5 * dt;
-            seq[ns++] = Sn;
-        }
-        S = Sn;
-    }
-    *nseq = ns;
-    return true;
-}
-
 bool Solver::residual(Arc* arcs, int nseq, const double* tau, double* res, int* nres,
                       double* c) const {
     set_times(arcs, nseq, tau);
@@ -449,21 +426,6 @@ bool Solver::newton(Arc* arcs, int nseq, double* tau, double* c, int* its, doubl
     return rmax < tol;
 }
 
-double Solver::pmp_violation(const Arc* arcs, int narcs, const double* c) const {
-    double err = 0.0, w[MAXM], va[MAXM], vo[MAXM];
-    int ai = 0;
-    for (int g = 0; g <= NGRID; ++g) {
-        const double t = p_.T * g / NGRID;
-        while (ai < narcs - 1 && t > arcs[ai].t1) ++ai;
-        v_on(arcs[ai], c, t, va);
-        w_of(c, t, w);
-        uint16_t S;
-        project(w, arcs[ai].S, vo, &S);
-        for (int j = 0; j < m_; ++j) err = fmax(err, fabs(va[j] - vo[j]));
-    }
-    return err;
-}
-
 double Solver::cost(const Arc* arcs, int narcs, const double* c) const {
     double J = 0.0, v[MAXM];
     for (int a = 0; a < narcs; ++a) {
@@ -490,16 +452,15 @@ bool Solver::solve(Result& R, int method) {
     return solve_tau(R);
 }
 
-// Active-set sequence for the tau method: exact event walk of the newton method (grid only
-// as a fallback, e.g. if the walk needs more junctions than the tau method supports).
+// Active-set sequence for the tau method: the exact event walk of the newton method (per arc and
+// row, the cubic gap's roots in closed form; section 7.3). Fails if the walk fails or needs more
+// junctions than the tau method supports.
 bool Solver::detect_exact(const double* c) {
-    if (walk(c, ew_.ev[0]) && ew_.ev[0].narcs <= MAXJ_TAU + 1) {
-        ew_.nseq2 = ew_.ev[0].narcs;
-        for (int i = 0; i < ew_.nseq2; ++i) ew_.seq2[i] = ew_.wseq[i];
-        for (int i = 0; i + 1 < ew_.nseq2; ++i) ew_.tau2[i] = ew_.wtau[i];
-        return true;
-    }
-    return detect(c, ew_.seq2, &ew_.nseq2, ew_.tau2);
+    if (!walk(c, ew_.ev[0]) || ew_.ev[0].narcs > MAXJ_TAU + 1) return false;
+    ew_.nseq2 = ew_.ev[0].narcs;
+    for (int i = 0; i < ew_.nseq2; ++i) ew_.seq2[i] = ew_.wseq[i];
+    for (int i = 0; i + 1 < ew_.nseq2; ++i) ew_.tau2[i] = ew_.wtau[i];
+    return true;
 }
 
 bool Solver::solve_tau(Result& R) {
