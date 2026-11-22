@@ -1264,6 +1264,7 @@ bool GSolver::setup(const Problem& p, BasisFn fn, void* ctx) {
         end_[j] = n_ - 1;
     }
     if (n_ > MAXN || !(p.T > 0.0)) return false;
+    set_x0(p.x0);
     // Cholesky R = Lc Lc^T (symmetrised)
     for (int i = 0; i < m_; ++i)
         for (int j = 0; j < m_; ++j) Lc_[i][j] = 0.0;
@@ -2006,6 +2007,33 @@ void cphi1(double zr, double zi, double* or_, double* oi) {
 }
 }  // namespace
 
+// I_j = int_sa^sb wt_j on the arc of F (closed form): modes e^{lam (sa - anc)} len phi1(lam len)
+// (stable) or e^{lam (sb - anc)} len phi1(-lam len) (unstable), plus the integrated polynomial
+void GSolver::wint(const ArcFn& F, double sa, double sb, double* I) const {
+    const SetBasis& b = *F.b;
+    const int n2 = 2 * n_, ns = b.ns, s1 = ns + b.nc;
+    const double len = sb - sa;
+    for (int j = 0; j < m_; ++j) {
+        double s = F.c[j] * len, ka = sa, kb = sb;
+        for (int k = 0; k < F.np; ++k) { s += F.poly[j][k] * (kb - ka) / (k + 1); ka *= sa; kb *= sb; }
+        I[j] = s;
+    }
+    for (int i = 0; i < n2;) {
+        if (i == ns && s1 > ns) { i = s1; continue; }
+        const bool pair = b.im[i] != 0.0, st = i < ns;
+        const double re = b.re[i], om = pair ? b.im[i] : 0.0, sg = st ? len : -len;
+        const double t = st ? sa : sb - F.L, e = xexp(re * t), c = cos(om * t), sn = sin(om * t);
+        double pr, pi;
+        cphi1(re * sg, om * sg, &pr, &pi);
+        const double gr = len * e * (c * pr - sn * pi), gi = len * e * (c * pi + sn * pr);   // e^{lam t} len phi1
+        for (int j = 0; j < m_; ++j) {
+            const double P = F.amp[j][i], Q = pair ? F.amp[j][i + 1] : 0.0;
+            I[j] += P * gr + Q * gi;                   // Re[(P - iQ)(gr + i gi)]
+        }
+        i += pair ? 2 : 1;
+    }
+}
+
 // J in closed form. Along an extremal d/dt (lambda's) = -s'Qs - |vt|^2 - mu'b (mu' (Mt vt - b) = 0),
 // so J = 1/2 [lambda(0)'x0 - lambda(T)'s(T) - int mu'b dt] + terminal cost; mu is linear in wt
 // on a saturated arc, and int wt = sum of modal phi1 terms + the integrated polynomial.
@@ -2013,7 +2041,7 @@ double GSolver::gcost(const uint16_t* seq, int N, const double* tau) {
     const int n = n_;
     double z0[N2 + 1], J = 0.0, mub = 0.0;
     zstart(seq, N, tau, 0, z0);
-    for (int i = 0; i < n; ++i) J += z0[n + i] * p_->x0[i] - zT_[n + i] * zT_[i];
+    for (int i = 0; i < n; ++i) J += z0[n + i] * x0_[i] - zT_[n + i] * zT_[i];
     ArcFn F;
     for (int ka = 0; ka < N; ++ka) {
         if (!seq[ka]) continue;
@@ -2021,26 +2049,8 @@ double GSolver::gcost(const uint16_t* seq, int N, const double* tau) {
         if (!arc(ka, seq, N, tau, a)) return HUGE_VAL;
         a.x = R_out->x[ka];
         if (!chan(a, F)) return HUGE_VAL;
-        const SetBasis& b = *a.b;
-        const int n2 = 2 * n, ns = b.ns, s1 = ns + b.nc;
         double I[MAXM];                                // int_0^L wt_j
-        for (int j = 0; j < m_; ++j) {
-            double s = F.c[j] * a.L, Lk = a.L;
-            for (int k = 0; k < F.np; ++k) { s += F.poly[j][k] * Lk / (k + 1); Lk *= a.L; }
-            I[j] = s;
-        }
-        for (int i = 0; i < n2;) {
-            if (i == ns && s1 > ns) { i = s1; continue; }
-            const double sg = (i < ns) ? a.L : -a.L;   // stable: L phi1(lam L), unstable: L phi1(-lam L)
-            const bool pair = b.im[i] != 0.0;
-            double pr, pi;
-            cphi1(b.re[i] * sg, pair ? b.im[i] * sg : 0.0, &pr, &pi);
-            for (int j = 0; j < m_; ++j) {
-                const double P = F.amp[j][i], Q = pair ? F.amp[j][i + 1] : 0.0;
-                I[j] += a.L * (P * pr + Q * pi);       // Re[(P - iQ)(pr + i pi)]
-            }
-            i += pair ? 2 : 1;
-        }
+        wint(F, 0.0, a.L, I);
         int keys[2 * MAXM];
         double G[2 * MAXM][MAXM], g0[2 * MAXM];
         const int nk = gphi(seq[ka], keys, G, g0);
@@ -2095,7 +2105,7 @@ void GSolver::init_rel(int) {
     for (int r = 0; r < n_; ++r) {
         for (int c = 0; c < NCOL; ++c) rel_[r][c] = 0;
         rel_[r][r] = 1;
-        rel_[r][N2] = p_->x0[r];
+        rel_[r][N2] = x0_[r];
     }
 }
 
@@ -2604,12 +2614,13 @@ bool GSolver::newton_tau(uint16_t* seq, int* Np, double* tau, int* its) {
     const double tol = GTOL * R_, gap = 1e-12 * p_->T;
     double prev = HUGE_VAL;
     int bad = 0;
-    while (*its < MAX_TAU_NEWTON) {
+    while (*its < MAX_TAU_NEWTON && budget_ > 0) {
         const int nj = N - 1;
         if (rmax <= tol) { *Np = N; return true; }
         if (rmax > 0.5 * prev && ++bad > 2) { *Np = N; return rmax <= 1e3 * tol; }
         prev = rmax;
         ++*its;
+        --budget_;
         if (nr < nj || !sens(seq, N, tau)) { *Np = N; return false; }
         for (int q = 0; q < nr; ++q) {
             const int k = jq_[q];
@@ -2711,19 +2722,22 @@ bool GSolver::propose(const uint16_t* seq, int N, const double* tau, int* ndeg) 
 }
 
 // Corrector at a fixed bound scale from the predicted structure aseq_/atau_: Newton on tau, then
-// the exact walk; repeat with the walked structure (at most 3 times).
-bool GSolver::correct(int* its, int* outer, int* ndeg) {
+// the exact walk; repeat with the walked structure (at most `rounds` times). On failure aseq_/atau_
+// hold the last iterate's structure.
+bool GSolver::correct(int* its, int* outer, int* ndeg, int rounds) {
     uint16_t seq[NA];
     double tau[NA];
     int N = an_, retry = 1;
     for (int i = 0; i < N; ++i) seq[i] = aseq_[i];
     for (int i = 0; i + 1 < N; ++i) tau[i] = atau_[i];
-    for (int o = 0; o < 3; ++o) {
+    bool ok = true;
+    for (int o = 0; o < rounds && ok; ++o) {
         int k = 0;
-        const bool ok = newton_tau(seq, &N, tau, &k);
+        ok = newton_tau(seq, &N, tau, &k);
         *its += k;
-        if (!ok && (o > 0 || retry-- == 0)) return false;
-        if (!propose(seq, N, tau, ndeg)) return false;
+        if (!ok && (o > 0 || retry-- == 0)) break;
+        ok = propose(seq, N, tau, ndeg);
+        if (!ok) break;
         bool same = (wn_ == N);
         for (int i = 0; same && i < N; ++i) {
             if (wseq_[i] != seq[i]) same = false;
@@ -2740,6 +2754,9 @@ bool GSolver::correct(int* its, int* outer, int* ndeg) {
         for (int i = 0; i + 1 < N; ++i) tau[i] = wtau_[i];
         ++*outer;
     }
+    an_ = N;
+    for (int i = 0; i < N; ++i) aseq_[i] = seq[i];
+    for (int i = 0; i + 1 < N; ++i) atau_[i] = tau[i];
     return false;
 }
 
@@ -2753,16 +2770,23 @@ double GSolver::zmax(const uint16_t* seq, int N, const double* tau) const {
     return m;
 }
 
-bool GSolver::solve(GResult& R) {
+void GSolver::begin(GResult& R, int max_its) {
     R_out = &R;
     R.iterations = R.outer_iterations = R.degenerate_events = 0;
     R.cost = R.residual = R.pmp_violation = HUGE_VAL;
     R.converged = false;
     R.failure = nullptr;
-    R.narcs = 0;
     for (int k = 0; k < 2 * m_; ++k) rhs_[k] = rhs0_[k];
     events_ = 0;
     capfail_ = false;
+    budget_ = max_its;
+}
+
+bool GSolver::solve(GResult& R) { return cold(R, MAX_GEN_ITS); }
+
+bool GSolver::cold(GResult& R, int max_its) {
+    begin(R, max_its);
+    R.narcs = 0;
     int its = 0, outer = 0, ndeg = 0, nsteps = 0;
     an_ = 1;
     aseq_[0] = 0;
@@ -2791,7 +2815,7 @@ bool GSolver::solve(GResult& R) {
             double stau[NA];
             for (;;) {
                 if (kap == 1.0) { conv = true; break; }
-                if (its > MAX_GEN_ITS) { why = "iteration cap reached"; break; }
+                if (budget_ <= 0) { why = "iteration cap reached"; break; }
                 if (dl < DL_MIN) { why = "homotopy stalled at bound scale > 1 (bounds infeasible?)"; break; }
                 if (zmax(aseq_, an_, atau_) > 1e8 * (1.0 + z0)) { why = "costate diverged (bounds infeasible?)"; break; }
                 const int sn = an_;
@@ -2814,7 +2838,7 @@ bool GSolver::solve(GResult& R) {
                     if (!ord || !(p_->T > pv))
                         for (int i = 0; i + 1 < sn; ++i) atau_[i] = stau[i];
                 }
-                if (correct(&its, &outer, &ndeg)) {
+                if (correct(&its, &outer, &ndeg, 3)) {
                     hn_ = sn;
                     for (int i = 0; i < sn; ++i) hseq_[i] = sseq[i];
                     for (int i = 0; i + 1 < sn; ++i) htau_[i] = stau[i];
@@ -2833,6 +2857,40 @@ bool GSolver::solve(GResult& R) {
             }
         }
     }
+    return finish(R, conv, why, its, nsteps, ndeg);
+}
+
+// MPC warm start (NOTES.md 11.4): R holds the previous solution of this problem; the Problem's x0
+// has been updated by the caller. The previous arc structure, with its junction times moved by
+// -dt (arcs that ended are dropped, the last arc is stretched to T), is corrected by Newton on
+// tau and the exact walk at the true bounds: no homotopy. If that fails with iterations left, the
+// cold solve (homotopy) takes over. At most max_its Newton iterations in all; when the cap is hit,
+// R is the current iterate (it satisfies the dynamics and both boundary conditions) with
+// converged = false.
+bool GSolver::solve_warm(GResult& R, double dt, int max_its) {
+    if (R.narcs < 1 || R.narcs > NA) return cold(R, max_its);
+    const double T = p_->T;
+    an_ = 0;
+    for (int k = 0; k < R.narcs; ++k) {
+        const bool last = (k == R.narcs - 1);
+        const double t1 = last ? T : R.t1[k] - dt;
+        if (!last && t1 <= 1e-9 * T) continue;         // this arc has ended
+        aseq_[an_] = R.S[k];
+        if (!last) atau_[an_] = t1;
+        ++an_;
+    }
+    begin(R, max_its);
+    int its = 0, outer = 0, ndeg = 0;
+    if (correct(&its, &outer, &ndeg, 6)) return finish(R, true, nullptr, its, 0, ndeg);
+    if (budget_ > 0 && !capfail_) {                    // cold fallback with the iterations left
+        const bool ok = cold(R, budget_);
+        R.iterations += its;
+        return ok;
+    }
+    return finish(R, false, capfail_ ? "arc capacity NA exceeded" : "iteration cap reached", its, 0, ndeg);
+}
+
+bool GSolver::finish(GResult& R, bool conv, const char* why, int its, int nsteps, int ndeg) {
     R.iterations = its;
     R.outer_iterations = nsteps;
     R.degenerate_events = ndeg;
@@ -2897,6 +2955,34 @@ void GSolver::eval_u(const GResult& R, double t, double u[MAXM]) const {
         double s = a.q[i];
         for (int j = 0; j < m_; ++j) s += a.P[i][j] * wt[j];
         vt[i] = s;
+    }
+    for (int i = m_ - 1; i >= 0; --i) {                // Lc^T u = vt
+        double s = vt[i];
+        for (int k2 = i + 1; k2 < m_; ++k2) s -= Lc_[k2][i] * u[k2];
+        u[i] = s / Lc_[i][i];
+    }
+}
+
+// mean input over [t0, t1] (closed form; the value a zero-order hold should apply)
+void GSolver::mean_u(const GResult& R, double t0, double t1, double u[MAXM]) const {
+    double vt[MAXM] = {0.0, 0.0, 0.0, 0.0};
+    for (int i = 0; i < m_; ++i) u[i] = 0.0;
+    if (R.narcs < 1 || !(t1 > t0)) return;
+    Arc a;
+    ArcFn F;
+    for (int k = 0; k < R.narcs; ++k) {
+        if (!arc(k, R.S, R.narcs, R.t1, a)) return;
+        const double sa = fmax(t0, a.t0) - a.t0, sb = fmin(t1, a.t0 + a.L) - a.t0;
+        if (!(sb > sa)) continue;
+        a.x = R.x[k];
+        double I[MAXM];
+        if (!chan(a, F)) return;
+        wint(F, sa, sb, I);
+        for (int i = 0; i < m_; ++i) {
+            double s = a.q[i] * (sb - sa);
+            for (int j = 0; j < m_; ++j) s += a.P[i][j] * I[j];
+            vt[i] += s / (t1 - t0);
+        }
     }
     for (int i = m_ - 1; i >= 0; --i) {                // Lc^T u = vt
         double s = vt[i];

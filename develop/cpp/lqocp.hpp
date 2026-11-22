@@ -241,8 +241,13 @@ public:
     // p must stay alive (it is referenced, not copied). R = Lc Lc^T must be SPD.
     bool setup(const Problem& p, BasisFn fn, void* ctx);
     bool solve(GResult& r);
+    // MPC warm start from the previous solution in r (x0 updated in the Problem; junction times
+    // shifted by -dt); at most max_its Newton iterations (then r is the current iterate)
+    bool solve_warm(GResult& r, double dt, int max_its);
+    void set_x0(const double* x0) { for (int i = 0; i < n_; ++i) x0_[i] = x0[i]; }   // (setup copies p.x0)
     void eval_u(const GResult& r, double t, double u[MAXM]) const;
     void eval_x(const GResult& r, double t, double x[MAXN]) const;
+    void mean_u(const GResult& r, double t0, double t1, double u[MAXM]) const;   // mean u on [t0, t1]
     int switch_times(const GResult& r, double* out, int maxout) const;
     // for basis builders
     int n2() const { return 2 * n_; }
@@ -278,13 +283,15 @@ private:
     BasisFn bfn_;
     void* bctx_;
     int n_, m_, off_[MAXM], end_[MAXM];
+    double x0_[MAXN];
     double rows_[2 * MAXM][MAXM], rhs_[2 * MAXM], rhs0_[2 * MAXM], rownorm2_[2 * MAXM];
     bool finite_[2 * MAXM];
     int nsets_;
     double R_;
     double LiT_[MAXM][MAXM];         // Lc^-T: B~ = B Lc^-T has row end_[j] = LiT_[j]
     double Lc_[MAXM][MAXM];
-    bool capfail_;                   // an arc/row capacity (NA, NR) was exceeded
+    bool capfail_;
+    int budget_;                     // Newton iterations left (iteration cap)                   // an arc/row capacity (NA, NR) was exceeded
     GResult* R_out;
     // homotopy / structure
     int an_, hn_, wn_;
@@ -324,6 +331,7 @@ private:
     double bb(const RowFn& f, double a, double b, double thr, double atol, bool first, double* root,
               bool* simple) const;
     double hloc(const SetBasis& b) const;
+    void wint(const ArcFn& F, double sa, double sb, double* I) const;
     void rtaylor(const ArcFn& F, const double* G, double g0, double sig, double* cs) const;
     void gscale(double kap);
     bool glex_ok(uint16_t S, const ArcFn& F, double sig, double h) const;
@@ -349,7 +357,10 @@ private:
     void collapse(uint16_t* seq, int* N, double* tau, int j) const;
     bool newton_tau(uint16_t* seq, int* N, double* tau, int* its);
     bool propose(const uint16_t* seq, int N, const double* tau, int* ndeg);
-    bool correct(int* its, int* outer, int* ndeg);
+    bool correct(int* its, int* outer, int* ndeg, int rounds);
+    void begin(GResult& R, int max_its);
+    bool cold(GResult& R, int max_its);
+    bool finish(GResult& R, bool conv, const char* why, int its, int nsteps, int ndeg);
     double zmax(const uint16_t* seq, int N, const double* tau) const;
 };
 
