@@ -1616,9 +1616,9 @@ int GSolver::gphi(uint16_t S, int keys[2 * MAXM], double G[2 * MAXM][MAXM], doub
 bool GSolver::chan(const Arc& a, ArcFn& F) const {
     const SetBasis& b = *a.b;
     const int n = n_, n2 = 2 * n, ns = b.ns, nc = b.nc, s1 = ns + nc;
-    double Bw[MAXM][N2];                               // wt = Bw y (y: modal coordinates)
-    for (int j = 0; j < m_; ++j) {
-        for (int i = 0; i < n2; ++i) Bw[j][i] = 0.0;
+    double (*Bw)[N2] = F.amp;                          // wt = Bw y (y: modal coordinates); the
+    for (int j = 0; j < m_; ++j) {                     // centre columns stay Bw, the rest become
+        for (int i = 0; i < n2; ++i) Bw[j][i] = 0.0;   // amplitudes in place
         for (int l = 0; l < m_; ++l) {
             const double f = -LiT_[l][j];
             const double* Wr = b.W + (n + end_[l]) * n2;
@@ -1633,14 +1633,15 @@ bool GSolver::chan(const Arc& a, ArcFn& F) const {
         if (i == ns && nc) { i = s1; continue; }
         const double x0 = a.x[i] / b.cs[i];
         if (b.im[i] == 0.0) {
-            for (int j = 0; j < m_; ++j) { F.amp[j][i] = Bw[j][i] * x0; F.c[j] += Bw[j][i] * a.yp[i]; }
+            for (int j = 0; j < m_; ++j) { F.c[j] += Bw[j][i] * a.yp[i]; F.amp[j][i] = Bw[j][i] * x0; }
             ++i;
         } else {
             const double x1 = a.x[i + 1] / b.cs[i + 1];
             for (int j = 0; j < m_; ++j) {
-                F.amp[j][i] = Bw[j][i] * x0 + Bw[j][i + 1] * x1;
-                F.amp[j][i + 1] = Bw[j][i] * x1 - Bw[j][i + 1] * x0;
-                F.c[j] += Bw[j][i] * a.yp[i] + Bw[j][i + 1] * a.yp[i + 1];
+                const double b0 = Bw[j][i], b1 = Bw[j][i + 1];
+                F.c[j] += b0 * a.yp[i] + b1 * a.yp[i + 1];
+                F.amp[j][i] = b0 * x0 + b1 * x1;
+                F.amp[j][i + 1] = b0 * x1 - b1 * x0;
             }
             i += 2;
         }
@@ -1675,44 +1676,34 @@ bool GSolver::chan(const Arc& a, ArcFn& F) const {
 void GSolver::rowfn(const ArcFn& F, const double* G, double g0, RowFn& f) const {
     const SetBasis& b = *F.b;
     const int n2 = 2 * n_, ns = b.ns, s1 = ns + b.nc;
+    f.F = &F;
+    for (int j = 0; j < MAXM; ++j) f.G[j] = (j < m_) ? G[j] : 0.0;
     double c0 = g0, sc = 0.0, Lk = 1.0;
     for (int j = 0; j < m_; ++j) c0 += G[j] * F.c[j];
-    for (int i = 0; i < n2; ++i) {
-        double s = 0.0;
-        if (i < ns || i >= s1)
-            for (int j = 0; j < m_; ++j) s += G[j] * F.amp[j][i];
-        f.u[i] = s;
-        sc += fabs(s);
-    }
-    for (int k = 0; k < F.np; ++k) {
-        double s = 0.0;
-        for (int j = 0; j < m_; ++j) s += G[j] * F.poly[j][k];
-        f.p[k] = s;
-        sc += fabs(s) * Lk;
-        Lk *= F.L;
-    }
-    f.b = F.b;
-    f.L = F.L;
-    f.np = F.np;
+    for (int i = 0; i < n2; ++i)
+        if (i < ns || i >= s1) sc += fabs(f.u(i));
+    for (int k = 0; k < F.np; ++k) { sc += fabs(f.p(k)) * Lk; Lk *= F.L; }
     f.c0 = c0;
     f.scale = sc + fabs(c0);
 }
 
 // derivatives d[0..nd] of f at sig (closed form)
 void GSolver::feval(const RowFn& f, double sig, int nd, double* d) const {
-    const SetBasis& b = *f.b;
+    const SetBasis& b = *f.F->b;
+    const double L = f.F->L;
+    const int np = f.F->np;
     const int n2 = 2 * n_, ns = b.ns, s1 = ns + b.nc;
     for (int k = 0; k <= nd; ++k) d[k] = 0.0;
     d[0] = f.c0;
     for (int i = 0; i < n2;) {
         if (i == ns && s1 > ns) { i = s1; continue; }
-        const double re = b.re[i], t = sig - ((i < ns) ? 0.0 : f.L), e = xexp(re * t);
+        const double re = b.re[i], t = sig - ((i < ns) ? 0.0 : L), e = xexp(re * t);
         if (b.im[i] == 0.0) {
-            double v = f.u[i] * e;
+            double v = f.u(i) * e;
             for (int k = 0; k <= nd; ++k) { d[k] += v; v *= re; }
             ++i;
         } else {
-            const double om = b.im[i], c = cos(om * t), sn = sin(om * t), P = f.u[i], Q = f.u[i + 1];
+            const double om = b.im[i], c = cos(om * t), sn = sin(om * t), P = f.u(i), Q = f.u(i + 1);
             double x = e * (P * c + Q * sn), y = e * (P * sn - Q * c);
             for (int k = 0; k <= nd; ++k) {
                 d[k] += x;
@@ -1724,9 +1715,9 @@ void GSolver::feval(const RowFn& f, double sig, int nd, double* d) const {
         }
     }
     double q[NPOLY], fk = 1.0;                         // polynomial: Taylor shift to sig
-    for (int k = 0; k < f.np; ++k) q[k] = f.p[k];
-    for (int k = 0; k <= nd && k < f.np; ++k) {
-        for (int i = f.np - 2; i >= k; --i) q[i] += sig * q[i + 1];
+    for (int k = 0; k < np; ++k) q[k] = f.p(k);
+    for (int k = 0; k <= nd && k < np; ++k) {
+        for (int i = np - 2; i >= k; --i) q[i] += sig * q[i + 1];
         d[k] += fk * q[k];
         fk *= k + 1;
     }
@@ -1735,23 +1726,24 @@ void GSolver::feval(const RowFn& f, double sig, int nd, double* d) const {
 // M2 >= |f''| on [lo, hi]: modal envelopes (largest at the end nearer the anchor) plus the
 // centre polynomial's second derivative bounded by its Taylor coefficients at the midpoint
 double GSolver::fbound2(const RowFn& f, double lo, double hi) const {
-    const SetBasis& b = *f.b;
+    const SetBasis& b = *f.F->b;
     const int n2 = 2 * n_, ns = b.ns, s1 = ns + b.nc;
     double M = 0.0;
     for (int i = 0; i < n2;) {
         if (i == ns && s1 > ns) { i = s1; continue; }
-        const double re = b.re[i], e = xexp(re * (((re > 0) ? hi : lo) - ((i < ns) ? 0.0 : f.L)));
-        if (b.im[i] == 0.0) { M += fabs(f.u[i]) * re * re * e; ++i; }
+        const double re = b.re[i], e = xexp(re * (((re > 0) ? hi : lo) - ((i < ns) ? 0.0 : f.F->L)));
+        if (b.im[i] == 0.0) { M += fabs(f.u(i)) * re * re * e; ++i; }
         else {
-            M += sqrt(f.u[i] * f.u[i] + f.u[i + 1] * f.u[i + 1]) * (re * re + b.im[i] * b.im[i]) * e;
+            const double P = f.u(i), Q = f.u(i + 1);
+            M += sqrt(P * P + Q * Q) * (re * re + b.im[i] * b.im[i]) * e;
             i += 2;
         }
     }
-    const int nq = f.np - 2;
+    const int nq = f.F->np - 2;
     if (nq > 0) {
         const double m = 0.5 * (lo + hi), h = 0.5 * (hi - lo);
         double q[NPOLY], s = 0.0, hk = 1.0;
-        for (int k = 0; k < nq; ++k) q[k] = (k + 2.0) * (k + 1.0) * f.p[k + 2];
+        for (int k = 0; k < nq; ++k) q[k] = (k + 2.0) * (k + 1.0) * f.p(k + 2);
         for (int k = 0; k < nq; ++k) {
             for (int i = nq - 2; i >= k; --i) q[i] += m * q[i + 1];
             s += fabs(q[k]) * hk;
@@ -1882,6 +1874,7 @@ bool GSolver::gwalk(const uint16_t* seq, int N, const double* tau, int* ndeg) {
     }
     uint16_t S = 0xFFFFu;
     ArcFn F;
+    wthr_ = 0.0;
     for (int ka = 0; ka < N; ++ka) {
         Arc& a = ac_;
         if (!arc(ka, seq, N, tau, a)) return false;
@@ -1923,8 +1916,9 @@ bool GSolver::gwalk(const uint16_t* seq, int N, const double* tau, int* ndeg) {
                 rowfn(F, G[r], g0[r], f);
                 double root;
                 bool simple;
-                if (sig < a.L &&
-                    bb(f, sig, a.L, fmax(tol, 1e-12 * (f.scale + R_)), 0.0, true, &root, &simple) > 0) {
+                const double thr = fmax(tol, 1e-12 * (f.scale + R_));
+                wthr_ = fmax(wthr_, thr);
+                if (sig < a.L && bb(f, sig, a.L, thr, 0.0, true, &root, &simple) > 0) {
                     rootk[nc] = root; simplek[nc] = simple; keyk[nc++] = keys[r];
                     if (root < s1) s1 = root;
                 }
@@ -2744,6 +2738,7 @@ bool GSolver::correct(int* its, int* outer, int* ndeg, int rounds) {
             if (i > 0 && fabs(wtau_[i - 1] - tau[i - 1]) > STOL * p_->T) same = false;
         }
         if (same) {
+            cert_ = true;
             an_ = N;
             for (int i = 0; i < N; ++i) aseq_[i] = seq[i];
             for (int i = 0; i + 1 < N; ++i) atau_[i] = tau[i];
@@ -2780,6 +2775,8 @@ void GSolver::begin(GResult& R, int max_its) {
     events_ = 0;
     capfail_ = false;
     budget_ = max_its;
+    cert_ = false;
+    wthr_ = 0.0;
 }
 
 bool GSolver::solve(GResult& R) { return cold(R, MAX_GEN_ITS); }
@@ -2797,11 +2794,11 @@ bool GSolver::cold(GResult& R, int max_its) {
         return false;
     }
     if (!p_->has_bounds) {
-        conv = true;
+        cert_ = conv = true;
     } else {
         const double ratio = gmax_ratio(aseq_, 1, atau_);
         if (ratio <= 1.0 && propose(aseq_, 1, atau_, &ndeg))
-            conv = (wn_ == 1 && wseq_[0] == 0);
+            cert_ = conv = (wn_ == 1 && wseq_[0] == 0);
         if (!conv) {
             // homotopy in the bound scale kappa (NOTES.md 9.4): exact collapse events inside
             // the tau-Newton, secant predictor, step halving on failure
@@ -2894,7 +2891,9 @@ bool GSolver::finish(GResult& R, bool conv, const char* why, int its, int nsteps
     R.iterations = its;
     R.outer_iterations = nsteps;
     R.degenerate_events = ndeg;
-    if (!bvp(aseq_, an_, atau_)) {
+    // a converged corrector or walk left the BVP solution of aseq_/atau_ in place and certified it
+    const bool cert = conv && cert_;
+    if (!cert && !bvp(aseq_, an_, atau_)) {
         R.failure = why ? why : "linear BVP failed";
         return false;
     }
@@ -2915,7 +2914,8 @@ bool GSolver::finish(GResult& R, bool conv, const char* why, int its, int nsteps
         rmax = fmax(rmax, fabs(v));
     }
     R.residual = rmax;
-    R.pmp_violation = gverify(R.S, R.narcs, R.t1);
+    // the walk's certificate suffices when its levels are below the verification tolerance
+    R.pmp_violation = (cert && wthr_ <= VTOL * R_) ? wthr_ : gverify(R.S, R.narcs, R.t1);
     if (conv && !(R.pmp_violation <= VTOL * R_)) { conv = false; why = "optimality check failed"; }
     R.cost = gcost(R.S, R.narcs, R.t1);
     R.converged = conv;

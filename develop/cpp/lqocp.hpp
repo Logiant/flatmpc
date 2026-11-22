@@ -54,7 +54,7 @@ constexpr int MAX_TAU_NEWTON = 8;    // Newton iterations on the junction times 
 constexpr double KAP_PLAIN = 3.0;    // violation ratio up to which kappa0 -> 1 is tried in one step
 constexpr int MAX_GEN_ITS = 1000;    // total Newton iterations, general cost (all homotopy steps)
 constexpr double DL_MIN = 1e-3;
-constexpr int NPOLY = 48;            // max terms of an arc's centre polynomial (general cost)      // homotopy stall (feasible runs use steps >= 0.03 in log kappa)
+constexpr int NPOLY = 32;            // max terms of an arc's centre polynomial (general cost)      // homotopy stall (feasible runs use steps >= 0.03 in log kappa)
 
 enum Method { METHOD_TAU = 0, METHOD_NEWTON = 1 };
 
@@ -273,11 +273,11 @@ private:
         double poly[MAXM][NPOLY];
         double c[MAXM];
     };
-    struct RowFn {                   // one switching row g0 + G wt on an arc
-        const SetBasis* b;
-        double L;
-        int np;
-        double u[N2], p[NPOLY], c0, scale;
+    struct RowFn {                   // one switching row g0 + G wt on the arc of F
+        const ArcFn* F;
+        double G[MAXM], c0, scale;
+        double u(int i) const { double s = 0.0; for (int j = 0; j < MAXM; ++j) s += G[j] * F->amp[j][i]; return s; }
+        double p(int k) const { double s = 0.0; for (int j = 0; j < MAXM; ++j) s += G[j] * F->poly[j][k]; return s; }
     };
     const Problem* p_;
     BasisFn bfn_;
@@ -291,7 +291,9 @@ private:
     double LiT_[MAXM][MAXM];         // Lc^-T: B~ = B Lc^-T has row end_[j] = LiT_[j]
     double Lc_[MAXM][MAXM];
     bool capfail_;
-    int budget_;                     // Newton iterations left (iteration cap)                   // an arc/row capacity (NA, NR) was exceeded
+    int budget_;                     // Newton iterations left (iteration cap)
+    bool cert_;                      // the BVP solution in place was certified by the walk
+    double wthr_;                    // largest switching-row level the walk certified                   // an arc/row capacity (NA, NR) was exceeded
     GResult* R_out;
     // homotopy / structure
     int an_, hn_, wn_;
