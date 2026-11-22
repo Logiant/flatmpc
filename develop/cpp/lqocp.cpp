@@ -1476,7 +1476,8 @@ bool GSolver::arc(int k, const uint16_t* seq, int N, const double* tau, Arc& a) 
     a.S = seq[k];
     a.b = bfn_(bctx_, basis_key(seq[k]));
     a.x = nullptr;
-    if (!a.b) { bkey_ = basis_key(seq[k]); return false; }
+    if (!a.b || a.b->nc - a.b->nz > NSD) { bkey_ = basis_key(seq[k]); return false; }   // (NSD: a table
+                                                                                        // built larger)
     if (!affine(seq[k], a.P, a.q)) return false;
     const SetBasis& b = *a.b;
     const int n2 = 2 * n_, s1 = b.ns + b.nc;
@@ -2016,13 +2017,21 @@ double GSolver::bb(const RowFn& f, double a, double b, double thr, double atol, 
 double GSolver::pbb(const RowFn& f, double a, double b, double thr, bool first, double* root,
                     bool* simple) const {
     const int np = f.F->np;
-    double P[NPOLY][NPOLY] = {{0.0}}, x[NPOLY + 1], y[NPOLY + 1];   // P[l]: coefficients of p^(l)
-    for (int k = 0; k < np; ++k) P[0][k] = f.p(k) + ((k == 0) ? f.c0 : 0.0);
-    if (!isfinite(P[0][0])) return NAN;
-    for (int l = 1; l < np; ++l)
-        for (int k = 0; k + l < np; ++k) P[l][k] = P[l - 1][k + 1] * (k + 1);
-    auto val = [&](int l, double t) { return horner(P[l], np - l, t); };
-    auto zero = [&](int l, double lo, double hi) { return pzero(P[l], P[l + 1], np - l, lo, hi); };
+    double P[NPOLY] = {0.0}, Pl[NPOLY], Pd[NPOLY], x[NPOLY + 1], y[NPOLY + 1];
+    for (int k = 0; k < np; ++k) P[k] = f.p(k) + ((k == 0) ? f.c0 : 0.0);
+    if (!isfinite(P[0])) return NAN;
+    int lv = 0;                                        // Pl = p^(lv), Pd = p^(lv+1)
+    auto level = [&](int l) {
+        for (int k = 0; k < np; ++k) Pl[k] = P[k];
+        for (int j = 0; j <= l; ++j) {
+            for (int k = 0; k + j + 1 < np; ++k) Pd[k] = Pl[k + 1] * (k + 1);
+            if (j < l) for (int k = 0; k + j + 1 < np; ++k) Pl[k] = Pd[k];
+        }
+        lv = l;
+    };
+    auto val = [&](int l, double t) { if (l != lv) level(l); return horner(Pl, np - l, t); };
+    auto zero = [&](int l, double lo, double hi) { if (l != lv) level(l); return pzero(Pl, Pd, np - l, lo, hi); };
+    level(0);
     int nx = 0;                                        // roots of p^(l) in (a, b), sorted, l = np-2 .. 1
     for (int l = np - 2; l >= 1; --l) {
         int ny = 0;

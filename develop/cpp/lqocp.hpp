@@ -51,7 +51,11 @@ constexpr double KAP_PLAIN = 3.0;    // violation ratio up to which kappa0 -> 1 
 constexpr int MAX_GEN_ITS = 1000;    // total Newton iterations, general cost (all homotopy steps)
 constexpr double DL_MIN = 1e-3;      // homotopy stall (feasible runs use steps >= 0.03 in log kappa)
 constexpr int NPOLY = 2 * MAXK + 1;  // terms of an arc's centre polynomial: nilpotency index + 1
-constexpr int NSD = 8;               // max slow modal dimensions coupled into the centre (general cost)
+#ifndef LQOCP_NSD
+#define LQOCP_NSD 8
+#endif
+constexpr int NSD = LQOCP_NSD;       // max slow modal dimensions coupled into the centre (general cost;
+                                     // TINY at T = 0.45 needs 4, R1 8; 2 x 4 x 10 doubles of stack each)
 
 enum Method { METHOD_TAU = 0, METHOD_NEWTON = 1 };
 
