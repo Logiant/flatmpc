@@ -1471,7 +1471,8 @@ bool GSolver::arc(int k, const uint16_t* seq, int N, const double* tau, Arc& a) 
 }
 
 // y <- e^{M L} y (column) or y <- y e^{M L} (row), M = [[Tc, aff ? yp_c : 0], [0, 0]];
-// y has nc + 1 entries. Matrix-free Taylor with substeps (centre: |Re eig| <= 1/T).
+// y has nc + 1 entries. Matrix-free Taylor series (M is nearly nilpotent: it terminates in about nc
+// terms; a second step only when L tcr > 0.5, i.e. for long arcs).
 void GSolver::cexp(const Arc& a, double L, double* y, bool row, bool aff) const {
     const SetBasis& b = *a.b;
     const int nc = b.nc;

@@ -8,7 +8,8 @@
 //   METHOD_NEWTON (default): energy -> Newton on the 12 polynomial coefficients, exact cubic
 //                  events, line search on the concave dual; general -> stable-basis motion
 //                  primitives, Newton on the junction times with exact derivatives and exact
-//                  collapse events, event-driven bound-scale homotopy (NOTES.md section 9).
+//                  collapse events, event-driven bound-scale homotopy (NOTES.md section 9);
+//                  closed-form walk/cost and the MPC warm start GSolver::solve_warm (section 11).
 //   METHOD_TAU    : junction-time Gauss-Newton, sequence read off a time grid (energy only).
 //
 // Embedded-friendly core: fixed-size arrays only, no heap allocation, no exceptions, no STL.
@@ -49,7 +50,7 @@ constexpr int MAX_TAU_TOTAL = 500;   // total junction-time Newton iterations (t
 constexpr int MAX_PDAS = 30;         // PDAS iterations per continuation step
 constexpr int MAX_CONT = 400;        // continuation steps
 constexpr int N2 = 2 * MAXN;         // Hamiltonian state (s, lambda)
-constexpr int GN = 24;               // Taylor order per substep (event detection, general cost)
+constexpr int GN = 24;               // Taylor order of the sign tests at an event (general cost)
 constexpr int MAX_TAU_NEWTON = 8;    // Newton iterations on the junction times per corrector
 constexpr double KAP_PLAIN = 3.0;    // violation ratio up to which kappa0 -> 1 is tried in one step
 constexpr int MAX_GEN_ITS = 1000;    // total Newton iterations, general cost (all homotopy steps)
@@ -311,7 +312,7 @@ private:
     double ck_[NCK > 1 ? NCK - 1 : 1][NCK > 1 ? MAXN : 1][NCK > 1 ? N2 + 1 + NB : 1];
     real Z_[N2][NB];                 // backward sensitivities
     double Dj_[NB][MAXM];            // jumps of the sensitivity block (chain-end entries)
-    mutable Arc ac_;                 // scratch arc (sweep step, substep loop, zstart)
+    mutable Arc ac_;                 // scratch arc (sweep step, walk, zstart)
     real J_[NR][NJ + 1];             // junction Jacobian | residual
 
     void wt_of(const double* lam, double* wt) const;
