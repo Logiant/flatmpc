@@ -19,3 +19,4 @@ compare/audit/upstream/
 *.csv
 validate/results/*.out
 .aider*
+.claude/
