@@ -269,6 +269,7 @@ bool modal(const double* A, int k, double* V, double* re, double* im) {
 }  // namespace
 
 const SetBasis* BasisBuilder::get(uint16_t S) {
+    S = basis_key(S);
     for (int i = 0; i < n_; ++i)
         if (sb_[i].S == S) return &sb_[i];
     if (!g_ || n_ >= MAXSETS || !build(S, n_)) return nullptr;

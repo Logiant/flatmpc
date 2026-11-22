@@ -202,12 +202,15 @@ constexpr int NCOL = N2 + 1 + NB;    // relation row: z | rhs | sensitivities
 
 // Bound-independent primitive of one active set S: H_S = W diag(Ls, Tc, Lu) W^-1, where the
 // stable/unstable parts are modal (1x1 real or 2x2 [[re, im], [-im, re]] blocks) and Tc is the
-// centre block (|Re eig| <= 1/T). Arrays may live in flash.
+// centre block (|Re eig| <= 1/T, nearly nilpotent). H_S depends only on WHICH rows are
+// active, not on the side, so one basis serves S and its mirror: key basis_key(S). Arrays may
+// live in flash.
+inline uint16_t basis_key(uint16_t S) { return (uint16_t)((S | (S >> 1)) & 0x5555u); }
 struct SetBasis {
-    uint16_t S;
+    uint16_t S;                      // basis_key of the sets it serves
     uint8_t ns, nc;                  // nu = 2n - ns - nc
     double tcn;                      // ||Tc||_inf
-    double tcr;                      // ||Tc^24||_inf^(1/24) (sets the Taylor substeps)
+    double tcr;                      // ||Tc^24||_inf^(1/24) (Taylor radius of e^{Tc L})
     const double* W;                 // 2n x 2n, row-major
     const double* Wi;                // W^-1
     const double* re;                // 2n modal real parts (stable / unstable columns)
@@ -250,6 +253,7 @@ public:
 private:
     struct Arc {                     // per-arc data derived on the fly
         const SetBasis* b;
+        uint16_t S;
         double t0, L;
         double P[MAXM][MAXM], q[MAXM];
         double yp[N2];               // particular part (modal); centre entries: forcing

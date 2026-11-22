@@ -1507,6 +1507,7 @@ bool GSolver::hmat(uint16_t S, double* H) const {
     double P[MAXM][MAXM], q[MAXM], e[N2 + 1], o[N2 + 1];
     if (!affine(S, P, q)) return false;
     const int n2 = 2 * n_;
+    for (int i = 0; i < m_; ++i) q[i] = 0.0;       // homogeneous (q may be inf for a basis key)
     for (int c = 0; c < n2; ++c) {
         for (int i = 0; i <= n2; ++i) e[i] = (i == c) ? 1.0 : 0.0;
         hmul(P, q, e, o);
@@ -1546,7 +1547,8 @@ bool GSolver::nrm(uint16_t S, const double P[MAXM][MAXM], const double* q, doubl
 bool GSolver::arc(int k, const uint16_t* seq, int N, const double* tau, Arc& a) const {
     a.t0 = (k == 0) ? 0.0 : tau[k - 1];
     a.L = ((k == N - 1) ? p_->T : tau[k]) - a.t0;
-    a.b = bfn_(bctx_, seq[k]);
+    a.S = seq[k];
+    a.b = bfn_(bctx_, basis_key(seq[k]));
     a.x = nullptr;
     if (!a.b || !affine(seq[k], a.P, a.q)) return false;
     const SetBasis& b = *a.b;
@@ -1908,7 +1910,7 @@ double GSolver::gverify(const uint16_t* seq, int N, const double* tau) {
     const bool ok = substeps(seq, N, tau, [&](const Arc& a, int j, double h, double nN) {
         int keys[2 * MAXM];
         double G[2 * MAXM][MAXM], g0[2 * MAXM];
-        const int nk = gphi(a.b->S, keys, G, g0);
+        const int nk = gphi(a.S, keys, G, g0);
         if (nk == 0) return true;
         double W[MAXM][GN], Zb;
         taylor_w(a, j * h, h, W, &Zb);
