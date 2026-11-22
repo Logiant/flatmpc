@@ -1144,10 +1144,17 @@ void gfun(double lr, double li, double t, int K, double (*g)[2]) {
     } else {
         double fk = 1.0;                               // 1/K!
         for (int j = 2; j <= K; ++j) fk /= j;
+        static const double inv[2 * MAXK + 43] = {      // 1/n (no divisions: slow on a Cortex-M7)
+            0, 1.0, 1.0 / 2, 1.0 / 3, 1.0 / 4, 1.0 / 5, 1.0 / 6, 1.0 / 7, 1.0 / 8, 1.0 / 9, 1.0 / 10,
+            1.0 / 11, 1.0 / 12, 1.0 / 13, 1.0 / 14, 1.0 / 15, 1.0 / 16, 1.0 / 17, 1.0 / 18, 1.0 / 19,
+            1.0 / 20, 1.0 / 21, 1.0 / 22, 1.0 / 23, 1.0 / 24, 1.0 / 25, 1.0 / 26, 1.0 / 27, 1.0 / 28,
+            1.0 / 29, 1.0 / 30, 1.0 / 31, 1.0 / 32, 1.0 / 33, 1.0 / 34, 1.0 / 35, 1.0 / 36, 1.0 / 37,
+            1.0 / 38, 1.0 / 39, 1.0 / 40, 1.0 / 41, 1.0 / 42, 1.0 / 43, 1.0 / 44, 1.0 / 45, 1.0 / 46,
+            1.0 / 47, 1.0 / 48, 1.0 / 49, 1.0 / 50};
         double sr = 0.0, si = 0.0, tr = fk, ti = 0.0;
-        for (int i = 1; i <= 40; ++i) {
+        for (int i = 1; i <= 40; ++i) {                // (i + K <= 50: K <= ni + 2 <= 2 MAXK + 2)
             sr += tr; si += ti;
-            const double nr = (tr * zr - ti * zi) / (i + K), ni = (tr * zi + ti * zr) / (i + K);
+            const double nr = (tr * zr - ti * zi) * inv[i + K], ni = (tr * zi + ti * zr) * inv[i + K];
             tr = nr; ti = ni;
         }
         g[K][0] = sr; g[K][1] = si;
@@ -1159,6 +1166,44 @@ void gfun(double lr, double li, double t, int K, double (*g)[2]) {
     }
     double tj = 1.0;
     for (int j = 0; j <= K; ++j) { g[j][0] *= tj; g[j][1] *= tj; tj *= t; }
+}
+
+// action of a block function G = [[gr, gi], [-gi, gr]] (q = (gr, gi); 1x1 block: gr) of width w:
+// o += s G v (column), o += r G (row); dot: A = <c, v> = P - iQ (P = c0 v0 + c1 v1, Q = c0 v1 - c1 v0)
+__attribute__((noinline)) void col(const double* q, const double* v, int w, double* o, double s) {
+    if (w == 1) { o[0] += s * q[0] * v[0]; return; }
+    o[0] += s * (q[0] * v[0] + q[1] * v[1]);
+    o[1] += s * (q[0] * v[1] - q[1] * v[0]);
+}
+__attribute__((noinline)) void rowa(const double* q, const double* r, int w, double* o) {
+    if (w == 1) { o[0] += r[0] * q[0]; return; }
+    o[0] += r[0] * q[0] - r[1] * q[1];
+    o[1] += r[0] * q[1] + r[1] * q[0];
+}
+__attribute__((noinline)) void dot(const double* c, const double* v, int w, double* A0, double* A1) {
+    *A0 += c[0] * v[0] + ((w == 2) ? c[1] * v[1] : 0.0);
+    if (w == 2) *A1 -= c[0] * v[1] - c[1] * v[0];
+}
+
+// polynomial sum_k P[k] t^k of np terms; root of it on [lo, hi] where it is monotone (safeguarded
+// Newton; D: its derivative's coefficients)
+__attribute__((noinline)) double horner(const double* P, int np, double t) {
+    double s = 0.0;
+    for (int k = np - 1; k >= 0; --k) s = s * t + P[k];
+    return s;
+}
+__attribute__((noinline)) double pzero(const double* P, const double* D, int np, double lo, double hi) {
+    const double flo = horner(P, np, lo);
+    double t = 0.5 * (lo + hi);
+    for (int it = 0; it < 200; ++it) {
+        const double ft = horner(P, np, t), dt = horner(D, np - 1, t);
+        if ((ft > 0) == (flo > 0)) lo = t; else hi = t;
+        double tn = (dt != 0.0) ? t - ft / dt : 0.5 * (lo + hi);
+        if (!(tn > lo && tn < hi)) tn = 0.5 * (lo + hi);
+        if (tn == t || !(hi > lo)) break;
+        t = tn;
+    }
+    return t;
 }
 
 // Householder reflection H with H x = alpha e_p for the column x = R[.][col] over the rows
@@ -1482,12 +1527,6 @@ void GSolver::cexp(const Arc& a, double L, double* y, bool row, bool aff) const 
     cb[nb] = nc;
     fk[0] = 1.0;
     for (int k = 1; k <= ni + 1; ++k) fk[k] = fk[k - 1] * L / k;
-    // block action of G(j) = [[gr, gi], [-gi, gr]] on a column (v0, v1) (1x1 block: gr)
-    auto col = [](const double* q, const double* v, int w, double* o, double s) {
-        if (w == 1) { o[0] += s * q[0] * v[0]; return; }
-        o[0] += s * (q[0] * v[0] + q[1] * v[1]);
-        o[1] += s * (q[0] * v[1] - q[1] * v[0]);
-    };
     if (!row) {
         double acc[N2], v[N2], xs[N2];
         for (int k = ni - 1; k >= 0; --k) {
@@ -1518,11 +1557,6 @@ void GSolver::cexp(const Arc& a, double L, double* y, bool row, bool aff) const 
     }
     // row: w_k = r_N N^k; out_N = sum w_k L^k/k!, out_s = r_s G0 + sum (w_k X) G(k+1),
     // affine slot += sum (w_k g_N) L^(k+1)/(k+1)! + r_s G1 g_s + sum (w_k X) G(k+2) g_s
-    auto rowa = [](const double* q, const double* r, int w, double* o) {
-        if (w == 1) { o[0] += r[0] * q[0]; return; }
-        o[0] += r[0] * q[0] - r[1] * q[1];
-        o[1] += r[0] * q[1] + r[1] * q[0];
-    };
     double w[N2], wn[N2], out[N2 + 1], c[N2], t2[2];
     for (int i = 0; i <= nc; ++i) out[i] = 0.0;
     out[nc] = y[nc];
@@ -1722,10 +1756,6 @@ bool GSolver::chan(const Arc& a, ArcFn& F) const {
     F.nz = nz;
     for (int c = nz; c < nc; c += (b.im[ns + c] != 0.0) ? 2 : 1) F.sc[F.nsb++] = c;
     if (!F.nsb) return true;
-    auto dot = [](const double* c, const double* v, int w, double* A0, double* A1) {
-        *A0 += c[0] * v[0] + ((w == 2) ? c[1] * v[1] : 0.0);
-        if (w == 2) *A1 -= c[0] * v[1] - c[1] * v[0];
-    };
     for (int j = 0; j < m_; ++j) {
         double r[N2], rn[N2], cx[N2];
         for (int q = 0; q < nc - nz; ++q)
@@ -1991,20 +2021,8 @@ double GSolver::pbb(const RowFn& f, double a, double b, double thr, bool first, 
     if (!isfinite(P[0][0])) return NAN;
     for (int l = 1; l < np; ++l)
         for (int k = 0; k + l < np; ++k) P[l][k] = P[l - 1][k + 1] * (k + 1);
-    auto val = [&](int l, double t) { double s = 0.0; for (int k = np - 1 - l; k >= 0; --k) s = s * t + P[l][k]; return s; };
-    auto zero = [&](int l, double lo, double hi) {    // the root of p^(l), monotone on [lo, hi]
-        const double flo = val(l, lo);
-        double t = 0.5 * (lo + hi);
-        for (int it = 0; it < 200; ++it) {
-            const double ft = val(l, t), d = val(l + 1, t);
-            if ((ft > 0) == (flo > 0)) lo = t; else hi = t;
-            double tn = (d != 0.0) ? t - ft / d : 0.5 * (lo + hi);
-            if (!(tn > lo && tn < hi)) tn = 0.5 * (lo + hi);
-            if (tn == t || !(hi > lo)) break;
-            t = tn;
-        }
-        return t;
-    };
+    auto val = [&](int l, double t) { return horner(P[l], np - l, t); };
+    auto zero = [&](int l, double lo, double hi) { return pzero(P[l], P[l + 1], np - l, lo, hi); };
     int nx = 0;                                        // roots of p^(l) in (a, b), sorted, l = np-2 .. 1
     for (int l = np - 2; l >= 1; --l) {
         int ny = 0;
