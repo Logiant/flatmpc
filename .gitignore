@@ -18,3 +18,4 @@ compare/audit/upstream/
 *.npy
 *.csv
 validate/results/*.out
+.aider*

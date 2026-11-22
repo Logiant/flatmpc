@@ -2,8 +2,10 @@
 
 Energy cost (Q=0, R=I, fixed endpoint): methods "newton" (default, Newton on the 12 polynomial
 coefficients, exact cubic events) and "tau" (junction-time Newton). General LQ cost
-(Q, R, Qf; spec Revision 3): "newton" = semismooth Newton (PDAS) with a Riccati-sweep linear BVP,
-grid-free Taylor/Bernstein events, continuation in the bound scale. See develop/NOTES.md.
+(Q, R, Qf; spec Revision 3): "newton" (default) = stable-basis motion primitives with Newton on
+the junction times (NOTES.md section 9); "riccati" = the earlier semismooth Newton (PDAS) with a
+Riccati-sweep linear BVP and continuation in the bound scale (NOTES.md section 8). For the energy
+cost "riccati" runs the "newton" polynomial path. See develop/NOTES.md.
 
 Original description of the energy method:
 Indirect (motion-primitive) solver for energy-optimal, fixed-time, fixed-endpoint transfers of
@@ -1363,7 +1365,8 @@ def _solve_general(A, B, x0, xf, T, M, lo, hi, Q, R, Qf, maxit=30):
 # arc the solution is z = W_s e^{T_s (t-t_k)} a + W_c E_c(t-t_k)[c;1] + W_u e^{T_u (t-t_{k+1})} b
 # + particular part, so every exponential is bounded. For fixed junction times the boundary and
 # junction conditions are a block-bidiagonal linear system in (a, c, b); Newton runs on the
-# junction times with exact derivatives. See NOTES.md section 9.
+# junction times with exact derivatives; active-set changes come from the exact event walk and from
+# exact arc-collapse events inside the Newton step. See NOTES.md section 9.
 # =====================================================================================
 _SIGN_MAXIT = 60
 _DELTA_FACTORS = (1.0, 0.5, 2.0)          # centre half-width candidates, times 1/T
@@ -1622,42 +1625,101 @@ class _StabCtx(_GenCtx):
             J[q] = g @ (-self.Bt.T @ dz[n:])
         return J
 
-    def newton_tau(self, seq, tau, maxit=20):
+    def collapse(self, seq, tau, j):
+        """Exact event: arc j shrinks to zero length along a Newton step. Equal neighbours ->
+        merge them; neighbours that differ in two rows -> the two switches swap order (the
+        middle set becomes the other intermediate set); otherwise the arc is dropped."""
+        seq, tau = list(seq), list(tau)
+        N = len(seq)
+        if j == 0 or j == N - 1:
+            del seq[j]
+            del tau[0 if j == 0 else -1]
+            return seq, tau
+        A, Mid, B = set(seq[j - 1]), set(seq[j]), set(seq[j + 1])
+        D = A ^ B
+        m = 0.5 * (tau[j - 1] + tau[j])
+        if not D:
+            del seq[j:j + 2]
+            del tau[j - 1:j + 1]
+            return seq, tau
+        first = A ^ Mid
+        if len(D) == 2 and len(first) == 1 and first <= D:
+            Mn = tuple(sorted(A ^ (D - first)))
+            if self._valid(Mn):
+                seq[j] = Mn
+                tau[j - 1], tau[j] = m, m + 1e-9 * self.T
+                return seq, tau
+        del seq[j]
+        del tau[j - 1:j + 1]
+        tau.insert(j - 1, m)
+        return seq, tau
+
+    def newton_tau(self, seq, tau, maxit=8, stats=None):
+        """Newton on the junction times with exact derivatives. Arc collapse along a step is an
+        exact event (see collapse). Fails fast when the residual does not contract (the arc
+        structure is then wrong and the caller re-walks or shortens the homotopy step).
+        Returns (sol, iterations, ok); sol["seq"] may differ from seq after events."""
         T = self.T
-        rows = self.junction_rows(seq)
+        seq = list(seq)
         tau = np.array(tau, float)
+        rows = self.junction_rows(seq)
         sol = self.bvp(seq, tau)
         if not rows:
             return sol, 0, True
         r = self.residual(sol, rows)
         tol = 1e-12 * self.R_
         gap = 1e-12 * T
-        for it in range(1, maxit + 1):
-            if np.abs(r).max() <= tol:
-                return sol, it - 1, True
+        prev, bad, it = np.inf, 0, 0
+        while it < maxit:
+            nr = np.abs(r).max()
+            if nr <= tol:
+                return sol, it, True
+            bad += nr > 0.5 * prev
+            if bad > 2:                         # stall: round-off (accept) or wrong structure
+                return sol, it, bool(nr <= 1e3 * tol)
+            prev = nr
+            it += 1
             J = self.jacobian(sol, rows)
             step = np.linalg.lstsq(J, -r, rcond=None)[0]
+            e = np.concatenate([[0.0], tau, [T]])
+            de = np.concatenate([[0.0], step, [0.0]])
+            Ls, dL = np.diff(e), np.diff(de)
+            amax, jc = 1.0, None
+            for j in range(len(Ls)):
+                if dL[j] < 0 and Ls[j] + dL[j] <= gap and Ls[j] / -dL[j] < amax:
+                    amax, jc = Ls[j] / -dL[j], j
+            if jc is not None:                  # collapse event inside the full step
+                seq, t2 = self.collapse(seq, list(tau + amax * step), jc)
+                tau = np.array(t2)
+                if np.any(np.diff(np.concatenate([[0.0], tau, [T]])) <= 0):
+                    return sol, it, False
+                rows = self.junction_rows(seq)
+                sol = self.bvp(seq, tau)
+                if stats is not None:
+                    stats["events"] = stats.get("events", 0) + 1
+                if not rows:
+                    return sol, it, True
+                r = self.residual(sol, rows)
+                prev, bad = np.inf, 0
+                continue
             alpha, acc = 1.0, None
             nr0 = np.linalg.norm(r)
-            while alpha > 1e-8:
+            while alpha > 1e-3:
                 tn = tau + alpha * step
-                e = np.concatenate([[0.0], tn, [T]])
-                if np.all(np.diff(e) > gap):
-                    try:
-                        sn = self.bvp(seq, tn)
-                    except (np.linalg.LinAlgError, ValueError):
-                        sn = None
-                    if sn is not None:
-                        rn = self.residual(sn, rows)
-                        if np.linalg.norm(rn) <= (1 - 1e-4 * alpha) * nr0 or np.abs(rn).max() <= tol:
-                            acc = (tn, sn, rn)
-                            break
+                try:
+                    sn = self.bvp(seq, tn)
+                except (np.linalg.LinAlgError, ValueError):
+                    sn = None
+                if sn is not None:
+                    rn = self.residual(sn, rows)
+                    if np.linalg.norm(rn) <= (1 - 1e-4 * alpha) * nr0 or np.abs(rn).max() <= tol:
+                        acc = (tn, sn, rn)
+                        break
                 alpha *= 0.5
             if acc is None:
-                # round-off stall: accept if already tiny
-                return sol, it, bool(np.abs(r).max() <= 1e3 * tol)
+                return sol, it, bool(np.abs(r).max() <= 1e3 * tol)     # round-off stall
             tau, sol, r = acc
-        return sol, maxit, bool(np.abs(r).max() <= tol)
+        return sol, it, bool(np.abs(r).max() <= tol)
 
     # ---- substeps (Taylor models) for event walk, cost, evaluation ----
     def make_subs(self, sol):
@@ -1712,112 +1774,120 @@ def _blockdiag(*Ms):
 from scipy.linalg import lu_factor as sl_lu_factor, lu_solve as sl_lu_solve  # noqa: E402
 
 
-def _stable_loop(ctx, sol, maxit, t0, time_limit):
-    """Walk -> proposed sequence -> Newton on the junction times, until the walk of the
-    converged trajectory reproduces its own arc structure."""
-    T = ctx.T
-    its, outer, ndeg, dt_max, seen = 0, 0, 0, None, set()
-    while True:
-        subs, zT = ctx.make_subs(sol)
-        if not ctx.md.has_bounds:
-            return True, sol, its, outer, ndeg, dt_max, None
-        wk = ctx.walk(subs)
-        if wk is None:
-            return False, sol, its, outer, ndeg, dt_max, "event walk failed"
-        pseq, ptau, ndeg = wk
-        pseq, ptau = list(pseq), list(ptau)
-        i = 1
-        while i + 1 < len(pseq):                 # drop round-off chatter arcs
-            if ptau[i] - ptau[i - 1] < 1e-10 * T and pseq[i - 1] == pseq[i + 1]:
-                del pseq[i:i + 2]
-                del ptau[i - 1:i + 1]
-            else:
-                i += 1
-        if pseq == sol["seq"]:
-            dt_max = max([abs(a - b) for a, b in zip(ptau, sol["tau"])], default=0.0)
-            if dt_max <= 1e-9 * T:
-                return True, sol, its, outer, ndeg, dt_max, None
-        key = (tuple(pseq), tuple(np.round(ptau, 12)))
-        if key in seen:
-            return False, sol, its, outer, ndeg, dt_max, "active-set cycle"
-        seen.add(key)
-        outer += 1
-        if outer > maxit:
-            return False, sol, its, outer, ndeg, dt_max, "iteration limit"
-        if time.perf_counter() - t0 > time_limit:
-            return False, sol, its, outer, ndeg, dt_max, "time limit"
-        try:
-            sn, k, ok = ctx.newton_tau(pseq, ptau)
-        except np.linalg.LinAlgError:
-            sn, k, ok = None, 0, False
-        its += k
-        if ok:
-            sol = sn
+_MAX_ITS_STABLE = 1000      # total Newton iterations (all homotopy steps)
+_KAP_PLAIN = 3.0            # violation ratio up to which kappa0 -> 1 is tried in one step
+_DL_GROW, _DL_MIN = 1.5, 1e-3     # feasible runs use steps >= 0.03 in log(kappa)
+
+
+def _propose(ctx, sol):
+    """Exact event walk of the pointwise H-minimiser along the iterate -> (seq, tau), ndeg."""
+    subs, _ = ctx.make_subs(sol)
+    wk = ctx.walk(subs)
+    if wk is None:
+        return None, 0
+    pseq, ptau, ndeg = wk
+    pseq, ptau = list(pseq), list(ptau)
+    i = 1
+    while i + 1 < len(pseq):                     # drop round-off chatter arcs
+        if ptau[i] - ptau[i - 1] < 1e-10 * ctx.T and pseq[i - 1] == pseq[i + 1]:
+            del pseq[i:i + 2]
+            del ptau[i - 1:i + 1]
         else:
-            # plain active-set step (linear BVP with the proposed arcs)
-            sol = ctx.bvp(pseq, ptau)
-            its += 1
+            i += 1
+    return (pseq, ptau), ndeg
 
 
-def _solve_stable(A, B, x0, xf, T, M, lo, hi, Q, R, Qf, maxit=50, time_limit=60.0):
+def _correct(ctx, seq, tau, st, maxout=3, retry=1):
+    """Corrector at a fixed bound scale: Newton on tau for the predicted arc structure, then
+    the exact walk; repeat with the walked structure (at most maxout times). Accepts only an
+    iterate whose walk reproduces its own structure (PMP consistency)."""
+    for o in range(maxout):
+        sn, k, ok = ctx.newton_tau(seq, tau, stats=st)
+        st["its"] += k
+        if not ok:
+            if o > 0 or retry == 0:
+                return None
+            retry -= 1
+        p, st["ndeg"] = _propose(ctx, sn)
+        if p is None:
+            return None
+        if p[0] == sn["seq"]:
+            dt = max([abs(x - y) for x, y in zip(p[1], sn["tau"])], default=0.0)
+            if dt <= 1e-9 * ctx.T:
+                st["dt_max"] = dt
+                return sn
+        seq, tau = p
+        st["outer"] += 1
+    return None
+
+
+def _zmax(ctx, sol):
+    return max(np.abs(ctx.zend(sol, k)).max() for k in range(sol["N"]))
+
+
+def _solve_stable(A, B, x0, xf, T, M, lo, hi, Q, R, Qf, time_limit=60.0, max_its=_MAX_ITS_STABLE):
+    """Stable-basis motion primitives + Newton on the junction times (NOTES.md section 9).
+    Globalisation: homotopy in the bound scale kappa with exact arc-collapse events and a
+    secant predictor; a single step kappa0 -> 1 when the unconstrained violation is mild."""
     t0 = time.perf_counter()
     ctx = _StabCtx(A, B, x0, xf, T, M, lo, hi, Q, R, Qf)
-    its, outer, conv, fail, ndeg, dt_max, nsteps = 0, 0, False, None, 0, None, 0
+    st = dict(its=0, outer=0, ndeg=0, events=0, dt_max=None)
+    conv, fail, nsteps, kap = False, None, 0, 1.0
     try:
         sol = ctx.bvp([()], [])
     except np.linalg.LinAlgError:
         sol, fail = None, "infeasible (singular boundary-value system)"
-    if sol is not None:
-        sol_unc = sol
-        try:
-            # 1) plain: walk + Newton on the junction times, no continuation
-            conv, sol, k, o, ndeg, dt_max, fail = _stable_loop(ctx, sol, 5, t0, time_limit)
-        except np.linalg.LinAlgError:
-            conv, k, o, fail = False, 0, 0, "infeasible (singular boundary-value system)"
-        its += k
-        outer += o
-        if not conv and fail in ("active-set cycle", "iteration limit", "event walk failed"):
-            # 2) fallback: continuation in the bound scale kappa (see NOTES.md 9.4)
-            fail = None
-            subs_u, _ = ctx.make_subs(sol_unc)
-            kap = max(1.0, 1.05 * ctx.max_ratio(subs_u))
-            dl = 0.5 * math.log(kap)
+    if sol is not None and not ctx.md.has_bounds:
+        conv = True
+    elif sol is not None:
+        subs, _ = ctx.make_subs(sol)
+        ratio = ctx.max_ratio(subs)
+        if ratio <= 1.0:
+            p, st["ndeg"] = _propose(ctx, sol)
+            conv = p is not None and p[0] == [()]
+        if not conv:
+            z0 = _zmax(ctx, sol)
+            kap = 1.05 * max(ratio, 1.0)
             ctx.set_scale(kap)
             sol = ctx.bvp([()], [])
-            ok, sol, k, o, ndeg, dt_max, fail = _stable_loop(ctx, sol, maxit, t0, time_limit)
-            its += k
-            outer += o
-            while ok and kap > 1.0:
+            hist = [(kap, sol)]
+            dl = math.log(kap) * (1.0 if ratio <= _KAP_PLAIN else 1.0 / 3.0)
+            while True:
+                if kap == 1.0:
+                    conv = True
+                    break
+                if st["its"] > max_its:
+                    fail = "iteration limit"
+                    break
                 if time.perf_counter() - t0 > time_limit:
-                    ok, fail = False, "time limit"
+                    fail = "time limit"
+                    break
+                if dl < _DL_MIN:
+                    fail = "homotopy stalled at bound scale %.6g > 1 (bounds infeasible?)" % kap
+                    break
+                if _zmax(ctx, sol) > 1e8 * (1.0 + z0):
+                    fail = "infeasible (costate diverges)"
                     break
                 kt = max(1.0, kap * math.exp(-dl))
-                ctx.set_scale(kt)
                 nsteps += 1
+                ctx.set_scale(kt)
+                tau = np.array(sol["tau"])
+                if len(hist) >= 2 and hist[-2][1]["seq"] == sol["seq"]:       # secant predictor
+                    k0, s0 = hist[-2]
+                    tp = tau + (tau - np.array(s0["tau"])) / (kap - k0) * (kt - kap)
+                    if np.all(np.diff(np.concatenate([[0.0], tp, [T]])) > 0):
+                        tau = tp
                 try:
-                    s1, k1, _ = ctx.newton_tau(sol["seq"], sol["tau"])   # predictor
-                    ok2, s2, k, o, nd2, dt2, f2 = _stable_loop(ctx, s1, 5, t0, time_limit)
-                    k += k1
+                    sn = _correct(ctx, sol["seq"], tau, st)
                 except np.linalg.LinAlgError:
-                    ok2, k, o, f2 = False, 0, 0, "singular"
-                its += k
-                outer += o
-                if ok2:
-                    kap, sol, ndeg, dt_max, fail = kt, s2, nd2, dt2, None
-                    dl *= 1.5
+                    sn = None
+                if sn is not None:
+                    kap, sol = kt, sn
+                    hist.append((kap, sol))
+                    dl *= _DL_GROW
                 else:
-                    fail = f2
-                    dl *= 0.5
                     ctx.set_scale(kap)
-                    sol = ctx.bvp(sol["seq"], sol["tau"])
-                    if dl < 1e-4 or nsteps > 200:
-                        ok = False
-                        break
-            conv = bool(ok and kap == 1.0)
-            if conv:
-                fail = None
-            elif fail is None:
-                fail = "continuation failed"
+                    dl *= 0.5
     if sol is None:
         subs, zT = [], np.zeros(2 * ctx.n + 1)
         arcs = [(0.0, T, ())]
@@ -1832,14 +1902,16 @@ def _solve_stable(A, B, x0, xf, T, M, lo, hi, Q, R, Qf, maxit=50, time_limit=60.
     if conv and viol > 1e-9 * ctx.R_:
         conv, fail = False, "verification failed"
     info = {
-        "iterations": int(its),
+        "iterations": int(st["its"]),
         "converged": bool(conv),
-        "outer_iterations": int(outer),
+        "outer_iterations": int(st["outer"]),
         "continuation_steps": int(nsteps),
+        "collapse_events": int(st["events"]),
+        "bound_scale": float(kap),
         "terminal_residual_inf": resid,
-        "switch_time_change": dt_max,
+        "switch_time_change": st["dt_max"],
         "max_violation": float(viol),
-        "degenerate_events": int(ndeg),
+        "degenerate_events": int(st["ndeg"]),
         "cached_sets": len(ctx._basis),
         "sequence": [list(a[2]) for a in arcs],
         "general_cost": True,

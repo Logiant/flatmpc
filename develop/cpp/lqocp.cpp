@@ -522,8 +522,15 @@ bool Solver::solve_tau(Result& R) {
     bool conv = !p_.has_bounds;
     if (p_.has_bounds) {
         double c_try[MAXN];
+        double c0n = 1.0;
+        for (int i = 0; i < n_; ++i) c0n = fmax(c0n, 1.0 + fabs(R.c[i]));
         for (int outer = 1; outer <= MAX_OUTER; ++outer) {
             R.outer_iterations = outer;
+            // early exits: iteration cap, diverging w (dual unbounded: infeasible)
+            if (R.newton_iterations > MAX_TAU_TOTAL) break;
+            double cn = 0.0;
+            for (int i = 0; i < n_; ++i) cn = fmax(cn, fabs(R.c[i]));
+            if (cn > 1e6 * c0n) break;
             // 2) active-set sequence from the pointwise H-minimiser of the current w(t)
             if (!detect_exact(R.c)) break;
             if (outer == 1 && ew_.nseq2 == 1 && ew_.seq2[0] == 0) { conv = true; break; }
@@ -1049,6 +1056,8 @@ bool Solver::solve_newton(Result& R) {
     if (!build_arcs(ew_.seq, 1, ew_.tau, ew_.arcs)) return false;
     double c[MAXN], cn[MAXN];
     if (!solve_c(ew_.arcs, 1, c)) return false;
+    double c_start[MAXN];
+    for (int i = 0; i < n_; ++i) c_start[i] = c[i];
     int cur = 0;
     bool ok = evaluate(c, ew_.ev[cur]);
     bool conv = false;
@@ -1060,6 +1069,11 @@ bool Solver::solve_newton(Result& R) {
         for (int i = 0; i < n_; ++i) { Fn = fmax(Fn, fabs(E.F[i])); F2 += E.F[i] * E.F[i]; }
         if (Fn <= rtol * E.scale) { conv = true; break; }
         if (its >= MAX_NEWTON) break;
+        {   // dual unbounded (infeasible problem): the iterates c diverge
+            double cn = 0.0, c0 = 1.0;
+            for (int i = 0; i < n_; ++i) { cn = fmax(cn, fabs(c[i])); c0 = fmax(c0, 1.0 + fabs(c_start[i])); }
+            if (cn > 1e6 * c0) break;
+        }
         ++its;
         // (J Lm) d_nu = -F, J Lm = int K P K^T dt symmetric PSD; d_c = Lm d_nu
         double H[MAXN * MAXN], dnu[MAXN], d[MAXN];
@@ -1675,6 +1689,7 @@ void Solver::gscale(double kap) {
     for (int k = 0; k < 2 * m_; ++k) rhs_[k] = rhs0_[k] * kap;
     gw_.nsets = 0;                            // Taylor set data (q, H) depend on the bounds
     for (int i = 0; i < gw_.nsb; ++i) gw_.sb[i].part_ok = 0;   // bases W, T do not
+    ++gw_.gen;                                // invalidates cached arc exponentials
 }
 
 double Solver::gmax_ratio(const Result& R) {
@@ -1912,6 +1927,7 @@ int Solver::sbasis(uint16_t S) {
     }
     SBasis& b = gw_.sb[slot];
     b.S = 0xFFFFu;                            // invalid until complete
+    ++gw_.gen;                                // a basis changes: drop cached exponentials
     const int gi = gset(S);
     if (gi < 0) return -1;
     const GSet& g = gw_.sets[gi];
@@ -2049,24 +2065,44 @@ bool Solver::arc_maps(int bi, double L, bool, double*, double*, double*) {
     const real* Ts = b.Tp;
     const real* Tc = b.Tp + ns * ns;
     const real* Tu = Tc + nc * nc;
-    if (ns) {
-        for (int i = 0; i < ns * ns; ++i) A[i] = Ts[i];
-        expm_small(A, ns, ns, L, Es, gw_.M5, gw_.Ms, gw_.Me);
-    }
-    {
-        const int m = nc + 1;
+    const int m = nc + 1;
+    // per-arc exponential cache (slot = arc position), keyed by (set, L, generation)
+    const int need = ns * ns + m * m + nu * nu;
+    int slot = -1;
+    for (int i = 0; i < MAXARC_G; ++i)
+        if (gw_.ex_S[i] == b.S && gw_.ex_L[i] == L && gw_.ex_gen[i] == gw_.gen) { slot = i; break; }
+    if (slot >= 0) {
+        const real* e = gw_.ex[slot];
+        for (int i = 0; i < ns * ns; ++i) Es[i] = e[i];
+        for (int i = 0; i < m * m; ++i) Ec[i] = e[ns * ns + i];
+        for (int i = 0; i < nu * nu; ++i) Eu[i] = e[ns * ns + m * m + i];
+    } else {
+        if (ns) {
+            for (int i = 0; i < ns * ns; ++i) A[i] = Ts[i];
+            expm_small(A, ns, ns, L, Es, gw_.M5, gw_.Ms, gw_.Me);
+        }
         for (int i = 0; i < m * m; ++i) A[i] = 0.0;
         for (int i = 0; i < nc; ++i) {
             for (int j = 0; j < nc; ++j) A[i * m + j] = Tc[i * nc + j];
             A[i * m + nc] = b.gc[i];
         }
         expm_small(A, m, m, L, Ec, gw_.M5, gw_.Ms, gw_.Me);
+        if (nu) {
+            for (int i = 0; i < nu * nu; ++i) A[i] = Tu[i];
+            expm_small(A, nu, nu, -L, Eu, gw_.M5, gw_.Ms, gw_.Me);
+        }
+        if (need <= EXPCAP) {
+            const int i0 = gw_.ex_next;
+            gw_.ex_next = (gw_.ex_next + 1) % MAXARC_G;
+            real* e = gw_.ex[i0];
+            for (int i = 0; i < ns * ns; ++i) e[i] = (real)Es[i];
+            for (int i = 0; i < m * m; ++i) e[ns * ns + i] = (real)Ec[i];
+            for (int i = 0; i < nu * nu; ++i) e[ns * ns + m * m + i] = (real)Eu[i];
+            gw_.ex_S[i0] = b.S;
+            gw_.ex_L[i0] = L;
+            gw_.ex_gen[i0] = gw_.gen;
+        }
     }
-    if (nu) {
-        for (int i = 0; i < nu * nu; ++i) A[i] = Tu[i];
-        expm_small(A, nu, nu, -L, Eu, gw_.M5, gw_.Ms, gw_.Me);
-    }
-    const int m = nc + 1;
     for (int i = 0; i < n; ++i) {
         const real* Wr = b.W + i * n;
         double ps = 0.0, pe = 0.0;
@@ -2341,16 +2377,57 @@ bool Solver::sens(const uint16_t* seq, int N, const double* tau, int nr, double*
     return true;
 }
 
-bool Solver::newton_tau(const uint16_t* seq, int N, double* tau, int* its, double* zT) {
-    const int nj = N - 1;
+// Exact event: arc j shrinks to zero length along a Newton step. Equal neighbours -> merge
+// them; neighbours that differ in two rows -> the two switches swap order; else drop the arc.
+void Solver::collapse(uint16_t* seq, int* N, double* tau, int j) const {
+    const int n = *N;
+    if (j == 0 || j == n - 1) {
+        if (j == 0) {
+            for (int k = 0; k + 1 < n; ++k) seq[k] = seq[k + 1];
+            for (int k = 0; k + 2 < n; ++k) tau[k] = tau[k + 1];
+        }
+        *N = n - 1;
+        return;
+    }
+    const uint16_t A = seq[j - 1], Mid = seq[j], B = seq[j + 1], D = (uint16_t)(A ^ B);
+    const double mid = 0.5 * (tau[j - 1] + tau[j]);
+    if (D == 0) {                                   // merge: drop arcs j, j+1 and two junctions
+        for (int k = j; k + 2 < n; ++k) seq[k] = seq[k + 2];
+        for (int k = j - 1; k + 2 < n - 1; ++k) tau[k] = tau[k + 2];
+        *N = n - 2;
+        return;
+    }
+    const uint16_t first = (uint16_t)(A ^ Mid);
+    const bool one = first && !(first & (first - 1));
+    int nd = 0;
+    for (uint16_t x = D; x; x &= (uint16_t)(x - 1)) ++nd;
+    if (nd == 2 && one && (first & D) == first) {   // swap the order of the two switches
+        const uint16_t Mn = (uint16_t)(A ^ (D & ~first));
+        if (valid_set(Mn)) {
+            seq[j] = Mn;
+            tau[j - 1] = mid;
+            tau[j] = mid + 1e-9 * p_.T;
+            return;
+        }
+    }
+    for (int k = j; k + 1 < n; ++k) seq[k] = seq[k + 1];          // drop arc j
+    tau[j - 1] = mid;
+    for (int k = j; k + 2 < n; ++k) tau[k] = tau[k + 1];
+    *N = n - 1;
+}
+
+// Newton on the junction times with exact derivatives (sens). Arc collapse inside a step is an
+// exact event (collapse). Fails fast when the residual does not contract. seq/N/tau are
+// updated in place (events may change the structure).
+bool Solver::newton_tau(uint16_t* seq, int* Np, double* tau, int* its, double* zT) {
     *its = 0;
+    int N = *Np;
     if (!bvp(seq, N, tau, zT)) return false;
-    if (nj == 0) return true;
     int* jq = gw_.jq;
     double (*G)[MAXM] = gw_.jG;
     double* g0 = gw_.jg0;
     double* J = gw_.J;
-    const int nr = jrows(seq, N, jq, G, g0);
+    int nr = jrows(seq, N, jq, G, g0);
     if (nr == 0) return true;
     auto resid = [&](double* rv) {
         double mx = 0.0;
@@ -2366,14 +2443,18 @@ bool Solver::newton_tau(const uint16_t* seq, int N, double* tau, int* its, doubl
         }
         return mx;
     };
-    double r[2 * MAXARC_G], rn[2 * MAXARC_G], tn[MAXARC_G];
+    double r[2 * MAXARC_G], rn[2 * MAXARC_G], tn[MAXARC_G], d[MAXARC_G];
     double rmax = resid(r);
     const double tol = 1e-12 * R_, gap = 1e-12 * p_.T;
-    double tcur[MAXARC_G];
-    for (int j = 0; j < nj; ++j) tcur[j] = tau[j];
-    for (int it = 1; it <= 20; ++it) {
-        if (rmax <= tol) { *its = it - 1; return true; }
-        if (!sens(seq, N, tcur, nr, J)) return false;
+    double prev = HUGE_VAL;
+    int bad = 0;
+    while (*its < MAX_TAU_NEWTON) {
+        const int nj = N - 1;
+        if (rmax <= tol) { *Np = N; return true; }
+        if (rmax > 0.5 * prev && ++bad > 2) { *Np = N; return rmax <= 1e3 * tol; }   // stall: round-off or wrong structure
+        prev = rmax;
+        ++*its;
+        if (!sens(seq, N, tau, nr, J)) { *Np = N; return false; }
         for (int q = 0; q < nr; ++q) {
             // explicit part: d z(tau_k^-)/d tau_k includes zdot of arc k-1
             const int k = jq[q];
@@ -2392,7 +2473,7 @@ bool Solver::newton_tau(const uint16_t* seq, int N, double* tau, int* its, doubl
             J[q * MAXARC_G + (k - 1)] += v;
         }
         // Gauss-Newton step (normal equations)
-        double Nm[MAXARC_G * MAXARC_G], d[MAXARC_G];
+        double Nm[MAXARC_G * MAXARC_G];
         for (int a = 0; a < nj; ++a) {
             double s = 0.0;
             for (int q = 0; q < nr; ++q) s += J[q * MAXARC_G + a] * r[q];
@@ -2403,22 +2484,38 @@ bool Solver::newton_tau(const uint16_t* seq, int N, double* tau, int* its, doubl
                 Nm[a * nj + b2] = g;
             }
         }
-        if (!lu_solve(Nm, nj, nj, d, 1, 1)) return false;
+        if (!lu_solve(Nm, nj, nj, d, 1, 1)) { *Np = N; return false; }
+        // exact arc-collapse event along the full step
+        double amax = 1.0;
+        int jc = -1;
+        for (int j = 0; j <= nj; ++j) {
+            const double L = ((j == nj) ? p_.T : tau[j]) - ((j == 0) ? 0.0 : tau[j - 1]);
+            const double dL = ((j == nj) ? 0.0 : d[j]) - ((j == 0) ? 0.0 : d[j - 1]);
+            if (dL < 0 && L + dL <= gap && L / -dL < amax) { amax = L / -dL; jc = j; }
+        }
+        if (jc >= 0) {
+            for (int j = 0; j < nj; ++j) tau[j] += amax * d[j];
+            collapse(seq, &N, tau, jc);
+            double pv = 0.0;
+            for (int j = 0; j + 1 < N; ++j) { if (!(tau[j] > pv)) { *Np = N; return false; } pv = tau[j]; }
+            if (!(p_.T > pv)) { *Np = N; return false; }
+            ++gw_.events;
+            if (!bvp(seq, N, tau, zT)) { *Np = N; return false; }
+            nr = jrows(seq, N, jq, G, g0);
+            if (nr == 0) { *Np = N; return true; }
+            rmax = resid(r);
+            prev = HUGE_VAL;
+            bad = 0;
+            continue;
+        }
         double nr0 = 0.0;
         for (int q = 0; q < nr; ++q) nr0 += r[q] * r[q];
         nr0 = sqrt(nr0);
         double alpha = 1.0;
         bool acc = false;
-        while (alpha > 1e-8) {
-            bool ordered = true;
-            double prev = 0.0;
-            for (int j = 0; j < nj; ++j) {
-                tn[j] = tcur[j] + alpha * d[j];
-                if (!(tn[j] - prev > gap)) ordered = false;
-                prev = tn[j];
-            }
-            if (!(p_.T - prev > gap)) ordered = false;
-            if (ordered && bvp(seq, N, tn, zT)) {
+        while (alpha > 1e-3) {
+            for (int j = 0; j < nj; ++j) tn[j] = tau[j] + alpha * d[j];
+            if (bvp(seq, N, tn, zT)) {
                 const double mx = resid(rn);
                 double nn = 0.0;
                 for (int q = 0; q < nr; ++q) nn += rn[q] * rn[q];
@@ -2426,16 +2523,15 @@ bool Solver::newton_tau(const uint16_t* seq, int N, double* tau, int* its, doubl
             }
             alpha *= 0.5;
         }
-        *its = it;
         if (!acc) {
-            bvp(seq, N, tcur, zT);                    // restore the state of tcur
-            for (int j = 0; j < nj; ++j) tau[j] = tcur[j];
+            bvp(seq, N, tau, zT);                     // restore the state of tau
+            *Np = N;
             return rmax <= 1e3 * tol;                 // round-off stall
         }
-        for (int j = 0; j < nj; ++j) tcur[j] = tn[j];
+        for (int j = 0; j < nj; ++j) tau[j] = tn[j];
         for (int q = 0; q < nr; ++q) r[q] = rn[q];
     }
-    for (int j = 0; j < nj; ++j) tau[j] = tcur[j];
+    *Np = N;
     return rmax <= tol;
 }
 
@@ -2519,56 +2615,63 @@ bool Solver::make_subs(Result& R, const uint16_t* seq, int N, const double* tau)
     return true;
 }
 
-// walk -> proposal -> Newton on the junction times; returns 1 converged, 0 failed,
-// -1 infeasible (singular boundary-value system). Current arcs: gw_.aseq/atau/an.
-int Solver::sloop(Result& R, double* zT, int maxit, int* its, int* outer, int* ndeg) {
-    double hist[64];
-    int nh = 0, local = 0;
-    for (;;) {
-        if (!make_subs(R, gw_.aseq, gw_.an, gw_.atau)) return 0;
-        if (!p_.has_bounds) return 1;
-        if (!gwalk(R, ndeg)) return 0;
-        for (int i = 1; i + 1 < gw_.nseq;) {                  // drop round-off chatter
-            const double len = gw_.tau[i] - gw_.tau[i - 1];
-            if (len < 1e-10 * p_.T && gw_.seq[i - 1] == gw_.seq[i + 1]) {
-                for (int k = i; k + 2 < gw_.nseq; ++k) gw_.seq[k] = gw_.seq[k + 2];
-                for (int k = i - 1; k + 2 < gw_.nseq - 1; ++k) gw_.tau[k] = gw_.tau[k + 2];
-                gw_.nseq -= 2;
-            } else {
-                ++i;
-            }
+// Exact event walk of the pointwise H-minimiser along the current BVP solution -> gw_.seq/tau
+// (round-off chatter arcs removed).
+bool Solver::propose(Result& R, const uint16_t* seq, int N, const double* tau, int* ndeg) {
+    if (!make_subs(R, seq, N, tau) || !gwalk(R, ndeg)) return false;
+    for (int i = 1; i + 1 < gw_.nseq;) {
+        const double len = gw_.tau[i] - gw_.tau[i - 1];
+        if (len < 1e-10 * p_.T && gw_.seq[i - 1] == gw_.seq[i + 1]) {
+            for (int k = i; k + 2 < gw_.nseq; ++k) gw_.seq[k] = gw_.seq[k + 2];
+            for (int k = i - 1; k + 2 < gw_.nseq - 1; ++k) gw_.tau[k] = gw_.tau[k + 2];
+            gw_.nseq -= 2;
+        } else {
+            ++i;
         }
-        const int ns = gw_.nseq;
-        bool same = (ns == gw_.an);
-        double dmax = 0.0;
-        for (int i = 0; same && i < ns; ++i) {
-            if (gw_.seq[i] != gw_.aseq[i]) same = false;
-            if (i > 0) dmax = fmax(dmax, fabs(gw_.tau[i - 1] - gw_.atau[i - 1]));
-        }
-        if (same && dmax <= 1e-9 * p_.T) return 1;
-        double hk = ns;
-        for (int i = 0; i < ns; ++i) hk += (gw_.seq[i] + 1.0) * (i + 1) * 1.618;
-        for (int i = 0; i + 1 < ns; ++i) hk += floor(gw_.tau[i] * 1e12 + 0.5) * 1e-12 * (i + 3);
-        for (int i = 0; i < nh; ++i) if (hist[i] == hk) return 0;
-        if (nh < 64) hist[nh++] = hk;
-        ++*outer;
-        if (++local > maxit || ns > MAXARC_G) return 0;
-        uint16_t pseq[MAXARC];
-        double ptau[MAXJ];
-        for (int i = 0; i < ns; ++i) pseq[i] = gw_.seq[i];
-        for (int i = 0; i + 1 < ns; ++i) ptau[i] = gw_.tau[i];
-        int k = 0;
-        const bool ok = newton_tau(pseq, ns, ptau, &k, zT);
-        *its += k;
-        if (!ok) {
-            for (int i = 0; i + 1 < ns; ++i) ptau[i] = gw_.tau[i];   // plain active-set step
-            if (!bvp(pseq, ns, ptau, zT)) return -1;
-            ++*its;
-        }
-        gw_.an = ns;
-        for (int i = 0; i < ns; ++i) gw_.aseq[i] = pseq[i];
-        for (int i = 0; i + 1 < ns; ++i) gw_.atau[i] = ptau[i];
     }
+    return true;
+}
+
+// Corrector at a fixed bound scale, starting from the predicted structure in gw_.aseq/atau/an:
+// Newton on tau, then the exact walk; repeat with the walked structure (at most 3 times).
+// On success the accepted, self-consistent structure is in gw_.aseq/atau/an.
+bool Solver::correct(Result& R, double* zT, int* its, int* outer, int* ndeg) {
+    uint16_t seq[MAXARC];
+    double tau[MAXJ];
+    int N = gw_.an, retry = 1;
+    for (int i = 0; i < N; ++i) seq[i] = gw_.aseq[i];
+    for (int i = 0; i + 1 < N; ++i) tau[i] = gw_.atau[i];
+    for (int o = 0; o < 3; ++o) {
+        int k = 0;
+        const bool ok = newton_tau(seq, &N, tau, &k, zT);
+        *its += k;
+        if (!ok && (o > 0 || retry-- == 0)) return false;
+        if (!propose(R, seq, N, tau, ndeg)) return false;
+        bool same = (gw_.nseq == N);
+        for (int i = 0; same && i < N; ++i) {
+            if (gw_.seq[i] != seq[i]) same = false;
+            if (i > 0 && fabs(gw_.tau[i - 1] - tau[i - 1]) > 1e-9 * p_.T) same = false;
+        }
+        if (same) {
+            gw_.an = N;
+            for (int i = 0; i < N; ++i) gw_.aseq[i] = seq[i];
+            for (int i = 0; i + 1 < N; ++i) gw_.atau[i] = tau[i];
+            return true;
+        }
+        if (gw_.nseq > MAXARC_G) return false;
+        N = gw_.nseq;
+        for (int i = 0; i < N; ++i) seq[i] = gw_.seq[i];
+        for (int i = 0; i + 1 < N; ++i) tau[i] = gw_.tau[i];
+        ++*outer;
+    }
+    return false;
+}
+
+static double zmax_of(const double (*zj)[N2], int N) {
+    double m = 0.0;
+    for (int k = 0; k <= N; ++k)
+        for (int i = 0; i < N2; ++i) m = fmax(m, fabs(zj[k][i]));
+    return m;
 }
 
 bool Solver::solve_general(Result& R) {
@@ -2581,6 +2684,10 @@ bool Solver::solve_general(Result& R) {
     gw_.nsets = 0;
     gw_.nsb = 0;
     gw_.clock = 0;
+    gw_.gen = 1;
+    gw_.ex_next = 0;
+    gw_.events = 0;
+    for (int i = 0; i < MAXARC_G; ++i) gw_.ex_gen[i] = 0;
     for (int i = 0; i < n_; ++i) R.c[i] = 0.0;
     double zT[N2 + 1];
     int its = 0, outer = 0, ndeg = 0, nsteps = 0;
@@ -2589,37 +2696,53 @@ bool Solver::solve_general(Result& R) {
     bool conv = false, infeasible = false;
     if (!bvp(gw_.aseq, 1, gw_.atau, zT)) {
         infeasible = true;
+    } else if (!p_.has_bounds) {
+        conv = true;
     } else {
-        // 1) plain: walk + Newton on the junction times, no continuation
-        const int st = sloop(R, zT, 5, &its, &outer, &ndeg);
-        if (st == 1) conv = true;
-        if (st == -1) infeasible = true;
-        if (st == 0) {
-            // 2) fallback: continuation in the bound scale (NOTES.md 9.4)
-            gw_.an = 1;
-            gw_.aseq[0] = 0;
-            if (!bvp(gw_.aseq, 1, gw_.atau, zT) || !make_subs(R, gw_.aseq, 1, gw_.atau)) return false;
-            double kap = fmax(1.0, 1.05 * gmax_ratio(R));
-            double dl = 0.5 * log(kap);
+        if (!make_subs(R, gw_.aseq, 1, gw_.atau)) return false;
+        const double ratio = gmax_ratio(R);
+        if (ratio <= 1.0 && propose(R, gw_.aseq, 1, gw_.atau, &ndeg))
+            conv = (gw_.nseq == 1 && gw_.seq[0] == 0);
+        if (!conv) {
+            // homotopy in the bound scale kappa (NOTES.md 9.5): exact collapse events inside
+            // the tau-Newton, secant predictor, step halving on failure
+            const double z0 = zmax_of(gw_.zj, 1);
+            double kap = 1.05 * fmax(ratio, 1.0);
+            double dl = log(kap) * ((ratio <= KAP_PLAIN) ? 1.0 : 1.0 / 3.0);
             gscale(kap);
-            bool ok = bvp(gw_.aseq, 1, gw_.atau, zT) && sloop(R, zT, 5, &its, &outer, &ndeg) == 1;
+            if (!bvp(gw_.aseq, 1, gw_.atau, zT)) return false;
+            gw_.hn = 0;
             uint16_t sseq[MAXARC];
             double stau[MAXJ];
-            while (ok && kap > 1.0) {
+            for (;;) {
+                if (kap == 1.0) { conv = true; break; }
+                if (its > MAX_GEN_ITS || dl < DL_MIN) break;
+                if (zmax_of(gw_.zj, gw_.an) > 1e8 * (1.0 + z0)) { infeasible = true; break; }
                 const int sn = gw_.an;
                 for (int i = 0; i < sn; ++i) sseq[i] = gw_.aseq[i];
                 for (int i = 0; i + 1 < sn; ++i) stau[i] = gw_.atau[i];
                 const double kt = fmax(1.0, kap * exp(-dl));
                 gscale(kt);
                 ++nsteps;
-                int k = 0;
-                if (!newton_tau(gw_.aseq, gw_.an, gw_.atau, &k, zT)) {     // predictor
-                    for (int i = 0; i + 1 < sn; ++i) gw_.atau[i] = stau[i];
-                    bvp(gw_.aseq, gw_.an, gw_.atau, zT);
+                bool same = (gw_.hn == sn);
+                for (int i = 0; same && i < sn; ++i) same = (gw_.hseq[i] == sseq[i]);
+                if (same) {                                  // secant predictor
+                    double pv = 0.0;
+                    bool ord = true;
+                    for (int i = 0; i + 1 < sn; ++i) {
+                        const double t = stau[i] + (stau[i] - gw_.htau[i]) / (kap - gw_.hkap) * (kt - kap);
+                        gw_.atau[i] = t;
+                        if (!(t > pv)) ord = false;
+                        pv = t;
+                    }
+                    if (!ord || !(p_.T > pv))
+                        for (int i = 0; i + 1 < sn; ++i) gw_.atau[i] = stau[i];
                 }
-                its += k;
-                const int st2 = sloop(R, zT, 5, &its, &outer, &ndeg);
-                if (st2 == 1) {
+                if (correct(R, zT, &its, &outer, &ndeg)) {
+                    gw_.hn = sn;
+                    for (int i = 0; i < sn; ++i) gw_.hseq[i] = sseq[i];
+                    for (int i = 0; i + 1 < sn; ++i) gw_.htau[i] = stau[i];
+                    gw_.hkap = kap;
                     kap = kt;
                     dl *= 1.5;
                 } else {
@@ -2628,11 +2751,9 @@ bool Solver::solve_general(Result& R) {
                     gw_.an = sn;
                     for (int i = 0; i < sn; ++i) gw_.aseq[i] = sseq[i];
                     for (int i = 0; i + 1 < sn; ++i) gw_.atau[i] = stau[i];
-                    if (!bvp(gw_.aseq, gw_.an, gw_.atau, zT)) { ok = false; break; }
-                    if (dl < 1e-4 || nsteps > 200) { ok = false; break; }
+                    if (!bvp(gw_.aseq, gw_.an, gw_.atau, zT)) { infeasible = true; break; }
                 }
             }
-            conv = ok && kap == 1.0;
         }
     }
     R.iterations = R.newton_iterations = its;
@@ -2647,7 +2768,11 @@ bool Solver::solve_general(Result& R) {
         R.converged = false;
         return false;
     }
-    if (!make_subs(R, gw_.aseq, gw_.an, gw_.atau)) { R.converged = false; return false; }
+    if (!bvp(gw_.aseq, gw_.an, gw_.atau, zT) || !make_subs(R, gw_.aseq, gw_.an, gw_.atau)) {
+        R.cost = HUGE_VAL;
+        R.converged = false;
+        return false;
+    }
     double rmax = 0.0;
     for (int i = 0; i < n_; ++i) {
         double v;

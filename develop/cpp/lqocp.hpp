@@ -6,9 +6,9 @@
 //   general : J = 1/2 int (s'Qs + v'Rv) + 1/2 (s(T)-xf)'Qf(s(T)-xf)  (or fixed endpoint)
 // Methods:
 //   METHOD_NEWTON (default): energy -> Newton on the 12 polynomial coefficients, exact cubic
-//                  events, line search on the concave dual; general -> semismooth Newton
-//                  (primal-dual active set) with a Riccati-sweep linear BVP solve and grid-free
-//                  Taylor/Bernstein event detection on exponential-polynomial arcs.
+//                  events, line search on the concave dual; general -> stable-basis motion
+//                  primitives, Newton on the junction times with exact derivatives and exact
+//                  collapse events, event-driven bound-scale homotopy (NOTES.md section 9).
 //   METHOD_TAU    : junction-time Gauss-Newton, sequence read off a time grid (energy only).
 //
 // Embedded-friendly core: fixed-size arrays only, no heap allocation, no exceptions, no STL.
@@ -42,17 +42,25 @@ constexpr int NGRID = 2000;          // grid used by the tau method only
 constexpr int MAXSETS = 81;          // 3^MAXM candidate active sets
 constexpr int MAX_OUTER = 50;
 constexpr int MAX_NEWTON = 50;
+constexpr int MAX_TAU_TOTAL = 500;   // total junction-time Newton iterations (tau method)
 constexpr int MAX_PDAS = 30;         // PDAS iterations per continuation step
 constexpr int MAX_CONT = 400;        // continuation steps
 // general-cost mode
 constexpr int GZ = 2 * MAXN + 1;     // augmented Hamiltonian state (s, lambda, 1)
 constexpr int GN = 24;               // Taylor order per substep
-constexpr int MAXSUB = 192;          // max substeps over [0, T] (Taylor models)
+constexpr int MAXSUB = 384;          // max substeps over [0, T] (Taylor models)
+// shortcut: substep states are stored (Result.gz0, 384*24 reals); TINY-like stiffness needs ~250
+// per second of horizon, so T > ~1.5 s fails. Upgrade: modal Ts/Tu + streamed substeps (NOTES 9.8).
 constexpr int MAXGSET = 16;          // cached Taylor data per active set
 constexpr int N2 = 2 * MAXN;         // Hamiltonian state (s, lambda)
 constexpr int NC_ROWS = MAXN;        // rows of the carried relation
-constexpr int MAXSB = 8;             // cached stable-basis primitives (LRU)
+constexpr int MAXSB = 16;             // cached stable-basis primitives (LRU)
 constexpr int MAXARC_G = 24;         // max arcs of a general-cost trajectory
+constexpr int EXPCAP = 626;          // cached exponential entries per arc
+constexpr int MAX_TAU_NEWTON = 8;    // Newton iterations on the junction times per corrector
+constexpr double KAP_PLAIN = 3.0;    // violation ratio up to which kappa0 -> 1 is tried in one step
+constexpr int MAX_GEN_ITS = 1000;    // total Newton iterations, general cost (all homotopy steps)
+constexpr double DL_MIN = 1e-3;      // homotopy stall (feasible runs use steps >= 0.03 in log kappa)
 
 enum Method { METHOD_TAU = 0, METHOD_NEWTON = 1 };
 
@@ -168,6 +176,17 @@ private:
         int jq[2 * MAXARC_G];        // junction residual rows
         double jG[2 * MAXARC_G][MAXM], jg0[2 * MAXARC_G];
         double J[2 * MAXARC_G * MAXARC_G];
+        real ex[MAXARC_G][EXPCAP];   // cached arc exponentials e^{Ts L}, e^{Tca L}, e^{-Tu L}
+        uint16_t ex_S[MAXARC_G];
+        double ex_L[MAXARC_G];
+        uint32_t ex_gen[MAXARC_G];
+        uint32_t gen;
+        int ex_next;
+        int events;                  // exact arc-collapse events (newton_tau)
+        int hn;                      // previous accepted structure (secant predictor)
+        uint16_t hseq[MAXARC_G];
+        double htau[MAXARC_G];
+        double hkap;
         double x[MAXARC_G][N2];      // arc coefficients (a, c, b)
         double zj[MAXARC_G + 1][N2]; // z at the junctions (index k = tau_k, k = N: T)
         int nseq;
@@ -249,9 +268,11 @@ private:
     bool bvp(const uint16_t* seq, int N, const double* tau, double* zT);
     bool sens(const uint16_t* seq, int N, const double* tau, int nr, double* J);
     int jrows(const uint16_t* seq, int N, int* jq, double G[][MAXM], double* g0) const;
-    bool newton_tau(const uint16_t* seq, int N, double* tau, int* its, double* zT);
+    void collapse(uint16_t* seq, int* N, double* tau, int j) const;
+    bool newton_tau(uint16_t* seq, int* N, double* tau, int* its, double* zT);
+    bool propose(Result& R, const uint16_t* seq, int N, const double* tau, int* ndeg);
+    bool correct(Result& R, double* zT, int* its, int* outer, int* ndeg);
     bool make_subs(Result& R, const uint16_t* seq, int N, const double* tau);
-    int sloop(Result& R, double* zT, int maxit, int* its, int* outer, int* ndeg);
     bool solve_general(Result& R);
 };
 

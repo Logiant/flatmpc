@@ -1,4 +1,4 @@
-// Host CLI: lqocp_cli <A|B|problem_file> <out.csv> [tau|newton]. May use the STL; the core does not.
+// Host CLI: lqocp_cli <A|B|TINY|problem_file> <out.csv> [newton|tau|riccati]. May use the STL; the core does not.
 #include <chrono>
 #include <fstream>
 #include <sstream>
@@ -78,12 +78,12 @@ static bool read_problem_file(const char* path, lqocp::Problem& p) {
 
 int main(int argc, char** argv) {
     if (argc != 3 && argc != 4) {
-        std::fprintf(stderr, "usage: %s <A|B|TINY|problem_file> <out.csv> [newton|tau]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <A|B|TINY|problem_file> <out.csv> [newton|tau|riccati]\n", argv[0]);
         return 2;
     }
     std::string method = (argc == 4) ? argv[3] : "newton";
-    if (method != "tau" && method != "newton") {
-        std::fprintf(stderr, "unknown method '%s' (tau|newton)\n", method.c_str());
+    if (method != "tau" && method != "newton" && method != "riccati") {
+        std::fprintf(stderr, "unknown method '%s' (tau|newton|riccati)\n", method.c_str());
         return 2;
     }
     const int n = 12, m = 4;
@@ -113,11 +113,17 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "'%s' is neither a case name (A|B) nor a valid problem file\n", argv[1]);
         return 2;
     }
-    const int meth = (method == "newton") ? lqocp::METHOD_NEWTON : lqocp::METHOD_TAU;
+    const int meth = (method == "tau") ? lqocp::METHOD_TAU : lqocp::METHOD_NEWTON;
 
     const auto t0 = std::chrono::steady_clock::now();
     if (!g_solver.setup(p)) {
         std::fprintf(stderr, "problem setup failed (unsupported dimensions or R not SPD)\n");
+        return 3;
+    }
+    // riccati: same as newton for the energy cost (as in Python); the Riccati-sweep general-cost
+    // solver exists only in Python (method="riccati")
+    if (method == "riccati" && g_solver.is_general()) {
+        std::fprintf(stderr, "method 'riccati' with a general cost is Python-only (use newton)\n");
         return 3;
     }
     if (meth == lqocp::METHOD_TAU && g_solver.is_general()) {
@@ -152,7 +158,9 @@ int main(int argc, char** argv) {
 
     double st[lqocp::MAXJ];
     const int ns = g_solver.switch_times(g_result, st, lqocp::MAXJ);
-    std::printf("{\"cost\": %.17g, \"switch_times\": [", g_result.cost);
+    // JSON has no inf/nan: print null for a non-finite cost (failed or infeasible solve)
+    if (std::isfinite(g_result.cost)) std::printf("{\"cost\": %.17g, \"switch_times\": [", g_result.cost);
+    else std::printf("{\"cost\": null, \"switch_times\": [");
     for (int i = 0; i < ns; ++i) std::printf("%s%.17g", i ? ", " : "", st[i]);
     std::printf("], \"iterations\": %d, \"solve_time_us\": %.3f, \"converged\": %s, \"method\": \"%s\"}\n",
                 g_result.iterations, us, ok && g_result.converged ? "true" : "false", method.c_str());
