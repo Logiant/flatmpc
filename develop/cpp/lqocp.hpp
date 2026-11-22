@@ -22,6 +22,9 @@ namespace lqocp {
 
 // Storage precision of the large arrays (bases, carried relations, substep states).
 // Arithmetic is always double. Build with -DLQOCP_FLOAT for float storage.
+// Storage precision of the junction Jacobian and sensitivities of the general-cost solver
+// (-DLQOCP_FLOAT: float). Arithmetic, relations and arc coefficients are always double: TINY's
+// R (cond 2e6) amplifies float round-off in the costate beyond the junction tolerance.
 #ifdef LQOCP_FLOAT
 typedef float real;
 #else
@@ -31,7 +34,7 @@ typedef double real;
 constexpr int MAXM = 4;              // inputs / chains
 constexpr int MAXN = 12;             // states = sum of chain orders
 constexpr int MAXK = 4;              // max chain order (4-pt Gauss-Legendre exact for 2K-2 <= 7)
-constexpr int MAXARC = 64;           // max arcs of any trajectory
+constexpr int MAXARC = 64;           // max switch times printed by the CLI
 constexpr int MAXJ = MAXARC - 1;     // max junctions (switch times)
 constexpr int MAXARC_E = 32;         // energy-cost buffers (tau / energy newton)
 constexpr int MAXJ_E = MAXARC_E - 1;
@@ -45,18 +48,8 @@ constexpr int MAX_NEWTON = 50;
 constexpr int MAX_TAU_TOTAL = 500;   // total junction-time Newton iterations (tau method)
 constexpr int MAX_PDAS = 30;         // PDAS iterations per continuation step
 constexpr int MAX_CONT = 400;        // continuation steps
-// general-cost mode
-constexpr int GZ = 2 * MAXN + 1;     // augmented Hamiltonian state (s, lambda, 1)
-constexpr int GN = 24;               // Taylor order per substep
-constexpr int MAXSUB = 384;          // max substeps over [0, T] (Taylor models)
-// shortcut: substep states are stored (Result.gz0, 384*24 reals); TINY-like stiffness needs ~250
-// per second of horizon, so T > ~1.5 s fails. Upgrade: modal Ts/Tu + streamed substeps (NOTES 9.8).
-constexpr int MAXGSET = 16;          // cached Taylor data per active set
 constexpr int N2 = 2 * MAXN;         // Hamiltonian state (s, lambda)
-constexpr int NC_ROWS = MAXN;        // rows of the carried relation
-constexpr int MAXSB = 16;             // cached stable-basis primitives (LRU)
-constexpr int MAXARC_G = 24;         // max arcs of a general-cost trajectory
-constexpr int EXPCAP = 626;          // cached exponential entries per arc
+constexpr int GN = 24;               // Taylor order per substep (event detection, general cost)
 constexpr int MAX_TAU_NEWTON = 8;    // Newton iterations on the junction times per corrector
 constexpr double KAP_PLAIN = 3.0;    // violation ratio up to which kappa0 -> 1 is tried in one step
 constexpr int MAX_GEN_ITS = 1000;    // total Newton iterations, general cost (all homotopy steps)
@@ -88,9 +81,8 @@ struct Arc {
 
 struct Result {
     int method;
-    bool general;                    // general-cost path used
     int narcs;
-    Arc arcs[MAXARC];
+    Arc arcs[MAXARC_E];
     double c[MAXN];                  // energy: coefficients of the switching polynomial w(t)
     double cost;
     int iterations;                  // tau: BC solves + Newton its; newton: Newton iterations
@@ -104,10 +96,6 @@ struct Result {
     double touch[MAXTOUCH];
     bool box_fast_path;
     bool converged;
-    // general mode: substeps (arc a is split into nsub[a] equal substeps); z0 = (s, lambda)
-    int gnsub;
-    int nsub[MAXARC];
-    real gz0[MAXSUB][2 * MAXN];
 };
 
 class Solver {
@@ -143,60 +131,6 @@ private:
         uint16_t wseq[MAXARC_E];
         double wtau[MAXJ_E];
     };
-    struct GSet {
-        uint16_t S;
-        double P[MAXM][MAXM], q[MAXM];
-        double nrmN, h;
-    };
-    // Stable-basis primitive of one active set (bound-independent part cacheable offline):
-    // H_S = W blockdiag(Ts, Tc, Tu) W^-1, columns of W = [stable | centre | unstable] bases.
-    struct SBasis {
-        uint16_t S;
-        int16_t ns, nc, nu;
-        uint32_t stamp;              // LRU
-        int part_ok;                 // particular part valid for the current bound scale
-        real W[N2 * N2];
-        real Tp[N2 * N2];            // packed blocks Ts (ns^2), Tc (nc^2), Tu (nu^2)
-        double yps[N2], ypu[N2], gc[N2];   // particular solution (depends on the bounds)
-    };
-    struct GenWork {
-        GSet sets[MAXGSET];          // Taylor data (P, q, ||H^24||, substep h) per active set
-        int nsets;
-        SBasis sb[MAXSB];
-        int nsb;
-        uint32_t clock;
-        double Z[GZ][GN];            // Taylor coefficients of one substep
-        double M1[GZ * GZ], M2[GZ * GZ], M3[GZ * GZ], M4[GZ * GZ], M5[GZ * GZ];  // scratch
-        double Ms[GZ * GZ], Me[GZ * GZ];   // maps of the current arc (also expm scratch)
-        double ps[N2], pe[N2];
-        real C[MAXARC_G + 1][NC_ROWS * N2];   // carried left relation C_k z(tau_k) = d_k
-        real d[MAXARC_G + 1][NC_ROWS];
-        real dd[MAXARC_G + 1][NC_ROWS][MAXARC_G];   // sensitivity right-hand sides
-        double Dl[N2][MAXARC_G];     // vector-field jumps at the junctions
-        int jq[2 * MAXARC_G];        // junction residual rows
-        double jG[2 * MAXARC_G][MAXM], jg0[2 * MAXARC_G];
-        double J[2 * MAXARC_G * MAXARC_G];
-        real ex[MAXARC_G][EXPCAP];   // cached arc exponentials e^{Ts L}, e^{Tca L}, e^{-Tu L}
-        uint16_t ex_S[MAXARC_G];
-        double ex_L[MAXARC_G];
-        uint32_t ex_gen[MAXARC_G];
-        uint32_t gen;
-        int ex_next;
-        int events;                  // exact arc-collapse events (newton_tau)
-        int hn;                      // previous accepted structure (secant predictor)
-        uint16_t hseq[MAXARC_G];
-        double htau[MAXARC_G];
-        double hkap;
-        double x[MAXARC_G][N2];      // arc coefficients (a, c, b)
-        double zj[MAXARC_G + 1][N2]; // z at the junctions (index k = tau_k, k = N: T)
-        int nseq;
-        uint16_t seq[MAXARC];
-        double tau[MAXJ];
-        int an;                      // last accepted arc structure (continuation)
-        uint16_t aseq[MAXARC];
-        double atau[MAXJ];
-    };
-
     Problem p_;
     int n_, m_, off_[MAXM];
     double rows_[2 * MAXM][MAXM], rhs_[2 * MAXM], rownorm2_[2 * MAXM];
@@ -205,17 +139,11 @@ private:
     int nsets_;
     double free_[MAXN];
     double rhs_scale_;
-    double rhs0_[2 * MAXM];          // general: unscaled bounds (continuation)
     double R_;
     bool identity_;
     bool general_;
     double Lm_[MAXN * MAXN], Linv_[MAXN * MAXN];   // energy: c = Lm nu
-    double Lc_[MAXM][MAXM];          // general: R = Lc Lc^T (Cholesky)
-    double Bt_[MAXN][MAXM];          // general: B Lc^{-T}
-    union {
-        EnergyWork ew_;
-        GenWork gw_;
-    };
+    EnergyWork ew_;
 
     // shared / energy
     void w_of(const double* c, double t, double* w) const;
@@ -246,34 +174,177 @@ private:
     bool evaluate(const double* c, Eval& e);
     double dual(const Arc* arcs, int narcs, const double* c) const;
     double verify(const Arc* arcs, int narcs, const double* c) const;
+};
 
-    // general cost (stable-basis motion primitives)
-    bool gsetup(double Mrow[MAXM][MAXM]);
-    int gset(uint16_t S);
-    void hmul(const GSet& g, const double* z, double* out) const;
-    void taylor(const GSet& g, const double* z0, double Z[GZ][GN]) const;
-    double eps_sub(const GSet& g, double h, double Z[GZ][GN]) const;
+// =====================================================================================
+// General LQ cost (NOTES.md sections 9 and 10): stable-basis motion primitives, Newton on the
+// junction times, bound-scale homotopy. Memory is sized by compile-time constants:
+//   LQOCP_NA  max arcs; LQOCP_NCK stored forward relations (fewer -> recomputed, O(N^2) time);
+//   LQOCP_NB  junction-sensitivity columns per sweep (fewer -> more sweeps).
+// The per-active-set bases come from a BasisFn: a flash table made offline (embedded) or
+// BasisBuilder (lqocp_basis.cpp, computes them on demand; host).
+// =====================================================================================
+#ifndef LQOCP_NA
+#define LQOCP_NA 48
+#endif
+#ifndef LQOCP_NCK
+#define LQOCP_NCK (LQOCP_NA + 1)
+#endif
+#ifndef LQOCP_NB
+#define LQOCP_NB (LQOCP_NA - 1)
+#endif
+constexpr int NA = LQOCP_NA;         // max arcs of a general-cost trajectory
+constexpr int NJ = NA - 1;
+constexpr int NR = NA;               // max junction residual rows
+constexpr int NCK = LQOCP_NCK;
+constexpr int NB = LQOCP_NB;
+constexpr int NCOL = N2 + 1 + NB;    // relation row: z | rhs | sensitivities
+
+// Bound-independent primitive of one active set S: H_S = W diag(Ls, Tc, Lu) W^-1, where the
+// stable/unstable parts are modal (1x1 real or 2x2 [[re, im], [-im, re]] blocks) and Tc is the
+// centre block (|Re eig| <= 1/T). Arrays may live in flash.
+struct SetBasis {
+    uint16_t S;
+    uint8_t ns, nc;                  // nu = 2n - ns - nc
+    double tcn;                      // ||Tc||_inf
+    double tcr;                      // ||Tc^24||_inf^(1/24) (sets the Taylor substeps)
+    const double* W;                 // 2n x 2n, row-major
+    const double* Wi;                // W^-1
+    const double* re;                // 2n modal real parts (stable / unstable columns)
+    const double* im;                // +b, -b on the two columns of a complex pair, else 0
+    const double* Tc;                // nc x nc
+    const double* cs;                // column norms of W (GResult.x stores x * cs)
+};
+typedef const SetBasis* (*BasisFn)(void* ctx, uint16_t S);
+
+struct GResult {
+    int narcs;
+    uint16_t S[NA];                  // active set of each arc
+    double t1[NA];                   // arc end times (t1[narcs-1] = T)
+    double x[NA][N2];                // arc coefficients (a, c, b) in the set's basis, times cs
+    double cost;
+    double residual;                 // terminal condition residual
+    double pmp_violation;
+    int iterations;                  // Newton iterations on the junction times (all homotopy steps)
+    int outer_iterations;            // homotopy steps
+    int degenerate_events;
+    bool converged;
+    const char* failure;             // short reason when not converged (else nullptr)
+};
+
+class GSolver {
+public:
+    // p must stay alive (it is referenced, not copied). R = Lc Lc^T must be SPD.
+    bool setup(const Problem& p, BasisFn fn, void* ctx);
+    bool solve(GResult& r);
+    void eval_u(const GResult& r, double t, double u[MAXM]) const;
+    void eval_x(const GResult& r, double t, double x[MAXN]) const;
+    int switch_times(const GResult& r, double* out, int maxout) const;
+    // for basis builders
+    int n2() const { return 2 * n_; }
+    int nsets() const { return nsets_; }
+    uint16_t set(int i) const;
+    bool hmat(uint16_t S, double* H) const;   // homogeneous H_S (2n x 2n, row-major)
+    double horizon() const { return p_->T; }
+
+private:
+    struct Arc {                     // per-arc data derived on the fly
+        const SetBasis* b;
+        double t0, L;
+        double P[MAXM][MAXM], q[MAXM];
+        double yp[N2];               // particular part (modal); centre entries: forcing
+        const double* x;
+    };
+    const Problem* p_;
+    BasisFn bfn_;
+    void* bctx_;
+    int n_, m_, off_[MAXM], end_[MAXM];
+    double rows_[2 * MAXM][MAXM], rhs_[2 * MAXM], rhs0_[2 * MAXM], rownorm2_[2 * MAXM];
+    bool finite_[2 * MAXM];
+    int nsets_;
+    double R_;
+    double LiT_[MAXM][MAXM];         // Lc^-T: B~ = B Lc^-T has row end_[j] = LiT_[j]
+    double Lc_[MAXM][MAXM];
+    struct NrmC { uint16_t S; double nrm, h; } nc_[8];   // ||H_S^24|| cache (bound dependent)
+    int ncn_;
+    GResult* R_out;
+    // homotopy / structure
+    int an_, hn_, wn_;
+    uint16_t aseq_[NA], hseq_[NA], wseq_[NA];
+    double atau_[NJ], htau_[NJ], wtau_[NA];
+    double hkap_;
+    double zT_[N2];
+    int events_;
+    // junction residual rows
+    int nr_;
+    int8_t jq_[NR], jk_[NR];
+    // linear algebra work
+    double rel_[MAXN][NCOL];         // carried relation (12 rows)
+    // stored relations at checkpoints 1..NCK-1 (checkpoint 0 is the initial relation s = x0)
+    double ck_[NCK > 1 ? NCK - 1 : 1][NCK > 1 ? MAXN : 1][NCK > 1 ? N2 + 1 + NB : 1];
+    real Z_[N2][NB];                 // backward sensitivities
+    double Dj_[NB][MAXM];            // jumps of the sensitivity block (chain-end entries)
+    mutable Arc ac_;                 // scratch arc (sweep step, substep loop, zstart)
+    real J_[NR][NJ + 1];             // junction Jacobian | residual
+
+    void wt_of(const double* lam, double* wt) const;
+    void hmul(const double P[MAXM][MAXM], const double* q, const double* z, double* out) const;
+    bool affine(uint16_t S, double P[MAXM][MAXM], double q[MAXM]) const;
+    bool valid_set(uint16_t S) const;
+    template <class F> bool for_sets(F f) const;
     int gphi(uint16_t S, int keys[2 * MAXM], double G[2 * MAXM][MAXM], double g0[2 * MAXM]) const;
+    bool rowphi(const uint16_t* seq, int q, double G[MAXM], double* g0) const;
+    bool nrm(uint16_t S, const double P[MAXM][MAXM], const double* q, double* nrmN, double* h);
+    bool arc(int k, const uint16_t* seq, int N, const double* tau, Arc& a) const;
+    __attribute__((noinline)) void zat(const Arc& a, double sig, double* z) const;
+    void zstart(const uint16_t* seq, int N, const double* tau, int k, double* z) const;
+    void cexp(const Arc& a, double L, double* y, bool row, bool aff) const;
+    __attribute__((noinline)) void taylor_w(const Arc& a, double sig0, double h, double W[MAXM][GN], double* Zb) const;
+    void gscale(double kap);
     bool glex_ok(uint16_t S, const double W[MAXM][GN], double sig, double h) const;
     bool glex_set(const double W[MAXM][GN], double sig, double h, uint16_t guess, uint16_t* out) const;
-    bool gwalk(const Result& R, int* ndeg);
-    double gverify(const Result& R);
-    double gcost(const Result& R, const double* zT);
-    void gz_at(const Result& R, double t, double z[GZ], int* arc) const;
-    void gscale(double kap);
-    double gmax_ratio(const Result& R);
-    int sbasis(uint16_t S);
-    bool sparticular(SBasis& b, uint16_t S);
-    bool arc_maps(int bi, double L, bool deriv, double* Ds, double* De, double* dpe);
-    bool bvp(const uint16_t* seq, int N, const double* tau, double* zT);
-    bool sens(const uint16_t* seq, int N, const double* tau, int nr, double* J);
-    int jrows(const uint16_t* seq, int N, int* jq, double G[][MAXM], double* g0) const;
+    bool gwalk(const uint16_t* seq, int N, const double* tau, int* ndeg);
+    template <class F> bool substeps(const uint16_t* seq, int N, const double* tau, F f);
+    double gverify(const uint16_t* seq, int N, const double* tau);
+    double gcost(const uint16_t* seq, int N, const double* tau);
+    double gmax_ratio(const uint16_t* seq, int N, const double* tau);
+    void init_rel(int nb);
+    bool fstep(const Arc& a, int nb);
+    void jump(const uint16_t* seq, int N, const double* tau, int j, double* D) const;
+    void inject(int k, int b0, int nb);
+    bool advance(const uint16_t* seq, int N, const double* tau, int k, int b0, int nb);
+    bool forward(const uint16_t* seq, int N, const double* tau, int b0, int nb, int* stride);
+    bool load(const uint16_t* seq, int N, const double* tau, int k, int stride, int b0, int nb);
+    __attribute__((noinline)) bool terminal(int nb, double* zT);
+    __attribute__((noinline)) bool recover(const Arc& a, int nb, bool aff, double* xout, double* zb);
+    bool bvp(const uint16_t* seq, int N, const double* tau);
+    int jrows(const uint16_t* seq, int N);
+    double resid(const uint16_t* seq, int N, const double* tau, double* r) const;
+    bool sens(const uint16_t* seq, int N, const double* tau);
+    __attribute__((noinline)) double explicit_term(const uint16_t* seq, int N, const double* tau, int q) const;
     void collapse(uint16_t* seq, int* N, double* tau, int j) const;
-    bool newton_tau(uint16_t* seq, int* N, double* tau, int* its, double* zT);
-    bool propose(Result& R, const uint16_t* seq, int N, const double* tau, int* ndeg);
-    bool correct(Result& R, double* zT, int* its, int* outer, int* ndeg);
-    bool make_subs(Result& R, const uint16_t* seq, int N, const double* tau);
-    bool solve_general(Result& R);
+    bool newton_tau(uint16_t* seq, int* N, double* tau, int* its);
+    bool propose(const uint16_t* seq, int N, const double* tau, int* ndeg);
+    bool correct(int* its, int* outer, int* ndeg);
+    double zmax(const uint16_t* seq, int N, const double* tau) const;
+};
+
+// Host helper: computes SetBasis data on demand (sign-function dichotomy + modal blocks).
+class BasisBuilder {
+public:
+    void attach(const GSolver* g) { g_ = g; n_ = 0; }
+    static const SetBasis* fn(void* ctx, uint16_t S) { return static_cast<BasisBuilder*>(ctx)->get(S); }
+    const SetBasis* get(uint16_t S);
+    int count() const { return n_; }
+    const SetBasis& at(int i) const { return sb_[i]; }
+
+private:
+    const GSolver* g_ = nullptr;
+    int n_ = 0;
+    SetBasis sb_[MAXSETS];
+    double W_[MAXSETS][N2 * N2], Wi_[MAXSETS][N2 * N2], re_[MAXSETS][N2], im_[MAXSETS][N2],
+        Tc_[MAXSETS][N2 * N2], cs_[MAXSETS][N2];
+    bool build(uint16_t S, int slot);
 };
 
 }  // namespace lqocp

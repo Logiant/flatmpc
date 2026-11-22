@@ -13,6 +13,9 @@
 
 static lqocp::Solver g_solver;   // static storage: no heap, no large stack frame
 static lqocp::Result g_result;
+static lqocp::GSolver g_gsolver; // general cost
+static lqocp::GResult g_gresult;
+static lqocp::BasisBuilder g_basis;
 
 // Problem file: whitespace-separated numbers, '#' starts a comment line.
 //   T, x0 (12), xf (12), has_bounds, [Umap (16, row-major), u_min (4), u_max (4)],
@@ -120,17 +123,28 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "problem setup failed (unsupported dimensions or R not SPD)\n");
         return 3;
     }
+    const bool general = g_solver.is_general();
     // riccati: same as newton for the energy cost (as in Python); the Riccati-sweep general-cost
     // solver exists only in Python (method="riccati")
-    if (method == "riccati" && g_solver.is_general()) {
+    if (method == "riccati" && general) {
         std::fprintf(stderr, "method 'riccati' with a general cost is Python-only (use newton)\n");
         return 3;
     }
-    if (meth == lqocp::METHOD_TAU && g_solver.is_general()) {
+    if (meth == lqocp::METHOD_TAU && general) {
         std::fprintf(stderr, "method 'tau' supports only the energy cost (Q=0, R=I, fixed endpoint)\n");
         return 3;
     }
-    bool ok = g_solver.solve(g_result, meth);
+    bool ok;
+    if (general) {
+        if (!g_gsolver.setup(p, lqocp::BasisBuilder::fn, &g_basis)) {
+            std::fprintf(stderr, "problem setup failed (unsupported dimensions or R not SPD)\n");
+            return 3;
+        }
+        g_basis.attach(&g_gsolver);
+        ok = g_gsolver.solve(g_gresult);
+    } else {
+        ok = g_solver.solve(g_result, meth);
+    }
     const auto t1 = std::chrono::steady_clock::now();
     const double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
 
@@ -147,8 +161,13 @@ int main(int argc, char** argv) {
     double x[lqocp::MAXN], u[lqocp::MAXM];
     for (int k = 0; k < K; ++k) {
         const double t = (k == K - 1) ? p.T : p.T * k / (K - 1);
-        g_solver.eval_x(g_result, t, x);
-        g_solver.eval_u(g_result, t, u);
+        if (general) {
+            g_gsolver.eval_x(g_gresult, t, x);
+            g_gsolver.eval_u(g_gresult, t, u);
+        } else {
+            g_solver.eval_x(g_result, t, x);
+            g_solver.eval_u(g_result, t, u);
+        }
         std::fprintf(f, "%.17g", t);
         for (int i = 0; i < n; ++i) std::fprintf(f, ",%.17g", x[i]);
         for (int j = 0; j < m; ++j) std::fprintf(f, ",%.17g", u[j]);
@@ -157,12 +176,21 @@ int main(int argc, char** argv) {
     std::fclose(f);
 
     double st[lqocp::MAXJ];
-    const int ns = g_solver.switch_times(g_result, st, lqocp::MAXJ);
+    const int ns = general ? g_gsolver.switch_times(g_gresult, st, lqocp::MAXJ)
+                           : g_solver.switch_times(g_result, st, lqocp::MAXJ);
+    const double cost = general ? g_gresult.cost : g_result.cost;
+    const int its = general ? g_gresult.iterations : g_result.iterations;
+    const bool conv = ok && (general ? g_gresult.converged : g_result.converged);
     // JSON has no inf/nan: print null for a non-finite cost (failed or infeasible solve)
-    if (std::isfinite(g_result.cost)) std::printf("{\"cost\": %.17g, \"switch_times\": [", g_result.cost);
+    if (std::isfinite(cost)) std::printf("{\"cost\": %.17g, \"switch_times\": [", cost);
     else std::printf("{\"cost\": null, \"switch_times\": [");
     for (int i = 0; i < ns; ++i) std::printf("%s%.17g", i ? ", " : "", st[i]);
-    std::printf("], \"iterations\": %d, \"solve_time_us\": %.3f, \"converged\": %s, \"method\": \"%s\"}\n",
-                g_result.iterations, us, ok && g_result.converged ? "true" : "false", method.c_str());
+    std::printf("], \"iterations\": %d, \"solve_time_us\": %.3f, \"converged\": %s, \"method\": \"%s\"",
+                its, us, conv ? "true" : "false", method.c_str());
+    if (!conv) {
+        const char* why = general ? g_gresult.failure : "not converged";
+        std::printf(", \"failure\": \"%s\"", why ? why : "not converged");
+    }
+    std::printf("}\n");
     return 0;
 }
