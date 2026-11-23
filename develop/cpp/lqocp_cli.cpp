@@ -10,16 +10,28 @@
 
 #include "case_data.h"
 #include "lqocp.hpp"
+#include "lqocp_state.hpp"
 
 static lqocp::Solver g_solver;   // static storage: no heap, no large stack frame
 static lqocp::Result g_result;
 static lqocp::GSolver g_gsolver; // general cost
 static lqocp::GResult g_gresult;
 static lqocp::BasisBuilder g_basis;
+static lqocp::StateSolver g_ssolver;   // tier 2: state box
+static lqocp::StateResult g_sresult;
+static bool g_hasx = false;
+static double g_xlo[12], g_xhi[12];   // physical-state box (quad_problem.py order)
+
+// physical state i = PHYS_SCALE[i] * flat state PHYS_FLAT[i] (quad_problem.Tf2p: one nonzero per row)
+static const double G2_ = 19.619999999999997, HALF_ = 0.49999999999999994;
+static const int PHYS_FLAT[12] = {0, 4, 8, 6, 2, 10, 1, 5, 9, 7, 3, 11};
+static const double PHYS_SCALE[12] = {1, 1, 1, -1 / G2_, 1 / G2_, 1, 1, 1, 1, -1 / (G2_ * HALF_), 1 / (G2_ * HALF_), 1 / HALF_};
 
 // Problem file: whitespace-separated numbers, '#' starts a comment line.
 //   T, x0 (12), xf (12), has_bounds, [Umap (16, row-major), u_min (4), u_max (4)],
 //   optional: has_cost, Q (144), R (16), has_Qf, [Qf (144)]
+//   optional (tier 2, needs the cost block): has_xbox, x_lo (12), x_hi (12) on the PHYSICAL state
+//   (px py pz phx phy phz vx vy vz wx wy wz; +-inf: none)
 static bool read_problem_file(const char* path, lqocp::Problem& p) {
     std::ifstream in(path);
     if (!in) return false;
@@ -72,6 +84,14 @@ static bool read_problem_file(const char* path, lqocp::Problem& p) {
         p.has_Qf = flag != 0.0;
         if (p.has_Qf)
             for (int i = 0; i < 12; ++i) for (int j = 0; j < 12; ++j) if (!take(p.Qf[i][j])) return false;
+        if (k < v.size()) {
+            if (!take(flag)) return false;
+            g_hasx = flag != 0.0;
+            if (g_hasx) {
+                for (int i = 0; i < 12; ++i) if (!take(g_xlo[i])) return false;
+                for (int i = 0; i < 12; ++i) if (!take(g_xhi[i])) return false;
+            }
+        }
     }
     if (k != v.size()) return false;
     p.has_cost = has_cost;
@@ -137,6 +157,55 @@ int main(int argc, char** argv) {
         return 3;
     }
     bool ok;
+    if (g_hasx) {   // tier 2: energy cost + thrust box + state box
+        double slo[12], shi[12];
+        for (int i = 0; i < 12; ++i) { slo[i] = -HUGE_VAL; shi[i] = HUGE_VAL; }
+        for (int i = 0; i < 12; ++i) {
+            const double a = PHYS_SCALE[i], l = g_xlo[i] / a, h = g_xhi[i] / a;
+            slo[PHYS_FLAT[i]] = a > 0 ? l : h;
+            shi[PHYS_FLAT[i]] = a > 0 ? h : l;
+        }
+        if (!g_ssolver.setup(p, slo, shi)) {
+            std::printf("{\"cost\": null, \"converged\": false, \"failure\": \"setup: %s\"}\n", g_ssolver.setup_failure());
+            return 3;
+        }
+        ok = g_ssolver.solve(g_sresult);
+        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        FILE* f = std::fopen(argv[2], "w");
+        if (!f) { std::fprintf(stderr, "cannot open %s\n", argv[2]); return 1; }
+        std::fprintf(f, "t");
+        for (int i = 0; i < n; ++i) std::fprintf(f, ",x%d", i);
+        for (int j = 0; j < m; ++j) std::fprintf(f, ",u%d", j);
+        std::fprintf(f, "\n");
+        double x[lqocp::MAXN], u[lqocp::MAXM];
+        for (int k = 0; k < 1001; ++k) {
+            const double t = (k == 1000) ? p.T : p.T * k / 1000;
+            g_ssolver.eval_x(g_sresult, t, x);
+            g_ssolver.eval_u(g_sresult, t, u);
+            std::fprintf(f, "%.17g", t);
+            for (int i = 0; i < n; ++i) std::fprintf(f, ",%.17g", x[i]);
+            for (int j = 0; j < m; ++j) std::fprintf(f, ",%.17g", u[j]);
+            std::fprintf(f, "\n");
+        }
+        std::fclose(f);
+        const lqocp::StateResult& r = g_sresult;
+        char seq[512];
+        g_ssolver.sequence(r.S, r.narcs, r.sa, r.nsa, r.tau, seq, sizeof seq);
+        if (ok) std::printf("{\"cost\": %.17g, \"switch_times\": [", r.cost);
+        else std::printf("{\"cost\": null, \"switch_times\": [");
+        for (int i = 0; i + 1 < r.narcs; ++i) std::printf("%s%.17g", i ? ", " : "", r.tau[i]);
+        std::printf("], \"iterations\": %d, \"solve_time_us\": %.3f, \"converged\": %s, \"method\": \"tier2\"",
+                    r.iterations, us, ok ? "true" : "false");
+        std::printf(", \"junction_iterations\": %d, \"inserted\": %d, \"state_arcs\": [", r.outer, r.inserted);
+        for (int q = 0; q < r.nsa; ++q)
+            std::printf("%s{\"chain\": %d, \"side\": %d, \"t1\": %.17g, \"t2\": %.17g}", q ? ", " : "",
+                        r.sa[q].chain, r.sa[q].side, r.sa[q].t1, r.sa[q].t2);
+        std::printf("], \"state_violation\": %.3g, \"sign_violation\": %.3g, \"pmp_violation\": %.3g, \"sequence\": \"%s\"",
+                    r.state_violation, r.sign_violation, r.pmp_violation, seq);
+        if (!ok) std::printf(", \"failure\": \"%s\"", r.failure ? r.failure : "not converged");
+        std::printf("}\n");
+        return 0;
+    }
     if (general) {
         if (!g_gsolver.setup(p, lqocp::BasisBuilder::fn, &g_basis)) {
             std::fprintf(stderr, "problem setup failed (unsupported dimensions or R not SPD)\n");

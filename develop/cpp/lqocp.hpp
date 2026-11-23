@@ -119,6 +119,7 @@ public:
     bool is_general() const { return general_; }
 
 private:
+    friend class StateSolver;        // tier 2 (lqocp_state.hpp) reuses the setup data
     struct Eval {                    // energy newton: evaluation of one iterate c (its ds(T)/dc is in G_)
         int narcs;
         uint16_t S[MAXARC_E];

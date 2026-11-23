@@ -6,7 +6,7 @@
 
 namespace lqocp {
 
-namespace {
+namespace pd {   // polynomial/linear-algebra helpers, shared with lqocp_state.cpp
 
 const double GL_X[4] = {-0.86113631159405257522, -0.33998104358485626480,
                         0.33998104358485626480, 0.86113631159405257522};
@@ -59,8 +59,10 @@ bool lu_solve(T* A, int n, int ld, T* B, int nrhs, int ldb) {
     }
     return true;
 }
+template bool lu_solve<double>(double*, int, int, double*, int, int);
 
-}  // namespace
+}  // namespace pd
+using namespace pd;
 
 bool Solver::setup(const Problem& p) {
     sfail_ = check_problem(p);
@@ -706,7 +708,7 @@ int Solver::switch_times(const Result& R, double* out, int maxout) const {
 // METHOD_NEWTON: Newton on c with exact (grid-free) event detection. Mirrors
 // develop/python/lqocp.py (_NewtonCtx / _solve_newton).
 // =====================================================================================
-namespace {
+namespace pd {
 
 const double EPS = 2.220446049250313e-16;
 
@@ -824,7 +826,7 @@ void crossings(const double* red, int len, int k, double L, double tol, Cross& o
     }
 }
 
-}  // namespace
+}  // namespace pd
 
 bool Solver::valid_set(uint16_t S) const {
     int cnt = 0;

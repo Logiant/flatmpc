@@ -4,8 +4,8 @@ BUILD := build
 
 all: $(BUILD)/lqocp_cli
 
-$(BUILD)/lqocp_cli: lqocp_cli.cpp lqocp.cpp lqocp_basis.cpp lqocp.hpp case_data.h | $(BUILD)
-	$(CXX) $(CXXFLAGS) -o $@ lqocp_cli.cpp lqocp.cpp lqocp_basis.cpp
+$(BUILD)/lqocp_cli: lqocp_cli.cpp lqocp.cpp lqocp_basis.cpp lqocp_state.cpp lqocp.hpp lqocp_state.hpp case_data.h | $(BUILD)
+	$(CXX) $(CXXFLAGS) -o $@ lqocp_cli.cpp lqocp.cpp lqocp_basis.cpp lqocp_state.cpp
 
 $(BUILD):
 	mkdir -p $(BUILD)
