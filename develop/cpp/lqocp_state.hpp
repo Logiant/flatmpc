@@ -76,7 +76,7 @@ private:
     double lo_[MAXM], hi_[MAXM];     // bound on the top state of chain j
     double xlo_[MAXN], xhi_[MAXN];   // all flat-state bounds (relative degree > 1: verified only)
     mutable double hiord_;
-    mutable int hiidx_;
+    mutable int hiidx_, release_;    // release_: fix2 arc whose terminal multiplier has the wrong sign
     int nsa_;                        // working arcs (copied to / from StateResult)
     StateArc sa_[MAXSA];
     int ny_;
@@ -95,7 +95,7 @@ private:
     void cvec(const double* y, double* c) const;
     bool evaluate(const double* y, Ev& e, bool wantH);
     bool inner(double* y, int max_its);
-    bool gres(const double* y, double* g, int* ng, double* vs);
+    bool gres(const double* y, double* g, int* ng, double* vs, double* J = nullptr, double* Z = nullptr);
     bool junctions(double* y, int max_its, int* outer);
     double scan(const double* c, const double* y, int j, int side, double tw, double* twout, double* ta, double* tb) const;
     double check(const double* y, int* wc, int* ws, double* ta, double* tb, double* tw, double* psign, double* ppmp) const;

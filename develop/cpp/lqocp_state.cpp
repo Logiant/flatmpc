@@ -447,7 +447,7 @@ bool StateSolver::inner(double* y, int max_its) {
         for (int i = 0; i < ny; ++i) { slope -= E.F[i] * d[i]; F2 += E.F[i] * E.F[i]; }
         const int nxt = 1 - cur;
         bool acc = false;
-        for (double al = 1.0; al >= 1e-10; al *= 0.5) {
+        for (double al = 1.0; al >= 1e-3; al *= 0.5) {
             for (int i = 0; i < ny; ++i) yn[i] = y[i] + al * d[i];
             if (!evaluate(yn, ev_[nxt], true)) continue;
             const Ev& N = ev_[nxt];
@@ -462,20 +462,33 @@ bool StateSolver::inner(double* y, int max_its) {
     }
 }
 
-// junction residuals v_j(t1-) and v_j(t2+) of the plan in ev_[0]
-bool StateSolver::gres(const double* y, double* g, int* ng, double* vs) {
+// junction residuals v_j(t1-) and v_j(t2+) of the plan in ev_[0] (y converged, H_ its Newton matrix).
+// With J: their exact Jacobian in the free junction times (row-major, ng x ng), by the implicit function
+// theorem through the inner KKT: dg/dth = g_th - g_y H^-1 F_th. For fixed y every piece is a fixed
+// polynomial, so F_th is the jump of the integrand at th (thrust events inside a piece keep v continuous)
+// and g_th = v_j'(th).
+bool StateSolver::gres(const double* y, double* g, int* ng, double* vs, double* J, double* Z) {
+    const Solver& B = base_;
+    const Problem& p = *B.p_;
     const Ev& e = ev_[0];
-    const double T = base_.p_->T;
+    const double T = p.T;
+    const int n = B.n_, ny = n + nsa_;
     double c[MAXN], V[MAXM][4];
     cvec(y, c);
-    int k = 0;
+    int k = 0, nf = 0;
+    for (int q = 0; q < nsa_; ++q) nf += !sa_[q].fix1 + !sa_[q].fix2;
     *vs = 1.0;
     for (int a = 0; a < e.narcs; ++a) {
         double t0, t1;
         span_(e.tau, e.narcs, a, T, &t0, &t1);
         vpoly(e.S, e.tau, e.narcs, a, c, y, sa_, nsa_, V);
-        for (int j = 0; j < base_.m_; ++j) *vs = fmax(*vs, 1.0 + fabs(peval(V[j], t0)));
+        for (int j = 0; j < B.m_; ++j) *vs = fmax(*vs, 1.0 + fabs(peval(V[j], t0)));
     }
+    double Fth[NY * 2 * MAXSA], gy[2 * MAXSA * NY];
+    int li[NY];
+    for (int l = 0; l < B.m_; ++l)
+        for (int r = 0; r < p.orders[l]; ++r) li[B.off_[l] + r] = l;
+    for (int q = 0; q < nsa_; ++q) li[n + q] = sa_[q].chain;
     for (int q = 0; q < nsa_; ++q) {
         const int j = sa_[q].chain;
         for (int side = 0; side < 2; ++side) {
@@ -490,15 +503,72 @@ bool StateSolver::gres(const double* y, double* g, int* ng, double* vs) {
             if (ab < 0 || bd > 1e-12 * T) return false;
             // control continuity: v_j(t1-) = 0, v_j(t2+) = 0 (v_j = 0 on the arc). This is dJ/dtj = 0
             // when the thrust rows active at the junction do not change (NOTES.md 14.2).
-            vpoly(e.S, e.tau, e.narcs, side == 0 ? ab : ab + 1, c, y, sa_, nsa_, V);
-            g[k++] = peval(V[j], tj);
+            if (!J) {
+                vpoly(e.S, e.tau, e.narcs, side == 0 ? ab : ab + 1, c, y, sa_, nsa_, V);
+                g[k++] = peval(V[j], tj);
+                continue;
+            }
+            double vv[2][MAXM], tm[2], Pg[MAXM], gt = 0.0;
+            for (int s = 0; s < 2; ++s) {                // s = 0: arc left of tj, 1: right
+                double t0, t1, Wc[MAXM][4], Pv[MAXM][MAXM], Vv[MAXM][4], phi[2 * MAXM][4], sig[MAXM][4];
+                bool has[2 * MAXM];
+                span_(e.tau, e.narcs, ab + s, T, &t0, &t1);
+                tm[s] = 0.5 * (t0 + t1);
+                wpoly(c, y, sa_, nsa_, tm[s], Wc);
+                if (!kkt(e.S[ab + s], Wc, Pv, Vv, phi, has, sig)) return false;
+                for (int l = 0; l < B.m_; ++l) vv[s][l] = peval(Vv[l], tj);
+                if (s == side) {
+                    for (int l = 0; l < B.m_; ++l) Pg[l] = Pv[j][l];
+                    gt = (3 * Vv[j][3] * tj + 2 * Vv[j][2]) * tj + Vv[j][1];
+                }
+            }
+            g[k] = vv[side][j];
+            for (int i = 0; i < ny; ++i) {               // F_th (column k) and g_y (row k), raw nu coordinates
+                double ci, cl, cr;
+                if (i < n) {
+                    const int r = i - B.off_[li[i]], kk = p.orders[li[i]];
+                    ci = cl = cr = ipow(T - tj, kk - 1 - r) / fact(kk - 1 - r);
+                } else {
+                    const StateArc& s = sa_[i - n];
+                    cl = (!s.fix1 && tm[0] < s.t1) ? 1.0 : 0.0;
+                    cr = (!s.fix1 && tm[1] < s.t1) ? 1.0 : 0.0;
+                    ci = side == 0 ? cl : cr;
+                }
+                Fth[i * 2 * MAXSA + k] = cl * vv[0][li[i]] - cr * vv[1][li[i]];
+                gy[k * NY + i] = Pg[li[i]] * ci;
+            }
+            for (int kk = 0; kk < nf; ++kk) J[k * nf + kk] = 0.0;
+            J[k * nf + k] = gt;
+            ++k;
         }
+    }
+    if (J && k) {
+        if (B.qf_)                                       // y = mu: F_i = mu_i + (Cf F_raw)_i, nu = Cf^T mu
+            for (int i = 0; i < n; ++i)
+                for (int a = 0; a < k; ++a) {
+                    double f = 0.0, h = 0.0;
+                    for (int jj = i; jj < n; ++jj) {
+                        f += B.Cf_[i * MAXN + jj] * Fth[jj * 2 * MAXSA + a];
+                        h += B.Cf_[i * MAXN + jj] * gy[a * NY + jj];
+                    }
+                    Fth[i * 2 * MAXSA + a] = f;      // row i only reads rows >= i: in place, ascending
+                    gy[a * NY + i] = h;
+                }
+        for (int i = 0; i < NY * NY; ++i) A_[i] = H_[i];
+        if (!lu_solve(A_, ny, NY, Fth, k, 2 * MAXSA)) return false;
+        for (int i = 0; i < ny * 2 * MAXSA; ++i) Z[i] = Fth[i];   // dy/dth = -Z
+        for (int a = 0; a < k; ++a)
+            for (int b = 0; b < k; ++b) {
+                double s = 0.0;
+                for (int i = 0; i < ny; ++i) s += gy[a * NY + i] * Fth[i * 2 * MAXSA + b];
+                J[a * k + b] -= s;
+            }
     }
     *ng = k;
     return true;
 }
 
-// Newton (finite-difference Jacobian) on the free junction times: dJ/dt = 0 at each (see gres).
+// Newton (exact Jacobian, gres) on the free junction times: dJ/dt = 0 at each (see gres).
 // false with collapsed_ = q: arc q collapsed (t2 <= t1).
 bool StateSolver::junctions(double* y, int max_its, int* outer) {
     const double T = base_.p_->T;
@@ -510,26 +580,15 @@ bool StateSolver::junctions(double* y, int max_its, int* outer) {
             if (!sa_[q].fix1) tv[nu++] = &sa_[q].t1;
             if (!sa_[q].fix2) tv[nu++] = &sa_[q].t2;
         }
-        double g[2 * MAXSA], vs;
+        double g[2 * MAXSA], vs, J[4 * MAXSA * MAXSA], y0[NY], tau0[2 * MAXSA], d[2 * MAXSA], Z[NY * 2 * MAXSA];
         int ng;
-        if (!gres(y, g, &ng, &vs)) { strcpy(why_, "junction not found in the walk"); return false; }
+        if (!gres(y, g, &ng, &vs, J, Z)) { strcpy(why_, "junction not found in the walk"); return false; }
         double gn = 0.0;
         for (int i = 0; i < ng; ++i) gn = fmax(gn, fabs(g[i]));
         if (gn <= 1e-10 * vs) return true;
         ++*outer;
-        double J[4 * MAXSA * MAXSA], y0[NY], tau0[2 * MAXSA], d[2 * MAXSA];
         for (int i = 0; i < ny; ++i) y0[i] = y[i];
         for (int k = 0; k < nu; ++k) tau0[k] = *tv[k];
-        for (int k = 0; k < nu; ++k) {
-            const double h = 1e-7 * T;
-            *tv[k] = tau0[k] + h;
-            for (int i = 0; i < ny; ++i) y[i] = y0[i];
-            double gk[2 * MAXSA], vk;
-            int nk;
-            if (!inner(y, max_its) || !gres(y, gk, &nk, &vk)) { strcpy(why_, "junction Jacobian failed"); return false; }
-            for (int i = 0; i < ng; ++i) J[i * nu + k] = (gk[i] - g[i]) / h;
-            *tv[k] = tau0[k];
-        }
         // (J^T J + lam I) d = -J^T g with a tiny lam: Newton when J is regular; a junction that does
         // not move its residual (e.g. entry inside a fully saturated arc, where v_j = 0 anyway) stays put
         double N[4 * MAXSA * MAXSA], dm = 0.0;
@@ -546,29 +605,35 @@ bool StateSolver::junctions(double* y, int max_its, int* outer) {
         }
         for (int a = 0; a < nu; ++a) N[a * nu + a] += 1e-10 * dm;
         if (!lu_solve(N, nu, nu, d, 1, 1)) { strcpy(why_, "singular junction Jacobian"); return false; }
-        bool acc = false;
+        bool acc = false, fix2s[MAXSA];
+        for (int q = 0; q < nsa_; ++q) fix2s[q] = sa_[q].fix2;
         for (double al = 1.0; al >= 1.0 / 256; al *= 0.5) {
+            for (int q = 0; q < nsa_; ++q) sa_[q].fix2 = fix2s[q];
             for (int k = 0; k < nu; ++k) *tv[k] = tau0[k] + al * d[k];
             bool bad = false;
             for (int q = 0; q < nsa_; ++q) {
                 StateArc& s = sa_[q];
                 if (!s.fix2 && s.t2 >= T * (1 - 1e-9)) { s.t2 = T; s.fix2 = true; }
                 if (!s.fix1 && s.t1 <= 1e-9 * T) bad = true;
+                for (int o = 0; o < q; ++o)
+                    if (sa_[o].chain == s.chain && s.t1 < sa_[o].t2 && sa_[o].t1 < s.t2) bad = true;
                 if (s.t2 - s.t1 <= 1e-9 * T) {           // collapse only if no shorter step avoids it
                     if (al <= 1.0 / 256) { collapsed_ = q; return false; }
                     bad = true;
                 }
             }
             if (bad) continue;
-            for (int i = 0; i < ny; ++i) y[i] = y0[i];
+            for (int i = 0; i < ny; ++i) {          // first-order predictor dy = -Z dth
+                double s = y0[i];
+                for (int k = 0; k < nu; ++k) s -= Z[i * 2 * MAXSA + k] * al * d[k];
+                y[i] = s;
+            }
             double gt[2 * MAXSA], vt;
             int nt;
-            if (!inner(y, max_its) || !gres(y, gt, &nt, &vt)) continue;
+            if (!inner(y, max_its) || !gres(y, gt, &nt, &vt)) break;   // shorter steps rarely help: fail fast
             double tn = 0.0;
             for (int i = 0; i < nt; ++i) tn = fmax(tn, fabs(gt[i]));
             if (nt != ng || tn < gn) { acc = true; break; }
-            for (int q = 0; q < nsa_; ++q) { sa_[q].fix2 = false; }   // undo a tentative fix2
-            for (int q = 0; q < nsa_; ++q) if (sa_[q].t2 >= T) sa_[q].fix2 = true;
         }
         if (!acc) { strcpy(why_, "junction Newton stalled"); return false; }
     }
@@ -633,6 +698,7 @@ double StateSolver::check(const double* y, int* wc, int* ws, double* ta, double*
     *wc = -1;
     hiord_ = 0.0;
     hiidx_ = -1;
+    release_ = -1;
     for (int j = 0; j < B.m_; ++j)
         for (int side = -1; side <= 1; side += 2) {
             const double b = side > 0 ? hi_[j] : lo_[j];
@@ -672,6 +738,9 @@ double StateSolver::check(const double* y, int* wc, int* ws, double* ta, double*
                 if (xv > 0 && xv < L) { mx = fmax(mx, pval(dd, 3, xv)); mn = fmin(mn, pval(dd, 3, xv)); }
             }
             ps = fmax(ps, (sa_[q].side > 0 ? mx : -mn) / nrm);
+            // arc riding to T: sigma_j(T) is the terminal atom of the multiplier, side * sigma_j(T) >= 0;
+            // otherwise the arc must leave the bound before T
+            if (sa_[q].fix2 && t1 >= T && sa_[q].side * pval(bb, 4, L) < -TOL_SIGN * nrm * T) release_ = q;
         }
     }
     *psign = ps;
@@ -814,6 +883,17 @@ bool StateSolver::run(StateResult& r, int warm) {
         double ta, tb, tw, ps, pp;
         const double viol = check(y, &wc, &ws, &ta, &tb, &tw, &ps, &pp);
         r.state_violation = viol; r.sign_violation = ps; r.pmp_violation = pp;
+        if (release_ >= 0) {                                 // exit before T: free t2 just below T
+            StateArc& s = sa_[release_];
+            s.fix2 = false;
+            s.t2 = T - 1e-2 * (T - s.t1);
+            if (!inner(y, cap)) {
+                strncpy(det, why_, sizeof det - 1); det[sizeof det - 1] = 0;
+                snprintf(why_, sizeof why_, "arc order rejected: release before T on %c (%s)", CH[s.chain], det);
+                why = why_;
+            }
+            continue;
+        }
         if (ps > TOL_SIGN) {
             sequence(ev_[0].S, ev_[0].narcs, sa_, nsa_, ev_[0].tau, seq, sizeof seq);
             snprintf(why_, sizeof why_, "arc order rejected: %s (sign of the state multiplier)", seq);
@@ -904,7 +984,13 @@ bool StateSolver::solve_warm(StateResult& r, int max_its, double shift) {
         if (a.t2 <= 1e-9 * T) continue;                  // ended: drop
         a.t1 -= shift;
         double d = r.y[n + q];
-        if (a.fix1 || a.t1 <= 1e-9 * T) { a.t1 = 0.0; a.fix1 = true; d = 0.0; }
+        if (a.fix1 || a.t1 <= 1e-9 * T) {
+            // starts at 0: only valid with x0 on the bound (no entry condition); otherwise drop it and
+            // let the violation check re-insert it with a free entry
+            const double top = base_.x0_[base_.off_[a.chain] + base_.p_->orders[a.chain] - 1];
+            if (fabs(top - a.b) > TOL_X * (1.0 + fabs(a.b))) continue;
+            a.t1 = 0.0; a.fix1 = true; d = 0.0;
+        }
         r.sa[k] = a;
         r.y[n + k++] = d;
     }
