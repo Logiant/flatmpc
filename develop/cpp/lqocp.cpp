@@ -1281,6 +1281,7 @@ void matvec(const double* M, int n, int ld, const double* v, double* t) {
 }  // namespace
 
 bool GSolver::setup(const Problem& p, BasisFn fn, void* ctx) {
+    setup_failure = "unsupported dimensions";
     if (p.m < 1 || p.m > MAXM || !fn) return false;
     p_ = &p;
     bfn_ = fn;
@@ -1293,7 +1294,20 @@ bool GSolver::setup(const Problem& p, BasisFn fn, void* ctx) {
         n_ += p.orders[j];
         end_[j] = n_ - 1;
     }
-    if (n_ > MAXN || !(p.T > 0.0)) return false;
+    if (n_ > MAXN) return false;
+    setup_failure = "non-finite problem data or T <= 0";   // x0 is checked by set_x0
+    bool fin = p.T > 0.0 && isfinite(p.T);
+    for (int i = 0; i < n_; ++i) {
+        fin = fin && isfinite(p.xf[i]);
+        for (int j = 0; j < n_; ++j)
+            fin = fin && (!p.has_cost || isfinite(p.Q[i][j])) && (!p.has_Qf || isfinite(p.Qf[i][j]));
+    }
+    for (int r = 0; r < m_; ++r) {                     // +-inf bounds disable a side; NaN does not
+        fin = fin && (!p.has_bounds || (p.lo[r] == p.lo[r] && p.hi[r] == p.hi[r]));
+        for (int j = 0; j < m_; ++j) fin = fin && isfinite(p.R[r][j]) && isfinite(p.M[r][j]);
+    }
+    if (!fin) return false;
+    setup_failure = "R not SPD";
     set_x0(p.x0);
     // Cholesky R = Lc Lc^T (symmetrised)
     for (int i = 0; i < m_; ++i)
@@ -1338,6 +1352,7 @@ bool GSolver::setup(const Problem& p, BasisFn fn, void* ctx) {
     R_ = 1.0 + mx;
     nsets_ = 0;
     for_sets([&](uint16_t) { ++nsets_; return false; });
+    setup_failure = nullptr;
     return true;
 }
 
@@ -3118,7 +3133,8 @@ bool GSolver::cold(GResult& R, int max_its) {
     bool conv = false;
     const char* why = nullptr;
     if (!bvp(aseq_, 1, atau_)) {
-        R.failure = bfail() ? bfail() : "linear BVP singular (infeasible endpoint?)";
+        R.failure = bfail() ? bfail() : p_->has_Qf ? "linear BVP singular (ill-conditioned data?)"
+                                                   : "linear BVP singular (infeasible endpoint?)";
         return false;
     }
     if (!p_->has_bounds) {
@@ -3142,8 +3158,9 @@ bool GSolver::cold(GResult& R, int max_its) {
             for (;;) {
                 if (kap == 1.0) { conv = true; break; }
                 if (budget_ <= 0) { why = "iteration cap reached"; break; }
-                if (dl < DL_MIN) { why = "homotopy stalled at bound scale > 1 (bounds infeasible?)"; break; }
-                if (zmax(aseq_, an_, atau_) > 1e8 * (1.0 + z0)) { why = "costate diverged (bounds infeasible?)"; break; }
+                if (dl < DL_MIN) { why = p_->has_Qf ? "homotopy stalled at bound scale > 1 (ill-conditioned: |x0| too large?)"
+                                                  : "homotopy stalled at bound scale > 1 (bounds infeasible?)"; break; }
+                if (zmax(aseq_, an_, atau_) > 1e8 * (1.0 + z0)) { why = p_->has_Qf ? "costate diverged (ill-conditioned: |x0| too large?)" : "costate diverged (bounds infeasible?)"; break; }
                 const int sn = an_;
                 for (int i = 0; i < sn; ++i) sseq[i] = aseq_[i];
                 for (int i = 0; i + 1 < sn; ++i) stau[i] = atau_[i];

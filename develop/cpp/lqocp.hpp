@@ -243,7 +243,9 @@ struct GResult {
 class GSolver {
 public:
     // p must stay alive (it is referenced, not copied). R = Lc Lc^T must be SPD.
+    // On false, setup_failure says why (bad dimensions, non-finite data, R not SPD).
     bool setup(const Problem& p, BasisFn fn, void* ctx);
+    const char* setup_failure = nullptr;
     bool solve(GResult& r);
     // MPC warm start from the previous solution in r (x0 updated in the Problem; junction times
     // shifted by -dt); at most max_its Newton iterations (then r is the current iterate)
