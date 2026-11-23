@@ -260,7 +260,7 @@ bool StateSolver::walk(const double* c, const double* y, Ev& e) const {
                 double b[4], red[4];
                 int kk;
                 shift(phi[key], 4, t, b);
-                const double tol = 1e-12 * (pscale(b, 4, L) + B.R_);
+                const double tol = 1e-12 * (pscale(b, 4, T) + B.R_);   // as the tier-1 walk (energy-float 71b3166): no stall on a tiny last arc
                 const int rl = strip(b, 4, L, tol, red, &kk);
                 if (rl == 0) continue;
                 if (red[0] > 0) { evk[key] = true; rootk[key] = 0.0; simplek[key] = false; s1 = 0.0; continue; }
