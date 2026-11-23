@@ -2455,6 +2455,7 @@ bool GSolver::fstep(const Arc& a, int nb) {
     const SetBasis& b = *a.b;
     const int n = n_, n2 = 2 * n, ns = b.ns, nc = b.nc, s1 = ns + nc;
     const int c1 = N2 + 1 + nb;
+    if (nc == n2) { vstep(a); return ortho(c1); }
     double E[4], eu[N2];
     for (int i = s1; i < n2;) {                        // e^{-Lu L}: (e) or (e cos, e sin) per block
         const int sz = mblk(b.re, b.im, i, -a.L, E);
@@ -2519,7 +2520,50 @@ bool GSolver::fstep(const Arc& a, int nb) {
         i += sz;
     }
     relmul(rel_, n, b.Wi, n2);                         // back to z: eta = Wi z
-    // re-orthonormalise the rows (modified Gram-Schmidt, twice), same ops on rhs/sensitivities
+    return ortho(c1);
+}
+
+// Vertex arc (every channel fixed: P = 0, H = [[A, 0], [-Q, -A^T]] nilpotent, forcing f = (Bt q, 0)),
+// in z directly: C' = C e^{-HL} = sum_k w_k, w_k = C (-HL)^k / k!, d' = d + sum_k (w_k f) L / (k + 1)
+// (= C int_0^L e^{-Hs} f ds). Finite sums: w_k = 0 for k >= the nilpotency index (<= 2 n).
+void GSolver::vstep(const Arc& a) {
+    const int n = n_, n2 = 2 * n;
+    double f[MAXM];
+    for (int j = 0; j < m_; ++j) {
+        double s = 0.0;
+        for (int k = 0; k < m_; ++k) s += LiT_[j][k] * a.q[k];
+        f[j] = s;                                      // (Bt q) at row end_[j]
+    }
+    for (int r = 0; r < n; ++r) {
+        double* row = rel_[r];
+        double w[N2], v[N2], d = row[N2];
+        for (int j = 0; j < n2; ++j) w[j] = row[j];
+        for (int k = 0; k <= n2; ++k) {
+            double wf = 0.0, nz = 0.0;
+            for (int j = 0; j < m_; ++j) wf += w[end_[j]] * f[j];
+            d += wf * a.L / (k + 1);
+            if (k) for (int j = 0; j < n2; ++j) row[j] += w[j];
+            for (int j = 0; j < n2; ++j) v[j] = 0.0;   // v = w H: s-part w_s A - w_l Q, l-part -w_l A^T
+            for (int i = 0; i < n; ++i)
+                if (w[n + i] != 0.0)                   // (w_l vanishes after the longest chain's steps)
+                    for (int j = 0; j < n; ++j) v[j] -= w[n + i] * 0.5 * (p_->Q[i][j] + p_->Q[j][i]);
+            for (int j = 0; j < m_; ++j)
+                for (int q = 0; q + 1 < p_->orders[j]; ++q) {
+                    const int i = off_[j] + q;
+                    v[i + 1] += w[i];
+                    v[n + i] -= w[n + i + 1];
+                }
+            const double c = -a.L / (k + 1);
+            for (int j = 0; j < n2; ++j) { w[j] = c * v[j]; nz += fabs(w[j]); }
+            if (nz == 0.0) break;
+        }
+        row[N2] = d;
+    }
+}
+
+// re-orthonormalise the relation rows (modified Gram-Schmidt, twice), same ops on rhs/sensitivities
+bool GSolver::ortho(int c1) {
+    const int n = n_, n2 = 2 * n;
     for (int i = 0; i < n; ++i) {
         for (int pass = 0; pass < 2; ++pass)
             for (int k = 0; k < i; ++k) {

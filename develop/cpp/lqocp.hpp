@@ -383,6 +383,8 @@ private:
     double gmax_ratio(const uint16_t* seq, int N, const double* tau);
     void init_rel();
     bool fstep(const Arc& a, int nb);
+    void vstep(const Arc& a);
+    bool ortho(int c1);
     void jump(const uint16_t* seq, int N, const double* tau, int j, double* D) const;
     void inject(int k, int b0, int nb);
     bool advance(const uint16_t* seq, int N, const double* tau, int k, int b0, int nb);
