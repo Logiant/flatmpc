@@ -88,8 +88,9 @@ struct Result {
     real c[MAXN];                  // energy: coefficients of the switching polynomial w(t)
     real mu[MAXN];                 // energy with Qf (newton): dual iterate, nu = Cf^T mu, c = Lm nu
     real cost;
-    int iterations;                  // tau: BC solves + Newton its; newton: Newton iterations
-    int newton_iterations;
+    int iterations;                  // tau: BC solves + Newton its; newton: Newton iterations (warm:
+                                     // switch-time + dual Newton iterations)
+    int newton_iterations;           // dual Newton iterations
     int outer_iterations;
     real residual;                 // tau: junction residual; newton: |F|_inf / terminal residual
     real pmp_violation;            // max violation of the optimality conditions found
@@ -97,6 +98,7 @@ struct Result {
     int degenerate_events;
     bool box_fast_path;
     bool converged;
+    bool reduced;                    // warm step solved on the previous pattern (switch-time Newton)
     const char* failure;             // short reason when not converged (else nullptr)
 };
 
@@ -106,8 +108,10 @@ public:
     bool setup(const Problem& p);
     // Returns r.converged. A general cost returns false (use GSolver).
     bool solve(Result& r, int method = METHOD_NEWTON);
-    // MPC warm start (newton): from the previous r.c / r.mu, at most max_its Newton iterations
-    // (then r is the current iterate; its v = Proj(w) is feasible). Update x0 with set_x0 first.
+    // MPC warm start (newton): first Newton on the switch times of the previous pattern r.S (at most
+    // min(max_its, 4) iterations, accepted only if verified; r.reduced), else the dual Newton from the
+    // previous r.c / r.mu with at most max_its iterations (then r is the current iterate; its
+    // v = Proj(w) is feasible). Update x0 with set_x0 first.
     bool solve_warm(Result& r, int max_its);
     bool set_x0(const double* x0);   // false if x0 is not finite
     // mean u on [t0, t1] (what a zero-order hold should apply); false: no plan
@@ -185,6 +189,13 @@ private:
 #endif
     bool start(Result& r, int method, int warm_its);
     bool solve_newton(Result& r, int warm_its);
+    __attribute__((noinline)) bool try_reduced(Result& r, int max_its);
+    __attribute__((noinline)) bool solve_reduced(Result& r, int max_its, int* its);
+    __attribute__((noinline)) real gapk(uint16_t SL, uint16_t SR, real t, const real* c, real* e, real* gd,
+                                        real* gs) const;
+    __attribute__((noinline)) void swjac(uint16_t SL, uint16_t SR, real t, const real* c, real g, real gd,
+                                         const real* e, real* d) const;
+    real vtol(real amp) const;
     void row_polys(uint16_t S, const real* c, real phi[2 * MAXM][4], bool has[2 * MAXM]) const;
     bool lex_ok(uint16_t S, const real* c, real t, real phi[2 * MAXM][4], bool has[2 * MAXM]) const;
     bool lex_set(const real* c, real t, uint16_t guess, uint16_t* out, real phi[2 * MAXM][4],

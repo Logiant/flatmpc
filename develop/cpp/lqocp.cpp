@@ -520,6 +520,7 @@ bool Solver::start(Result& R, int method, int warm_its) {
     R.backtracks = 0;
     R.degenerate_events = 0;
     R.box_fast_path = false;
+    R.reduced = false;
     capfail_ = false;
     if (method == METHOD_NEWTON) return solve_newton(R, warm_its);
 #ifdef LQOCP_NO_TAU
@@ -1091,7 +1092,9 @@ real Solver::verify(const uint16_t* S, const real* tau, int n, const real* c, re
 
 // warm_its < 0: cold start (unconstrained solution; mu = 0 with Qf), else from R.c / R.mu.
 bool Solver::solve_newton(Result& R, int warm_its) {
-    R.iterations = R.newton_iterations = R.outer_iterations = 0;
+    R.iterations = 0;                             // warm: first the previous pattern (NOTES 13.7)
+    if (warm_its >= 0 && try_reduced(R, warm_its < 4 ? warm_its : 4)) return true;
+    R.newton_iterations = R.outer_iterations = 0;
     R.residual = HUGE_VAL;
     R.pmp_violation = HUGE_VAL;
     R.box_fast_path = identity_;
@@ -1220,7 +1223,8 @@ bool Solver::solve_newton(Result& R, int warm_its) {
         for (int i = 0; i < n_; ++i) { c[i] = cn[i]; if (qf_) mu[i] = mun[i]; }
         cur = nxt;
     }
-    R.iterations = R.newton_iterations = its;
+    R.newton_iterations = its;
+    R.iterations += its;                          // plus a failed reduced attempt's iterations
     if (!ok) { R.failure = capfail_ ? CAPFAIL : why; return false; }
     const Eval& E = ew_.ev[cur];
     R.narcs = E.narcs;
@@ -1232,15 +1236,197 @@ bool Solver::solve_newton(Result& R, int warm_its) {
     R.degenerate_events = E.ndeg;
     real amp;
     R.pmp_violation = verify(R.S, R.tau, R.narcs, R.c, &amp);
-    // float: the walk's own event tolerance (round-off of the monomial row polynomials)
-    const real vtol = sizeof(real) == 4 ? 1e-12 * TS * (amp + R_) : 1e-9 * R_;
-    if (conv && R.pmp_violation > vtol) { conv = false; why = "PMP verification failed"; }
+    if (conv && R.pmp_violation > vtol(amp)) { conv = false; why = "PMP verification failed"; }
     R.cost = cost(R.S, R.tau, R.narcs, R.c);
     R.converged = conv;
     R.failure = conv ? nullptr : capfail_ ? CAPFAIL : why;
     return conv;
 }
 
+// float: the walk's own event tolerance (round-off of the monomial row polynomials)
+real Solver::vtol(real amp) const { return sizeof(real) == 4 ? 1e-12 * TS * (amp + R_) : 1e-9 * R_; }
+
+// Switch between arcs SL and SR (one row toggles): the row's gap on the side where it is
+// inactive, g(t) = e^T w(t) + g0. Control continuity at the switch <=> g = 0. gd = dg/dt,
+// gs = magnitude of g's terms (tolerance scale).
+real Solver::gapk(uint16_t SL, uint16_t SR, real t, const real* c, real* e, real* gd, real* gs) const {
+    const uint16_t X = (uint16_t)(SL ^ SR);
+    int key = 0;
+    while (!(X & (1u << key))) ++key;
+    real P[MAXM][MAXM], q[MAXM], rho[MAXM], w[MAXM];
+    pq((SR & X) ? SL : SR, P, q);
+    for (int i = 0; i < m_; ++i) {                  // rows act on vt = Lc^T v
+        real s = rI_ ? rows_[key][i] : 0.0;
+        if (!rI_) for (int j = 0; j <= i; ++j) s += Lc_[i][j] * rows_[key][j];
+        rho[i] = s;
+    }
+    w_of(c, t, w);
+    real g = -rhs_[key], a = fabs(rhs_[key]), d = 0.0;
+    for (int i = 0; i < m_; ++i) { g += rho[i] * q[i]; a += fabs(rho[i] * q[i]); }
+    for (int j = 0; j < m_; ++j) {
+        real ej = 0.0, wd = 0.0, tp = 1.0;
+        for (int i = 0; i < m_; ++i) ej += rho[i] * P[i][j];
+        for (int p = 1; p < p_->orders[j]; ++p) { wd += p * c[off_[j] + p] * tp; tp *= t; }
+        e[j] = ej;
+        g += ej * w[j];
+        a += fabs(ej * w[j]);
+        d += ej * wd;
+    }
+    *gd = d;
+    *gs = a;
+    return g;
+}
+
+// Warm step on the previous pattern: accepted if the reduced Newton converges and verify passes
+// (then R is the solution); else R.iterations = the reduced iterations spent, R otherwise unchanged.
+bool Solver::try_reduced(Result& R, int max_its) {
+    if (!solve_reduced(R, max_its, &R.iterations)) return false;
+    real amp;
+    const real viol = verify(R.S, ew_.ev[1].tau, R.narcs, ew_.ev[1].F, &amp);
+    if (!(viol <= vtol(amp))) return false;
+    for (int i = 0; i < n_; ++i) { R.c[i] = ew_.ev[1].F[i]; if (qf_) R.mu[i] = ew_.ev[0].F[i]; }
+    for (int k = 0; k + 1 < R.narcs; ++k) R.tau[k] = ew_.ev[1].tau[k];
+    R.newton_iterations = R.outer_iterations = R.degenerate_events = 0;
+    R.box_fast_path = identity_;
+    R.residual = ew_.ev[1].D;
+    R.pmp_violation = viol;
+    R.cost = cost(R.S, R.tau, R.narcs, R.c);
+    R.converged = R.reduced = true;
+    R.failure = nullptr;
+    return true;
+}
+
+// Switch at t between arcs SL and SR: its tau-elimination term in the reduced Newton system,
+// W_ -= qk a^T and d += qk g, with qk = Qh ds(T)/dtau / gd, ds(T)/dtau = K(T - t)(v_SL - v_SR) and
+// a = dg/dc (entries e_j t^p).
+void Solver::swjac(uint16_t SL, uint16_t SR, real t, const real* c, real g, real gd, const real* e,
+                   real* d) const {
+    real dv[MAXM];
+    {                                                 // own scope: stack shared with qk
+        real P[MAXM][MAXM], q[MAXM], vr[MAXM];
+        pq(SL, P, q);
+        v_on(P, q, c, t, dv);
+        pq(SR, P, q);
+        v_on(P, q, c, t, vr);
+        for (int l = 0; l < m_; ++l) dv[l] -= vr[l];
+    }
+    const real T = (real)p_->T;
+    real qk[MAXN];
+    for (int i = 0; i < n_; ++i) qk[i] = 0.0;
+    for (int l = 0; l < m_; ++l) {
+        const int ko = p_->orders[l];
+        for (int r = 0; r < ko; ++r) {
+            const real ks = ipow(T - t, ko - 1 - r) / fact(ko - 1 - r) * dv[l];
+            const int col = off_[l] + r;
+            if (!qf_) qk[col] += ks;
+            else for (int i = 0; i < n_; ++i) qk[i] += (real)p_->Qf[i][col] * ks;
+        }
+    }
+    for (int i = 0; i < n_; ++i) { qk[i] /= gd; d[i] += qk[i] * g; }
+    for (int j = 0; j < m_; ++j) {
+        real tp = 1.0;
+        for (int p = 0; p < p_->orders[j]; ++p, tp *= t)
+            for (int i = 0; i < n_; ++i) W_[i * MAXN + off_[j] + p] -= qk[i] * e[j] * tp;
+    }
+}
+
+// MPC warm step on the previous plan's pattern R.S (arXiv 2211.05251 style): the unknowns are the
+// switch times; the conditions are the terminal conditions (linear in c) and control continuity
+// at each switch (gap of the toggled row = 0). Newton on (c, tau) with tau eliminated per switch:
+//   [L0 + Qh G - sum_k Qh ks_k a_k^T / gd_k] dc = -E1 + sum_k Qh ks_k g_k / gd_k,
+//   dtau_k = -(g_k + a_k^T dc) / gd_k,
+// with E1 = L0 c + Qh (s(T) - xf) (L0 = Lm^-1, Qh = Qf; fixed endpoint: L0 = 0, Qh = I),
+// ks_k = ds(T)/dtau_k, a_k = dg_k/dc. No walk. On convergence returns true with the candidate in
+// scratch (c: ev[1].F, tau: ev[1].tau, mu: ev[0].F, residual: ev[1].D); the caller accepts it only
+// if verify passes (exact row maxima per arc: gaps <= 0, multipliers >= 0). R is not modified.
+bool Solver::solve_reduced(Result& R, int max_its, int* its) {
+    const int n = R.narcs, nj = n - 1;
+    *its = 0;
+    if (n < 1 || max_its < 1) return false;
+    for (int k = 0; k < nj; ++k) {
+        const uint16_t X = (uint16_t)(R.S[k] ^ R.S[k + 1]);
+        if (!X || (X & (X - 1))) return false;         // a simultaneous switch: walk it
+    }
+    const real T = (real)p_->T, gap = 1e-9 * T;
+    const real rtol = sizeof(real) == 4 ? EPS : 1e-12;
+    // scratch: trial c and tau in ev[1]; h in ev[0].F; per switch g_k/gd_k in ev[0].tau and
+    // e_k/gd_k in G_ (free once the Newton matrix is built)
+    real* const tau = ew_.ev[1].tau, * const c = ew_.ev[1].F, * const h = ew_.ev[0].F;
+    real* const sk = ew_.ev[0].tau, * const ek = G_;
+    for (int k = 0; k < nj; ++k) tau[k] = R.tau[k];
+    for (int i = 0; i < n_; ++i) c[i] = R.c[i];
+    real d[MAXN], E1[MAXN], e[MAXM], gd, gs;
+    bool fresh = false;                               // G_ and h hold ds(T)/dc and s(T) - G c at tau
+    for (;;) {
+        if (!fresh) assemble(R.S, tau, n, G_, h);
+        fresh = nj == 0;                              // tau fixed and G_ kept only without switches
+        real sc = 1.0, sc1 = 1.0, En = 0.0, Gn = 0.0;
+        for (int i = 0; i < n_; ++i) {                // d = xf - s(T)
+            real gc = 0.0, a = 0.0;
+            for (int j = 0; j < n_; ++j) { gc += G_[i * MAXN + j] * c[j]; a += fabs(G_[i * MAXN + j] * c[j]); }
+            d[i] = (real)p_->xf[i] - gc - h[i];
+            sc = fmax(sc, fmax(fabs((real)p_->xf[i]), fabs(free_[i])));
+            sc = fmax(sc, a + fabs(h[i] - free_[i]));
+        }
+        for (int i = 0; i < n_; ++i) {
+            real f = qf_ ? 0.0 : -d[i], a = qf_ ? 0.0 : sc;
+            for (int j = 0; j < n_ && qf_; ++j) {
+                f += Linv_[i * MAXN + j] * c[j] - (real)p_->Qf[i][j] * d[j];
+                a += fabs(Linv_[i * MAXN + j] * c[j]) + fabs((real)p_->Qf[i][j]) * sc;
+            }
+            E1[i] = f;
+            En = fmax(En, fabs(f));
+            sc1 = fmax(sc1, a);
+        }
+        bool conv = En <= rtol * sc1;
+        for (int k = 0; k < nj && conv; ++k) {
+            const real g = gapk(R.S[k], R.S[k + 1], tau[k], c, e, &gd, &gs);
+            Gn = fmax(Gn, fabs(g));
+            conv = fabs(g) <= 1e-12 * TS * (gs + R_);
+        }
+        if (conv) {
+            for (int i = 0; i < n_ && qf_; ++i) {       // dual iterate mu = Cf (xf - s(T)) (h is dead)
+                real m = 0.0;
+                for (int j = i; j < n_; ++j) m += Cf_[i * MAXN + j] * d[j];
+                h[i] = m;
+            }
+            ew_.ev[1].D = fmax(En, Gn);
+            return true;
+        }
+        if (*its >= max_its) return false;
+        ++*its;
+        for (int i = 0; i < n_; ++i) {                // Newton matrix L0 + Qh G in W_ (then G_ is free)
+            for (int j = 0; j < n_; ++j) {
+                real t = qf_ ? Linv_[i * MAXN + j] : G_[i * MAXN + j];
+                for (int k = 0; k < n_ && qf_; ++k) t += (real)p_->Qf[i][k] * G_[k * MAXN + j];
+                W_[i * MAXN + j] = t;
+            }
+            d[i] = -E1[i];
+        }
+        for (int k = 0; k < nj; ++k) {
+            const real g = gapk(R.S[k], R.S[k + 1], tau[k], c, e, &gd, &gs);
+            if (!(fabs(gd) * T > 1e-12 * TS * (gs + R_))) return false;   // tangential switch
+            swjac(R.S[k], R.S[k + 1], tau[k], c, g, gd, e, d);
+            for (int j = 0; j < m_; ++j) ek[k * MAXM + j] = e[j] / gd;
+            sk[k] = g / gd;
+        }
+        if (!lu_solve(W_, n_, MAXN, d, 1, 1)) return false;
+        for (int k = 0; k < nj; ++k) {
+            real ad = 0.0;
+            for (int j = 0; j < m_; ++j) {
+                real tp = 1.0, wj = 0.0;
+                for (int p = 0; p < p_->orders[j]; ++p, tp *= tau[k]) wj += d[off_[j] + p] * tp;
+                ad += ek[k * MAXM + j] * wj;
+            }
+            tau[k] -= sk[k] + ad;
+        }
+        for (int k = 0; k <= nj; ++k) {                // arcs keep a positive length: else the pattern changed
+            const real lo = k ? tau[k - 1] : 0.0, hi = k < nj ? tau[k] : T;
+            if (!(hi - lo > gap)) return false;
+        }
+        for (int i = 0; i < n_; ++i) c[i] += d[i];
+    }
+}
 
 // =====================================================================================
 // General LQ cost: GSolver (NOTES.md sections 9 and 10). R-scaled inputs vt = Lc^T v,
