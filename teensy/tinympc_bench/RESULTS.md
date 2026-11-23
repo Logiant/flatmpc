@@ -24,7 +24,7 @@ Cold solves repeated 3x, spread < 0.01 %.
 Per-iteration cost in the closed loop is a little lower (154 to 162 µs double, 89 to 93 µs float) because of the
 fixed per-solve overhead spread over few iterations; a 1-iteration step costs ~97 µs (double) / ~57 µs (float).
 
-PC cross-check (`compare/audit/build/hover_driver fix=1 dev=1`, x86 double, same problem in deviation coordinates):
+PC cross-check (host driver, x86 double, same problem in deviation coordinates):
 cold 5754 iterations (Teensy double: identical), cap 100 closed loop 1137 total, cap 5 closed loop 305 total
 (Teensy: 1143 / 308, small drift from different floating-point rounding on ARM). Note: the upstream 882 (closed loop)
 and ~5.4k (cold, 5402) figures in `ablation.out` are absolute coordinates and, for 882, WITHOUT the rho fix;

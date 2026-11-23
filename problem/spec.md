@@ -1,6 +1,6 @@
-# Shared problem spec and interface contract
+# Problem specification and solver interface
 
-Both `develop/` and `validate/` work from this file and `problem/quad_problem.py`. Neither may edit them.
+The solver (`develop/`) and the validation suite (`validate/`) both use this file and `problem/quad_problem.py`.
 
 ## Model
 Crazyflie quadrotor linearized about hover (TinyMPC 20 Hz model, `quadrotor_20hz_params.hpp`),
@@ -96,7 +96,7 @@ Everything derived from Umap changes: case B's motor bounds, TINY_CASE's R_flat,
 Case B is now T = 1 s with |u_i| <= 0.5 (|u_i| <= 0.3 is infeasible with the correct Umap).
 The math of all earlier results is unaffected: they were correct solutions for the polytope given by the old Umap.
 
-## Revision 5 (TINY_CASE matches TinyMPC exactly; from compare/audit/AUDIT.md)
+## Revision 5 (TINY_CASE matches TinyMPC exactly; from a formulation audit of the TinyMPC comparison)
 - Horizon: TinyMPC's N counts knot points (N states, N-1 inputs), so N = 10 at dt = 0.05 is T = 0.45 s.
 - Terminal cost: TinyMPC always uses its cached Pinf. The equivalent continuous terminal weight is
   QF_TINY_PHYS = dt * (DARE(Ad, Bd, Q + rho I, R + rho I) - rho I), with rho = 5, mapped to flat coordinates.

@@ -16,8 +16,8 @@ polynomial roots. It does not discretize the problem in time. The goal is a solv
 | Tier | Problem | C++ class | Status |
 |---|---|---|---|
 | 1 | Energy cost + input box (Q = 0, terminal cost or fixed endpoint) | `lqocp::Solver` | Done. Dual Newton (cold) plus Newton on the switch times (warm MPC steps); double and float |
-| 2 | Tier 1 + first-order state box (rates, z speed) | `lqocp::StateSolver` | Works when it converges; robustness in progress (`HEURISTIC_NOTES.md`) |
-| 3 | General LQ cost (Q ≠ 0) | `lqocp::GSolver` | Works; slower than TinyMPC; fails for very small Q (`develop/NOTES.md` §15.3) |
+| 2 | Tier 1 + first-order state box (rates, z speed) | `lqocp::StateSolver` | Works when it converges; robustness in progress (homotopy + Newton) |
+| 3 | General LQ cost (Q ≠ 0) | `lqocp::GSolver` | Works; slower than TinyMPC; fails for very small Q |
 
 ## Tier 1 on a Teensy 4.1 (matched problem, 100-step MPC closed loop)
 Both solvers solve the same problem: TinyMPC's hover model with Q = 0, TinyMPC's own terminal weight, |u| ≤ 0.5 and
@@ -31,16 +31,16 @@ no state bounds.
 | TinyMPC 0.0.8, float | 188 ms | 1.10 ms | 21 ms | | |
 
 Our closed loop converges at all 100 steps. TinyMPC converges at 84 and lets the applied input exceed the box slightly.
-Details and the fairness argument are in `develop/NOTES.md` §13.
+Fairness: with Q = 0, TinyMPC's discrete problem is exactly ours restricted to zero-order-hold inputs, and its cold
+solution matches the exact discrete optimum. Both closed loops use the same exact plant, initial state and cost scoring.
 
 ## Layout
 | Folder | Contents |
 |---|---|
 | `problem/` | Shared problem data (Crazyflie hover model from TinyMPC) and the interface spec |
-| `develop/` | Solver: Python reference (`python/`) and embeddable C++ (`cpp/`, no heap, fixed-size arrays); tier-2 prototype tools (`tier2/`); design notes and results (`NOTES.md`) |
+| `develop/` | Solver: Python reference (`python/`) and embeddable C++ (`cpp/`, no heap, fixed-size arrays) |
 | `validate/` | Independent validation suite (`run_all.sh`) |
 | `compare/` | Host benchmark against TinyMPC and OSQP on the same problem; `audit/` checks the formulation |
-| `sidebar/`, `HEURISTIC_NOTES.md` | Arc-sequence heuristics: where greedy arc selection fails, activation-order observations |
 | `teensy/` | PlatformIO projects: `lqocp_bench` (ours; envs `energy`, `energy_float`, `tier2`, `tiny_*`), `tinympc_bench` (TinyMPC; matched envs `double_q0_nox`, `float_q0_nox`), `mpc_bench` (ideal-model closed loop and TinyMPC knot sweep), `size_xmcu` (size-only builds for Cortex-M0+/M4F), `tinympc_size` |
 
 ## How to run

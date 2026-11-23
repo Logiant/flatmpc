@@ -153,7 +153,7 @@ TINY_DT = 0.05
 TINY_N = 10          # TinyMPC knot points: 10 states, 9 inputs -> horizon (N-1)*dt = 0.45 s
 TINY_RHO = 5.0       # rho in TinyMPC's quadrotor_hovering example
 
-# Revision 5 (audit, compare/audit/AUDIT.md): TinyMPC's terminal cost is its cached infinite-horizon
+# Revision 5 (formulation audit of the TinyMPC comparison): TinyMPC's terminal cost is its cached infinite-horizon
 # Pinf = DARE(Ad, Bd, Q + rho I, R + rho I), with effective terminal weight Pinf - rho I, in per-step units.
 # In our continuous cost units (TinyMPC's sum ~ (1/dt) * integral), the equivalent terminal weight is:
 from scipy.linalg import solve_discrete_are
