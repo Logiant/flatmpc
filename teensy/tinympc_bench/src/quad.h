@@ -29,18 +29,26 @@ static const tinytype B_rm[NX * NU] = {
  -13.8353509,15.2139209,13.8784751,-15.2570451,
  0.9873856,-0.3611820,-1.3921880,0.7659845};
 static const tinytype Q_d[NX] = {100,100,100,4,4,400,4,4,4,2.0408163,2.0408163,4.0};
+#ifdef Q_ZERO   // "easy" case: stage Q = 0 (TinyMPC's terminal Pinf then comes from Q = 0 too)
+static const tinytype Q_stage[NX] = {0};
+#else
+static const tinytype *const Q_stage = Q_d;
+#endif
 static const tinytype X0[NX] = {0,1,-2,0.2,0,0,0.1,0,0,0,0,0};
 
 static TinySolver *quad_setup() {
     typedef Matrix<tinytype, Dynamic, Dynamic, RowMajor> RM;
     tinyMatrix A = Map<const RM>(A_rm, NX, NX), B = Map<const RM>(B_rm, NX, NU);
     tinyMatrix f = tinyMatrix::Zero(NX, 1);
-    tinyMatrix Q = Map<const tinyVector>(Q_d, NX).asDiagonal();
+    tinyMatrix Q = Map<const tinyVector>(Q_stage, NX).asDiagonal();
     tinyMatrix R = tinytype(4) * tinyMatrix::Identity(NU, NU);
     TinySolver *s = nullptr;
     if (tiny_setup(&s, A, B, f, Q, R, 5.0, NX, NU, NH, 0)) return nullptr;
     tiny_set_bound_constraints(s, tinyMatrix::Constant(NX, NH, tinytype(-5)), tinyMatrix::Constant(NX, NH, tinytype(5)),
                                tinyMatrix::Constant(NU, NH - 1, tinytype(-0.5)), tinyMatrix::Constant(NU, NH - 1, tinytype(0.5)));
+#ifdef NO_XBOUND   // input bounds only (matches our energy + control-constraint problem)
+    s->settings->en_state_bound = 0;
+#endif
     s->settings->max_iter = 100;
     return s;
 }
