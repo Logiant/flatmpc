@@ -1087,6 +1087,7 @@ namespace {
 
 const double GTOL = 1e-12;           // junction residual tolerance (relative to R)
 const double STOL = 1e-9;            // walked vs Newton junction times (relative to T)
+const double WRESET = 0.3;          // warm start: a capped plan violating PMP by > WRESET*R restarts cold
 const double VTOL = 1e-9;            // PMP verification tolerance (relative to R)
 
 // exp and log without libm's lookup tables (a Teensy keeps those in RAM)
@@ -3191,9 +3192,11 @@ bool GSolver::cold(GResult& R, int max_its) {
 // tau and the exact walk at the true bounds: no homotopy. If that fails with iterations left, the
 // cold solve (homotopy) takes over. At most max_its Newton iterations in all; when the cap is hit,
 // R is the current iterate (it satisfies the dynamics and both boundary conditions) with
-// converged = false.
+// converged = false. A previous plan that is not converged and violates PMP by more than WRESET*R
+// (a stale active set asking for inputs far outside the box) is not reused: cold restart.
 bool GSolver::solve_warm(GResult& R, double dt, int max_its) {
-    if (R.narcs < 1 || R.narcs > NA || !x0ok_) return cold(R, max_its);
+    if (R.narcs < 1 || R.narcs > NA || !x0ok_ || (!R.converged && !(R.pmp_violation <= WRESET * R_)))
+        return cold(R, max_its);
     const double T = p_->T;
     an_ = 0;
     for (int k = 0; k < R.narcs; ++k) {
