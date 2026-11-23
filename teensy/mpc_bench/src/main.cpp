@@ -155,7 +155,6 @@ static bool ours_solve(int tier, int k, int cap, int* its) {
         *its = er.iterations;
     } else {
         ok = (k == 0) ? ss.solve(sr) : ss.solve_warm(sr, cap, DT);
-        if (!ok && k > 0 && !(sr.failure && strstr(sr.failure, "iteration cap"))) ok = ss.solve(sr);   // cold fallback
         *its = sr.iterations;
     }
     if (!ok) DBG("tier %d step %d: %s\n", tier, k, tier == 1 ? er.failure : sr.failure);

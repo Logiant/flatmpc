@@ -52,7 +52,9 @@ public:
     const char* setup_failure() const { return sfail_; }
     // cold solve by continuation in the state bounds (NOTES.md 14.6)
     bool solve(StateResult& r);
-    // MPC: from the previous arcs and dual iterate, at most max_its inner Newton iterations per solve.
+    // MPC: from the previous arcs and dual iterate, at most max_its inner Newton iterations in total. If that
+    // structure fails (not by the cap), the bound continuation from the arc-free problem, in the same budget.
+    // When the budget is spent r holds the best plan so far (failure "iteration cap ...").
     // shift: time the horizon moved since r was computed (arcs move left by it; an arc that now starts
     // at or before 0 starts at 0, one that ended is dropped). Update x0 with set_x0 first.
     bool solve_warm(StateResult& r, int max_its, double shift = 0.0);
@@ -83,7 +85,7 @@ private:
     int nsa_;                        // working arcs (copied to / from StateResult)
     StateArc sa_[MAXSA];
     int ny_;
-    int its_, cap_;
+    int its_, cap_;                  // Newton iterations of this solve call / its total budget
     Ev ev_[2];
     // Newton matrix (-Hess D) and Z = H^-1 dF/dth (junction Jacobian; in inner: a packed copy of H) live
     // in the tier-1 solve scratch, which is dead once the tier-1 solve is done
@@ -93,7 +95,9 @@ private:
     char why_[256];
     int collapsed_;
 
-    bool run(StateResult& r, int warm_its);
+    struct Hom;                      // continuation client (lqocp_cont.hpp)
+    bool run(StateResult& r);
+    bool homotopy(StateResult& r);
     bool cold(StateResult& r);
     void wpoly(const double* c, const double* y, const StateArc* sa, int nsa, double tm, double Wc[MAXM][4]) const;
     bool kkt(uint16_t S, const double Wc[MAXM][4], double Pv[MAXM][MAXM], double Vv[MAXM][4],

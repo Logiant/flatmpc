@@ -1,6 +1,8 @@
 // Tier 2: thrust box + first-order state box, energy cost. See lqocp_state.hpp and NOTES.md 14.
 #include "lqocp_state.hpp"
 
+#include "lqocp_cont.hpp"
+
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -438,7 +440,7 @@ bool StateSolver::inner(double* y, int max_its) {
         double Fn = 0.0;
         for (int i = 0; i < ny; ++i) Fn = fmax(Fn, fabs(E.F[i]));
         if (Fn <= 1e-12 * E.scale) { if (cur) ev_[0] = ev_[1]; return true; }
-        if (it >= max_its) { if (cur) ev_[0] = ev_[1]; strcpy(why_, "iteration cap"); return false; }
+        if (it >= max_its || its_ >= cap_) { if (cur) ev_[0] = ev_[1]; strcpy(why_, "iteration cap"); return false; }
         ++its_;
         double d[NY], yn[NY], hmax = 0.0;
         for (int i = 0; i < NY * NY; ++i) hmax = fmax(hmax, fabs(H_[i]));
@@ -905,23 +907,19 @@ __attribute__((noinline)) bool StateSolver::cold(StateResult& r) {
     return true;
 }
 
-bool StateSolver::run(StateResult& r, int warm) {
+// Junction solver from the arcs and dual iterate in r (the corrector of the continuation). Iterations count
+// into its_ / r.outer; the inner solves stop at the call's total budget cap_.
+bool StateSolver::run(StateResult& r) {
     const Solver& B = base_;
     const int n = B.n_;
     const double T = B.p_->T;
-    const int cap = warm < 0 ? MAX_NEWTON : warm;
+    const int cap = MAX_NEWTON;
     double* const y = r.y;
-    its_ = 0;
-    r.outer = 0;
     r.converged = false;
     r.cost = HUGE_VAL;
     r.state_violation = r.pmp_violation = r.sign_violation = HUGE_VAL;
-    if (warm < 0) {
-        if (!cold(r)) return false;
-    } else {
-        nsa_ = (r.nsa >= 0 && r.nsa <= MAXSA) ? r.nsa : 0;
-        for (int q = 0; q < nsa_; ++q) sa_[q] = r.sa[q];
-    }
+    nsa_ = (r.nsa >= 0 && r.nsa <= MAXSA) ? r.nsa : 0;
+    for (int q = 0; q < nsa_; ++q) sa_[q] = r.sa[q];
     const char* why = nullptr;
     bool conv = false;
     char seq[160], det[64];
@@ -1024,6 +1022,7 @@ bool StateSolver::run(StateResult& r, int warm) {
         break;
     }
     if (!conv && !why) why = "outer iteration cap";
+    if (!conv && its_ >= cap_) why = "iteration cap (total)";
     fill(r);
     r.iterations = its_;
     // cost: 1/2 int v'Rv (degree 6: 4-point Gauss is exact) + terminal
@@ -1057,12 +1056,18 @@ bool StateSolver::run(StateResult& r, int warm) {
 bool StateSolver::solve_warm(StateResult& r, int max_its, double shift) {
     const double T = base_.p_->T;
     const int n = base_.n_;
+    its_ = 0;
+    cap_ = max_its;
+    hs_ = 1.0;
+    r.outer = 0;
+    r.steps = 0;
     int k = 0;
     for (int q = 0; q < r.nsa && q < MAXSA; ++q) {
         StateArc a = r.sa[q];
         if (!a.fix2) a.t2 -= shift;
         if (a.t2 <= 1e-9 * T) continue;                  // ended: drop
         if (!touch(a)) a.t1 -= shift;
+        a.b = bnd(a.chain, a.side);                      // the target (a stalled continuation leaves b(s < 1))
         double d = r.y[n + q];
         if (a.fix1 || a.t1 <= 1e-9 * T) {
             // starts at 0: only valid with x0 on the bound (no entry condition); otherwise drop it and
@@ -1075,7 +1080,16 @@ bool StateSolver::solve_warm(StateResult& r, int max_its, double shift) {
         r.y[n + k++] = d;
     }
     r.nsa = k;
-    return run(r, max_its);
+    if (run(r) || its_ >= cap_) return r.converged;
+    // the previous structure failed: continuation from the arc-free problem, inside the same budget
+    r.nsa = nsa_ = 0;
+    if (!inner(r.y, MAX_NEWTON)) {
+        fill(r);
+        r.iterations = its_;
+        r.failure = its_ >= cap_ ? "iteration cap (total)" : why_;
+        return false;
+    }
+    return homotopy(r);
 }
 
 // Excess of the tier-1 plan (dual y, no arcs) over each target bound: lo_ / hi_ become the bounds at s = 0
@@ -1122,53 +1136,68 @@ __attribute__((noinline)) void StateSolver::stalled(StateResult& r, double s) { 
     r.failure = why_;
 }
 
-// Cold solve by continuation in the state bounds (NOTES.md 14.6). s = 0: tier 1, each violated bound starts
-// at the tier-1 plan's peak (start), b(s) = s target + (1 - s) peak. Each step runs the junction solver (run:
-// Newton corrector, arc insertion at new violations = births, collapse / wrong sign = deaths) at b(s1), from
-// the last accepted point moved along the IFT tangent (predict). The first step is s = 0 -> 1, i.e. the
-// direct solve; a failed step is halved, an accepted one doubles the next.
-bool StateSolver::solve(StateResult& r) {
-    const int n = base_.n_;
+// Continuation client (lqocp_cont.hpp) for the bound homotopy (NOTES.md 14.6): s = 0 is the arc-free (tier-1)
+// solution in r.y, each violated bound starts at that plan's peak (start), b(s) = s target + (1 - s) peak.
+// correct = the junction solver (run: Newton corrector, arc insertion at new violations = births, collapse /
+// wrong sign = deaths) at b(s1); predict = the exact IFT tangent.
+struct StateSolver::Hom {
+    StateSolver& S;
+    StateResult& r;
+    int nb;                                          // last accepted point: nb arcs sb, dual yb
+    StateArc sb[MAXSA];
+    double yb[NY];
+    void back() {
+        r.nsa = nb;
+        for (int q = 0; q < nb; ++q) r.sa[q] = sb[q];
+        for (int i = 0; i < S.base_.n_ + nb; ++i) r.y[i] = yb[i];
+    }
+    void predict(double s, double s1) { S.predict(r, s1 - s); }
+    bool correct(double s1) {
+        S.hs_ = s1;
+        for (int q = 0; q < r.nsa; ++q) r.sa[q].b = S.bnd(r.sa[q].chain, r.sa[q].side);
+        ++r.steps;
+        return S.run(r);
+    }
+    void accept() {
+        nb = r.nsa;
+        for (int q = 0; q < nb; ++q) sb[q] = r.sa[q];
+        for (int i = 0; i < S.base_.n_ + nb; ++i) yb[i] = r.y[i];
+    }
+    bool spent() const { return S.its_ >= S.cap_; }
+    void restart() { S.start(yb); }                 // the direct solve failed: bounds at s = 0
+};
+
+// From the arc-free solution in r.y (its_, cap_ set by the caller). On a stall r holds the last accepted
+// point (optimal for the bounds b(s), s < 1), not converged.
+__attribute__((noinline)) bool StateSolver::homotopy(StateResult& r) {
+    Hom h{*this, r, 0};
+    for (int i = 0; i < base_.n_; ++i) h.yb[i] = r.y[i];
+    const double s = continuation(h);
+    if (s < 1.0) {
+        stalled(r, s);
+        h.back();
+        hs_ = s;
+        nsa_ = r.nsa;
+        for (int q = 0; q < nsa_; ++q) sa_[q] = r.sa[q];
+        if (evaluate(r.y, ev_[0], false)) fill(r);
+        r.converged = false;
+    }
     hs_ = 1.0;
+    r.iterations = its_;
+    return r.converged;
+}
+
+// Cold solve: tier 1, then the bound continuation. The first step is s = 0 -> 1, i.e. the direct solve.
+bool StateSolver::solve(StateResult& r) {
+    hs_ = 1.0;
+    its_ = 0;
+    cap_ = 1 << 30;
     r.steps = 0;
     r.outer = 0;
     r.converged = false;
     r.cost = HUGE_VAL;
     if (!cold(r)) return false;
-    int its = its_, outer = 0, nb = 0;
-    double yb[NY], s = 0.0, ds = 1.0;                    // last accepted point: yb, sb, nb at s
-    StateArc sb[MAXSA];
-    for (int i = 0; i < n; ++i) yb[i] = r.y[i];
-    for (;;) {
-        const double s1 = fmin(1.0, s + ds);
-        r.nsa = nb;
-        for (int q = 0; q < nb; ++q) r.sa[q] = sb[q];
-        for (int i = 0; i < n + nb; ++i) r.y[i] = yb[i];
-        predict(r, s1 - s);
-        hs_ = s1;
-        for (int q = 0; q < nb; ++q) r.sa[q].b = bnd(r.sa[q].chain, r.sa[q].side);
-        ++r.steps;
-        const bool ok = run(r, MAX_NEWTON);
-        its += r.iterations;
-        outer += r.outer;
-        if (ok) {
-            s = s1;
-            if (s >= 1.0) break;
-            nb = r.nsa;
-            for (int q = 0; q < nb; ++q) sb[q] = r.sa[q];
-            for (int i = 0; i < n + nb; ++i) yb[i] = r.y[i];
-            ds = fmin(2.0 * ds, 1.0 - s);
-        } else if ((ds *= 0.5) < 1.0 / 256) {
-            stalled(r, s);
-            break;
-        } else if (ds == 0.5) {
-            start(yb);                                   // the direct solve failed: bounds at s = 0
-        }
-    }
-    hs_ = 1.0;
-    r.iterations = its;
-    r.outer = outer;
-    return r.converged;
+    return homotopy(r);
 }
 
 void StateSolver::eval_u(const StateResult& r, double t, double u[MAXM]) const {
