@@ -46,6 +46,9 @@ static TinySolver *quad_setup() {
     if (tiny_setup(&s, A, B, f, Q, R, 5.0, NX, NU, NH, 0)) return nullptr;
     tiny_set_bound_constraints(s, tinyMatrix::Constant(NX, NH, tinytype(-5)), tinyMatrix::Constant(NX, NH, tinytype(5)),
                                tinyMatrix::Constant(NU, NH - 1, tinytype(-0.5)), tinyMatrix::Constant(NU, NH - 1, tinytype(0.5)));
+#ifdef NO_XBOUND   // input bounds only (matches our energy + control-constraint problem)
+    s->settings->en_state_bound = 0;
+#endif
     s->settings->max_iter = 100;
     return s;
 }
