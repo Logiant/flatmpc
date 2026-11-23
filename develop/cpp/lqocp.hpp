@@ -104,6 +104,7 @@ class Solver {
 public:
     // p must stay alive (it is referenced, not copied; it may live in flash). Problem.x0 is copied.
     bool setup(const Problem& p);
+    const char* setup_failure() const { return sfail_; }   // why setup returned false
     // Returns r.converged. A general cost returns false (use GSolver).
     bool solve(Result& r, int method = METHOD_NEWTON);
     // MPC warm start (newton): from the previous r.c / r.mu, at most max_its Newton iterations
@@ -138,6 +139,9 @@ private:
         Eval ev[2];
     };
     const Problem* p_;
+    const char* sfail_ = nullptr;
+    static const char* check_problem(const Problem& p);
+    bool setup_(const Problem& p);
     double x0_[MAXN];
     int n_, m_, off_[MAXM];
     double rows_[2 * MAXM][MAXM], rhs_[2 * MAXM], rownorm2_[2 * MAXM];

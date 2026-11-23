@@ -120,7 +120,9 @@ int main(int argc, char** argv) {
 
     const auto t0 = std::chrono::steady_clock::now();
     if (!g_solver.setup(p)) {
-        std::fprintf(stderr, "problem setup failed (unsupported dimensions or R not SPD)\n");
+        const char* why = g_solver.setup_failure();
+        std::fprintf(stderr, "problem setup failed: %s\n", why ? why : "unknown");
+        std::printf("{\"cost\": null, \"converged\": false, \"failure\": \"setup: %s\"}\n", why ? why : "unknown");
         return 3;
     }
     const bool general = g_solver.is_general();
@@ -188,7 +190,7 @@ int main(int argc, char** argv) {
     std::printf("], \"iterations\": %d, \"solve_time_us\": %.3f, \"converged\": %s, \"method\": \"%s\"",
                 its, us, conv ? "true" : "false", method.c_str());
     if (!conv) {
-        const char* why = general ? g_gresult.failure : "not converged";
+        const char* why = general ? g_gresult.failure : g_result.failure;
         std::printf(", \"failure\": \"%s\"", why ? why : "not converged");
     }
     std::printf("}\n");

@@ -63,16 +63,60 @@ bool lu_solve(T* A, int n, int ld, T* B, int nrhs, int ldb) {
 }  // namespace
 
 bool Solver::setup(const Problem& p) {
-    if (p.m < 1 || p.m > MAXM) return false;
+    sfail_ = check_problem(p);
+    return !sfail_ && setup_(p);
+}
+
+// input checks at the trust boundary; nullptr if fine
+const char* Solver::check_problem(const Problem& p) {
+    if (p.m < 1 || p.m > MAXM) return "unsupported number of chains";
+    int n = 0;
+    for (int j = 0; j < p.m; ++j) {
+        if (p.orders[j] < 1 || p.orders[j] > MAXK) return "unsupported chain order";
+        n += p.orders[j];
+    }
+    if (n > MAXN) return "too many states";
+    if (!(p.T > 0.0) || !isfinite(p.T)) return "T must be finite and > 0";
+    for (int i = 0; i < n; ++i)
+        if (!isfinite(p.x0[i])) return "x0 not finite";
+    for (int i = 0; i < n; ++i)
+        if (!isfinite(p.xf[i])) return "xf not finite";
+    if (p.has_bounds) {
+        for (int r = 0; r < p.m; ++r) {
+            for (int j = 0; j < p.m; ++j)
+                if (!isfinite(p.M[r][j])) return "Umap not finite";
+            // -inf lo / +inf hi disable a side (documented); NaN, +inf lo, -inf hi are errors
+            if (isnan(p.lo[r]) || isnan(p.hi[r]) || p.lo[r] == HUGE_VAL || p.hi[r] == -HUGE_VAL)
+                return "bounds NaN or infinite on the wrong side";
+            if (p.lo[r] > p.hi[r]) return "bounds: lo > hi";
+        }
+    }
+    if (p.has_cost) {
+        for (int i = 0; i < p.m; ++i)
+            for (int j = 0; j < p.m; ++j) {
+                if (!isfinite(p.R[i][j])) return "R not finite";
+                if (fabs(p.R[i][j] - p.R[j][i]) > 1e-12 * (fabs(p.R[i][j]) + fabs(p.R[j][i])))
+                    return "R not symmetric";       // (rounding-level asymmetry is accepted)
+            }
+        for (int i = 0; i < n; ++i)
+            for (int j = 0; j < n; ++j)
+                if (!isfinite(p.Q[i][j])) return "Q not finite";
+        if (p.has_Qf)
+            for (int i = 0; i < n; ++i)
+                for (int j = 0; j < n; ++j)
+                    if (!isfinite(p.Qf[i][j])) return "Qf not finite";
+    }
+    return nullptr;
+}
+
+bool Solver::setup_(const Problem& p) {
     p_ = &p;
     m_ = p.m;
     n_ = 0;
     for (int j = 0; j < m_; ++j) {
-        if (p.orders[j] < 1 || p.orders[j] > MAXK) return false;
         off_[j] = n_;
         n_ += p.orders[j];
     }
-    if (n_ > MAXN || !(p.T > 0.0)) return false;
     // Q = 0: energy path (polynomial costate; any R, optional Qf); else general LQ cost
     general_ = false;
     rI_ = true;
@@ -93,7 +137,7 @@ bool Solver::setup(const Problem& p) {
         for (int j = 0; j < m_; ++j) {
             double d = p.R[j][j];
             for (int k = 0; k < j; ++k) d -= Lc_[j][k] * Lc_[j][k];
-            if (!(d > 0.0)) return false;           // R not SPD
+            if (!(d > 0.0)) { sfail_ = "R not SPD"; return false; }
             Lc_[j][j] = sqrt(d);
             for (int i = j + 1; i < m_; ++i) {
                 double s = p.R[i][j];
@@ -123,7 +167,7 @@ bool Solver::setup(const Problem& p) {
         for (int j = 0; j < n_; ++j) {
             double d = p.Qf[j][j];
             for (int k = 0; k < j; ++k) d -= Cf_[k * MAXN + j] * Cf_[k * MAXN + j];
-            if (d < -1e-12 * qmax) return false;    // Qf not PSD
+            if (d < -1e-12 * qmax) { sfail_ = "Qf not PSD"; return false; }
             if (d <= 1e-14 * qmax) continue;
             Cf_[j * MAXN + j] = sqrt(d);
             for (int i = j + 1; i < n_; ++i) {
@@ -195,7 +239,7 @@ bool Solver::setup(const Problem& p) {
         double A[MAXN * MAXN];
         for (int i = 0; i < MAXN * MAXN; ++i) A[i] = Lm_[i];
         for (int i = 0; i < n_; ++i) Linv_[i * MAXN + i] = 1.0;
-        if (!lu_solve(A, n_, MAXN, Linv_, n_, MAXN)) return false;
+        if (!lu_solve(A, n_, MAXN, Linv_, n_, MAXN)) { sfail_ = "internal: Lm singular"; return false; }
     }
     return set_x0(p.x0);
 }
@@ -499,6 +543,7 @@ bool Solver::newton(const uint16_t* S, int nseq, double* tau, double* c, int* it
 #endif
 
 static const char* const CAPFAIL = "arc capacity LQOCP_MAXARC_E exceeded";
+static const char* const INFEAS = "infeasible endpoint (no feasible input)";
 
 bool Solver::solve(Result& R, int method) { return start(R, method, -1); }
 bool Solver::solve_warm(Result& R, int max_its) { return start(R, METHOD_NEWTON, max_its); }
@@ -1123,7 +1168,7 @@ bool Solver::solve_newton(Result& R, int warm_its) {
         if (!qf_) {   // dual unbounded (infeasible problem): the iterates c diverge
             double cm = 0.0;
             for (int i = 0; i < n_; ++i) cm = fmax(cm, fabs(c[i]));
-            if (cm > 1e6 * c0) { why = "iterates diverge (infeasible?)"; break; }
+            if (cm > 1e6 * c0) { why = INFEAS; break; }
         }
         ++its;
         // (J Lm) d_nu = -F, J Lm = int K P K^T dt symmetric PSD; d_c = Lm d_nu
@@ -1206,6 +1251,11 @@ bool Solver::solve_newton(Result& R, int warm_its) {
         cur = nxt;
     }
     R.iterations = R.newton_iterations = its;
+    if (!conv && !qf_ && !capfail_) {               // walk / line search failed on a diverging dual
+        double cm = 0.0;
+        for (int i = 0; i < n_; ++i) cm = fmax(cm, fabs(c[i]));
+        if (cm > 1e6 * c0) why = INFEAS;
+    }
     if (!ok) { R.failure = capfail_ ? CAPFAIL : why; return false; }
     const Eval& E = ew_.ev[cur];
     R.narcs = E.narcs;
