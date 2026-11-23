@@ -82,7 +82,11 @@ private:
     int ny_;
     int its_, cap_;
     Ev ev_[2];
-    double H_[NY * NY], A_[NY * NY];
+    // Newton matrix (-Hess D) and Z = H^-1 dF/dth (junction Jacobian; in inner: a packed copy of H) live
+    // in the tier-1 solve scratch, which is dead once the tier-1 solve is done
+    double* const H_ = base_.xs_;
+    double* const Z_ = base_.xs_ + NY * NY;
+    static_assert(sizeof(Solver::xs_) >= (NY * NY + (NY * (NY + 1) / 2 > NY * 2 * MAXSA ? NY * (NY + 1) / 2 : NY * 2 * MAXSA)) * sizeof(double), "tier-1 scratch too small");
     char why_[256];
     int collapsed_;
 
@@ -95,7 +99,7 @@ private:
     void cvec(const double* y, double* c) const;
     bool evaluate(const double* y, Ev& e, bool wantH);
     bool inner(double* y, int max_its);
-    bool gres(const double* y, double* g, int* ng, double* vs, double* J = nullptr, double* Z = nullptr);
+    bool gres(const double* y, double* g, int* ng, double* vs, double* J = nullptr);
     bool junctions(double* y, int max_its, int* outer);
     double scan(const double* c, const double* y, int j, int side, double tw, double* twout, double* ta, double* tb) const;
     double check(const double* y, int* wc, int* ws, double* ta, double* tb, double* tw, double* psign, double* ppmp) const;

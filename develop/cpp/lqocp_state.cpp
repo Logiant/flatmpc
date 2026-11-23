@@ -398,18 +398,18 @@ bool StateSolver::evaluate(const double* y, Ev& e, bool wantH) {
         }
         sc = fmax(sc, sq);
         if (wantH) {
-            double* X = A_;                              // X = C H (rows 0..n-1 change)
-            for (int i = 0; i < ny; ++i)
+            // in place (Cf upper triangular: entry i reads entries >= i): H = C H, then H = H C^T + diag(I, 0)
+            for (int i = 0; i < n; ++i)
                 for (int k = 0; k < ny; ++k) {
-                    double s = H_[i * NY + k];
-                    if (i < n) { s = 0.0; for (int j = i; j < n; ++j) s += B.Cf_[i * MAXN + j] * H_[j * NY + k]; }
-                    X[i * NY + k] = s;
+                    double s = 0.0;
+                    for (int j = i; j < n; ++j) s += B.Cf_[i * MAXN + j] * H_[j * NY + k];
+                    H_[i * NY + k] = s;
                 }
-            for (int i = 0; i < ny; ++i)                 // H = X C^T + diag(I, 0)
-                for (int k = 0; k < ny; ++k) {
-                    double s = X[i * NY + k];
-                    if (k < n) { s = 0.0; for (int j = k; j < n; ++j) s += X[i * NY + j] * B.Cf_[k * MAXN + j]; }
-                    H_[i * NY + k] = s + ((i == k && i < n) ? 1.0 : 0.0);
+            for (int i = 0; i < ny; ++i)
+                for (int k = 0; k < n; ++k) {
+                    double s = 0.0;
+                    for (int j = k; j < n; ++j) s += H_[i * NY + j] * B.Cf_[k * MAXN + j];
+                    H_[i * NY + k] = s + ((i == k) ? 1.0 : 0.0);
                 }
         }
     } else {
@@ -436,10 +436,12 @@ bool StateSolver::inner(double* y, int max_its) {
         for (int i = 0; i < NY * NY; ++i) hmax = fmax(hmax, fabs(H_[i]));
         bool solved = false;
         double rho = 0.0;
+        double* const Hs = Z_;                           // upper triangle of H_ (symmetric): H_ is factored in place
+        for (int i = 0, q = 0; i < ny; ++i) for (int k = i; k < ny; ++k) Hs[q++] = H_[i * NY + k];
         for (int att = 0; att < 20 && !solved; ++att) {
-            for (int i = 0; i < NY * NY; ++i) A_[i] = H_[i];
-            for (int i = 0; i < ny; ++i) { A_[i * NY + i] += rho; d[i] = -E.F[i]; }
-            solved = lu_solve(A_, ny, NY, d, 1, 1);
+            if (att) for (int i = 0, q = 0; i < ny; ++i) for (int k = i; k < ny; ++k, ++q) H_[i * NY + k] = H_[k * NY + i] = Hs[q];
+            for (int i = 0; i < ny; ++i) { H_[i * NY + i] += rho; d[i] = -E.F[i]; }
+            solved = lu_solve(H_, ny, NY, d, 1, 1);
             rho = (rho == 0.0) ? 1e-12 * hmax : 10.0 * rho;
         }
         if (!solved) { strcpy(why_, "singular Newton matrix"); return false; }
@@ -467,7 +469,7 @@ bool StateSolver::inner(double* y, int max_its) {
 // theorem through the inner KKT: dg/dth = g_th - g_y H^-1 F_th. For fixed y every piece is a fixed
 // polynomial, so F_th is the jump of the integrand at th (thrust events inside a piece keep v continuous)
 // and g_th = v_j'(th).
-bool StateSolver::gres(const double* y, double* g, int* ng, double* vs, double* J, double* Z) {
+bool StateSolver::gres(const double* y, double* g, int* ng, double* vs, double* J) {
     const Solver& B = base_;
     const Problem& p = *B.p_;
     const Ev& e = ev_[0];
@@ -484,7 +486,7 @@ bool StateSolver::gres(const double* y, double* g, int* ng, double* vs, double* 
         vpoly(e.S, e.tau, e.narcs, a, c, y, sa_, nsa_, V);
         for (int j = 0; j < B.m_; ++j) *vs = fmax(*vs, 1.0 + fabs(peval(V[j], t0)));
     }
-    double Fth[NY * 2 * MAXSA], gy[2 * MAXSA * NY];
+    double* const Fth = Z_, gy[2 * MAXSA * NY];   // Fth becomes Z = H^-1 F_th (dy/dth = -Z)
     int li[NY];
     for (int l = 0; l < B.m_; ++l)
         for (int r = 0; r < p.orders[l]; ++r) li[B.off_[l] + r] = l;
@@ -554,9 +556,7 @@ bool StateSolver::gres(const double* y, double* g, int* ng, double* vs, double* 
                     Fth[i * 2 * MAXSA + a] = f;      // row i only reads rows >= i: in place, ascending
                     gy[a * NY + i] = h;
                 }
-        for (int i = 0; i < NY * NY; ++i) A_[i] = H_[i];
-        if (!lu_solve(A_, ny, NY, Fth, k, 2 * MAXSA)) return false;
-        for (int i = 0; i < ny * 2 * MAXSA; ++i) Z[i] = Fth[i];   // dy/dth = -Z
+        if (!lu_solve(H_, ny, NY, Fth, k, 2 * MAXSA)) return false;   // H_ is rebuilt by the next evaluate
         for (int a = 0; a < k; ++a)
             for (int b = 0; b < k; ++b) {
                 double s = 0.0;
@@ -580,9 +580,9 @@ bool StateSolver::junctions(double* y, int max_its, int* outer) {
             if (!sa_[q].fix1) tv[nu++] = &sa_[q].t1;
             if (!sa_[q].fix2) tv[nu++] = &sa_[q].t2;
         }
-        double g[2 * MAXSA], vs, J[4 * MAXSA * MAXSA], y0[NY], tau0[2 * MAXSA], d[2 * MAXSA], Z[NY * 2 * MAXSA];
+        double g[2 * MAXSA], vs, J[4 * MAXSA * MAXSA], y0[NY], tau0[2 * MAXSA], d[2 * MAXSA];
         int ng;
-        if (!gres(y, g, &ng, &vs, J, Z)) { strcpy(why_, "junction not found in the walk"); return false; }
+        if (!gres(y, g, &ng, &vs, J)) { strcpy(why_, "junction not found in the walk"); return false; }
         double gn = 0.0;
         for (int i = 0; i < ng; ++i) gn = fmax(gn, fabs(g[i]));
         if (gn <= 1e-10 * vs) return true;
@@ -605,6 +605,12 @@ bool StateSolver::junctions(double* y, int max_its, int* outer) {
         }
         for (int a = 0; a < nu; ++a) N[a * nu + a] += 1e-10 * dm;
         if (!lu_solve(N, nu, nu, d, 1, 1)) { strcpy(why_, "singular junction Jacobian"); return false; }
+        double zd[NY];                                   // Z d (Z_ is overwritten by the inner solves)
+        for (int i = 0; i < ny; ++i) {
+            double s = 0.0;
+            for (int k = 0; k < nu; ++k) s += Z_[i * 2 * MAXSA + k] * d[k];
+            zd[i] = s;
+        }
         bool acc = false, fix2s[MAXSA];
         for (int q = 0; q < nsa_; ++q) fix2s[q] = sa_[q].fix2;
         for (double al = 1.0; al >= 1.0 / 256; al *= 0.5) {
@@ -623,11 +629,7 @@ bool StateSolver::junctions(double* y, int max_its, int* outer) {
                 }
             }
             if (bad) continue;
-            for (int i = 0; i < ny; ++i) {          // first-order predictor dy = -Z dth
-                double s = y0[i];
-                for (int k = 0; k < nu; ++k) s -= Z[i * 2 * MAXSA + k] * al * d[k];
-                y[i] = s;
-            }
+            for (int i = 0; i < ny; ++i) y[i] = y0[i] - al * zd[i];   // first-order predictor dy = -Z dth
             double gt[2 * MAXSA], vt;
             int nt;
             if (!inner(y, max_its) || !gres(y, gt, &nt, &vt)) break;   // shorter steps rarely help: fail fast

@@ -158,8 +158,13 @@ private:
     double Lc_[MAXM][MAXM], Lci_[MAXM][MAXM];       // R = Lc Lc^T; projection in vt = Lc^T v
     double Lm_[MAXN * MAXN], Linv_[MAXN * MAXN];   // energy: c = Lm nu
     double Cf_[MAXN * MAXN], g_[MAXN];             // Qf = Cf^T Cf; g = Cf (xf - e^{AT} x0)
-    EnergyWork ew_;
-    mutable double G_[MAXN * MAXN], W_[MAXN * MAXN];  // workspace: ds(T)/dc of ev[cur]; Newton matrix
+    union {                          // tier-1 solve scratch; StateSolver reuses it as xs_ after the tier-1 solve
+        struct {
+            EnergyWork ew_;
+            mutable double G_[MAXN * MAXN], W_[MAXN * MAXN];  // workspace: ds(T)/dc of ev[cur]; Newton matrix
+        };
+        double xs_[(sizeof(EnergyWork) + 2 * MAXN * MAXN * sizeof(double)) / sizeof(double)];
+    };
     bool capfail_;                   // MAXARC_E was exceeded during this solve
 
     // shared / energy (an arc sequence is S[0..n-1] with switch times tau[0..n-2])
