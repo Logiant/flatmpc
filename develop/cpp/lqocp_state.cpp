@@ -31,6 +31,7 @@ const double EPS_ = 2.220446049250313e-16;
 const double TOL_X = 1e-9;           // state violation, relative to 1 + |b|
 const double TOL_SIGN = 1e-7;        // eta >= 0 on a boundary arc, relative
 const char CH[4] = {'x', 'y', 'z', 'p'};
+const int ZC = 2 * MAXSA;            // columns of Z_: one per free junction time
 
 void span_(const double* tau, int n, int a, double T, double* t0, double* t1) {
     *t0 = a ? tau[a - 1] : 0.0;
@@ -61,6 +62,7 @@ int proots(const double* a, int len, double L, double* out) {
 
 bool StateSolver::setup(const Problem& p, const double* slo, const double* shi) {
     nsa_ = 0;
+    hs_ = 1.0;
     if (!base_.setup(p)) { sfail_ = base_.setup_failure(); return false; }
     if (base_.general_) { sfail_ = "tier 2 needs Q = 0 (energy cost)"; return false; }
     sfail_ = nullptr;
@@ -485,7 +487,7 @@ double StateSolver::wbasis(int i, double t, double tm) const {
 // theorem through the inner KKT: dg/dth = g_th - g_y H^-1 F_th. For fixed y every piece is a fixed
 // polynomial, so F_th is the jump of the integrand at th (thrust events inside a piece keep v continuous)
 // and g_th = v_j'(th). J may point into H_ (written only after H_ is factored).
-bool StateSolver::gres(const double* y, double* g, int* ng, double* vs, double* J) {
+bool StateSolver::gres(const double* y, double* g, int* ng, double* vs, double* J, const double* zs, double* dgs) {
     const Solver& B = base_;
     const Problem& p = *B.p_;
     const Ev& e = ev_[0];
@@ -514,7 +516,7 @@ bool StateSolver::gres(const double* y, double* g, int* ng, double* vs, double* 
     for (int q = 0; q < nsa_; ++q) {
         const int j = sa_[q].chain;
         for (int side = 0; side < 2; ++side) {
-            if (side == 0 ? sa_[q].fix1 : sa_[q].fix2) continue;
+            if (side == 0 ? sa_[q].fix1 || touch(sa_[q]) : sa_[q].fix2) continue;
             const double tj = side == 0 ? sa_[q].t1 : sa_[q].t2;
             int ab = -1;                                 // arc ending at tj (ab + 1 starts there)
             double bd = HUGE_VAL;
@@ -543,7 +545,7 @@ bool StateSolver::gres(const double* y, double* g, int* ng, double* vs, double* 
             tjk[k] = tj;
             tmk[k] = tm[side];
             for (int i = 0; i < ny; ++i)                 // F_th (column k), raw nu coordinates
-                Fth[i * 2 * MAXSA + k] = wbasis(i, tj, tm[0]) * vv[0][li[i]] - wbasis(i, tj, tm[1]) * vv[1][li[i]];
+                Fth[i * ZC + k] = wbasis(i, tj, tm[0]) * vv[0][li[i]] - wbasis(i, tj, tm[1]) * vv[1][li[i]];
             ++k;
         }
     }
@@ -552,10 +554,10 @@ bool StateSolver::gres(const double* y, double* g, int* ng, double* vs, double* 
             for (int i = 0; i < n; ++i)                  // row i only reads rows >= i: in place, ascending
                 for (int a = 0; a < k; ++a) {
                     double f = 0.0;
-                    for (int jj = i; jj < n; ++jj) f += B.Cf_[i * MAXN + jj] * Fth[jj * 2 * MAXSA + a];
-                    Fth[i * 2 * MAXSA + a] = f;
+                    for (int jj = i; jj < n; ++jj) f += B.Cf_[i * MAXN + jj] * Fth[jj * ZC + a];
+                    Fth[i * ZC + a] = f;
                 }
-        if (!lu_solve(H_, ny, NY, Fth, k, 2 * MAXSA)) return false;   // H_ is rebuilt by the next evaluate
+        if (!lu_solve(H_, ny, NY, Fth, k, ZC)) return false;   // H_ is rebuilt by the next evaluate
         for (int a = 0; a < k; ++a) {
             double gy[NY];                               // dv_j/dy at the junction: Pv[j][l] times the w basis
             for (int i = 0; i < ny; ++i) gy[i] = pg[a][li[i]] * wbasis(i, tjk[a], tmk[a]);
@@ -567,12 +569,57 @@ bool StateSolver::gres(const double* y, double* g, int* ng, double* vs, double* 
                 }
             for (int b = 0; b < k; ++b) {
                 double s = (a == b) ? gtk[a] : 0.0;
-                for (int i = 0; i < ny; ++i) s -= gy[i] * Fth[i * 2 * MAXSA + b];
+                for (int i = 0; i < ny; ++i) s -= gy[i] * Fth[i * ZC + b];
                 J[a * k + b] = s;
+            }
+            if (dgs) {                                   // dg/ds at fixed junction times: -g_y zs
+                double s = 0.0;
+                for (int i = 0; i < ny; ++i) s -= gy[i] * zs[i];
+                dgs[a] = s;
             }
         }
     }
     *ng = k;
+    return true;
+}
+
+// (J^T J + lam I) d = -J^T g with a tiny lam: Newton when J (ng x nu, row-major) is regular; a junction
+// that does not move its residual (e.g. entry inside a fully saturated arc, where v_j = 0 anyway) stays put
+static bool lsq(const double* J, const double* g, int ng, int nu, double* N, double* d) {
+    double dm = 0.0;
+    for (int a = 0; a < nu; ++a) {
+        double s = 0.0;
+        for (int i = 0; i < ng; ++i) s -= J[i * nu + a] * g[i];
+        d[a] = s;
+        for (int b = 0; b < nu; ++b) {
+            double t = 0.0;
+            for (int i = 0; i < ng; ++i) t += J[i * nu + a] * J[i * nu + b];
+            N[a * nu + b] = t;
+        }
+        dm = fmax(dm, N[a * nu + a]);
+    }
+    for (int a = 0; a < nu; ++a) N[a * nu + a] += 1e-10 * dm;
+    return lu_solve(N, nu, nu, d, 1, 1);
+}
+
+// Path tangent of the continuation at a converged point (y, junction times) for the current bounds b(s):
+// dth = d(free junction times)/ds and dy = dy/ds by the implicit function theorem through the inner KKT
+// (F(y, th, s) = 0) and the junction conditions (g(y, th) = 0): J dth = -dg/ds|th, dy = -H^-1 (F_s + F_th dth).
+bool StateSolver::tangent(const double* y, double* dth, double* dy) {
+    const int n = base_.n_, ny = n + nsa_;
+    double g[2 * MAXSA], dgs[2 * MAXSA], vs;
+    int ng;
+    // dy (first) = zs = H^-1 F_s; F_s: only the rows D_top(t1) - b(s) depend on s. gres factors H_ in place,
+    // so H_ is built twice
+    for (int i = 0; i < ny; ++i) dy[i] = (i >= n && !sa_[i - n].fix1) ? -dbds(sa_[i - n]) : 0.0;
+    if (!evaluate(y, ev_[0], true) || !lu_solve(H_, ny, NY, dy, 1, 1)) return false;
+    if (!evaluate(y, ev_[0], true) || !gres(y, g, &ng, &vs, H_, dy, dgs)) return false;
+    if (ng && !lsq(H_, dgs, ng, ng, H_ + 4 * MAXSA * MAXSA, dth)) return false;
+    for (int i = 0; i < ny; ++i) {
+        double s = dy[i];
+        for (int k = 0; k < ng; ++k) s += Z_[i * ZC + k] * dth[k];
+        dy[i] = -s;
+    }
     return true;
 }
 
@@ -585,7 +632,7 @@ bool StateSolver::junctions(double* y, int max_its, int* outer) {
         double* tv[2 * MAXSA];
         int nu = 0;
         for (int q = 0; q < nsa_; ++q) {
-            if (!sa_[q].fix1) tv[nu++] = &sa_[q].t1;
+            if (!sa_[q].fix1 && !touch(sa_[q])) tv[nu++] = &sa_[q].t1;
             if (!sa_[q].fix2) tv[nu++] = &sa_[q].t2;
         }
         double* const J = H_;                            // J and N in H_ (dead until the next inner solve)
@@ -599,26 +646,11 @@ bool StateSolver::junctions(double* y, int max_its, int* outer) {
         ++*outer;
         for (int i = 0; i < ny; ++i) y0[i] = y[i];
         for (int k = 0; k < nu; ++k) tau0[k] = *tv[k];
-        // (J^T J + lam I) d = -J^T g with a tiny lam: Newton when J is regular; a junction that does
-        // not move its residual (e.g. entry inside a fully saturated arc, where v_j = 0 anyway) stays put
-        double dm = 0.0;
-        for (int a = 0; a < nu; ++a) {
-            double s = 0.0;
-            for (int i = 0; i < ng; ++i) s -= J[i * nu + a] * g[i];
-            d[a] = s;
-            for (int b = 0; b < nu; ++b) {
-                double t = 0.0;
-                for (int i = 0; i < ng; ++i) t += J[i * nu + a] * J[i * nu + b];
-                N[a * nu + b] = t;
-            }
-            dm = fmax(dm, N[a * nu + a]);
-        }
-        for (int a = 0; a < nu; ++a) N[a * nu + a] += 1e-10 * dm;
-        if (!lu_solve(N, nu, nu, d, 1, 1)) { strcpy(why_, "singular junction Jacobian"); return false; }
+        if (!lsq(J, g, ng, nu, N, d)) { strcpy(why_, "singular junction Jacobian"); return false; }
         double zd[NY];                                   // Z d (Z_ is overwritten by the inner solves)
         for (int i = 0; i < ny; ++i) {
             double s = 0.0;
-            for (int k = 0; k < nu; ++k) s += Z_[i * 2 * MAXSA + k] * d[k];
+            for (int k = 0; k < nu; ++k) s += Z_[i * ZC + k] * d[k];
             zd[i] = s;
         }
         bool acc = false, fix2s[MAXSA];
@@ -630,10 +662,11 @@ bool StateSolver::junctions(double* y, int max_its, int* outer) {
             for (int q = 0; q < nsa_; ++q) {
                 StateArc& s = sa_[q];
                 if (!s.fix2 && s.t2 >= T * (1 - 1e-9)) { s.t2 = T; s.fix2 = true; }
+                if (s.fix2 && !s.fix1 && s.t1 >= T * (1 - 1e-9)) s.t1 = T;   // entry at T: terminal touch
                 if (!s.fix1 && s.t1 <= 1e-9 * T) bad = true;
                 for (int o = 0; o < q; ++o)
                     if (sa_[o].chain == s.chain && s.t1 < sa_[o].t2 && sa_[o].t1 < s.t2) bad = true;
-                if (s.t2 - s.t1 <= 1e-9 * T) {           // collapse only if no shorter step avoids it
+                if (!touch(s) && s.t2 - s.t1 <= 1e-9 * T) {   // collapse only if no shorter step avoids it
                     if (al <= 1.0 / 256) { collapsed_ = q; return false; }
                     bad = true;
                 }
@@ -659,7 +692,7 @@ double StateSolver::scan(const double* c, const double* y, int j, int side, doub
                          double* ta, double* tb) const {
     const Solver& B = base_;
     const Ev& e = ev_[0];
-    const double T = B.p_->T, b = side > 0 ? hi_[j] : lo_[j];
+    const double T = B.p_->T, b = bnd(j, side);
     double top = B.x0_[B.off_[j] + B.p_->orders[j] - 1], worst = -HUGE_VAL, V[MAXM][4];
     *ta = 0.0; *tb = T;
     bool pend = tw >= 0.0;
@@ -713,7 +746,7 @@ double StateSolver::check(const double* y, int* wc, int* ws, double* ta, double*
     release_ = -1;
     for (int j = 0; j < B.m_; ++j)
         for (int side = -1; side <= 1; side += 2) {
-            const double b = side > 0 ? hi_[j] : lo_[j];
+            const double b = bnd(j, side);
             if (!isfinite(b)) continue;
             const double v = scan(c, y, j, side, -1.0, &xx, &xa, &xb) / (1.0 + fabs(b));
             if (v > worst) { worst = v; *wc = j; *ws = side; tw = xx; }
@@ -755,6 +788,9 @@ double StateSolver::check(const double* y, int* wc, int* ws, double* ta, double*
             if (sa_[q].fix2 && t1 >= T && sa_[q].side * pval(bb, 4, L) < -TOL_SIGN * nrm * T) release_ = q;
         }
     }
+    // terminal touch: its multiplier is the whole jump Delta, side * Delta <= 0 (as on every entry)
+    for (int q = 0; q < nsa_; ++q)
+        if (touch(sa_[q]) && sa_[q].side * y[B.n_ + q] > 1e-12) release_ = q;
     *psign = ps;
     *ppmp = pp / B.R_;
     // states of relative degree > 1 are not enforced, only verified (exact extrema per arc)
@@ -817,6 +853,12 @@ const char* StateSolver::sequence(const uint16_t* S, int narcs, const StateArc* 
         buf[k] = 0;
     }
     return buf;
+}
+
+void StateSolver::drop(int q, double* y, unsigned* gone) {
+    *gone |= 1u << sa_[q].chain;
+    for (; q + 1 < nsa_; ++q) { sa_[q] = sa_[q + 1]; y[base_.n_ + q] = y[base_.n_ + q + 1]; }
+    --nsa_;
 }
 
 void StateSolver::fill(StateResult& r) const {
@@ -885,9 +927,8 @@ bool StateSolver::run(StateResult& r, int warm) {
             if (!junctions(y, cap, &r.outer)) {
                 if (collapsed_ >= 0) {                       // collapsed arc: q = 1 touch = drop it
                     sequence(ev_[0].S, ev_[0].narcs, sa_, nsa_, ev_[0].tau, seq, sizeof seq);
-                    gone |= 1u << sa_[collapsed_].chain;
-                    for (int q = collapsed_; q + 1 < nsa_; ++q) { sa_[q] = sa_[q + 1]; y[n + q] = y[n + q + 1]; }
-                    --nsa_;
+                    if (sa_[collapsed_].fix2) sa_[collapsed_].t1 = T;   // rode to T: becomes the terminal touch
+                    else drop(collapsed_, y, &gone);
                     if (!inner(y, cap)) {
                         snprintf(why_, sizeof why_, "arc order rejected: %s (arc collapsed, re-solve failed)", seq);
                         why = why_;
@@ -905,6 +946,11 @@ bool StateSolver::run(StateResult& r, int warm) {
         double ta, tb, tw, ps, pp;
         const double viol = check(y, &wc, &ws, &ta, &tb, &tw, &ps, &pp);
         r.state_violation = viol; r.sign_violation = ps; r.pmp_violation = pp;
+        if (release_ >= 0 && touch(sa_[release_])) {         // touch with the wrong sign: the bound is not active
+            drop(release_, y, &gone);
+            if (!inner(y, cap)) why = why_;
+            continue;
+        }
         if (release_ >= 0) {                                 // exit before T: free t2 just below T
             StateArc& s = sa_[release_];
             s.fix2 = false;
@@ -923,23 +969,35 @@ bool StateSolver::run(StateResult& r, int warm) {
             break;
         }
         if (viol > TOL_X) {
-            if (nsa_ >= MAXSA) { why = "state arc capacity LQOCP_MAXSA exceeded"; break; }
+            // a terminal touch on this chain grows into the arc; a violation next to an arc on the same bound
+            // (gap shorter than the arc) extends that arc: the free arc between them dies
+            int k = nsa_;
+            for (int q = 0; q < nsa_; ++q) {
+                const StateArc& a = sa_[q];
+                if (a.chain != wc) continue;
+                if (touch(a) && tb >= T) k = q;
+                else if (a.side == ws && !touch(a) && fmax(a.t1 - tb, ta - a.t2) < a.t2 - a.t1) {
+                    k = q;
+                    ta = fmin(ta, a.t1);
+                    tb = fmax(tb, a.t2);
+                }
+            }
+            if (k == MAXSA) { why = "state arc capacity LQOCP_MAXSA exceeded"; break; }
             if (gone & (1u << wc)) {                         // the arc collapsed but the violation is back
                 snprintf(why_, sizeof why_, "arc order rejected: %s (boundary arc on %c collapsed, violation remains)", seq, CH[wc]);
                 why = why_;
                 break;
             }
             for (int q = 0; q < nsa_; ++q)
-                if (sa_[q].chain == wc && ta < sa_[q].t2 && tb > sa_[q].t1) why = "overlapping boundary arcs";
+                if (q != k && sa_[q].chain == wc && ta < sa_[q].t2 && tb > sa_[q].t1) why = "overlapping boundary arcs";
             if (why) break;
             // initial boundary arc: the violation interval [ta, tb]
-            StateArc& s = sa_[nsa_];
-            s.chain = (int8_t)wc; s.side = (int8_t)ws; s.b = ws > 0 ? hi_[wc] : lo_[wc];
+            StateArc& s = sa_[k];
+            s.chain = (int8_t)wc; s.side = (int8_t)ws; s.b = bnd(wc, ws);
             s.fix1 = ta <= 0.0; s.fix2 = tb >= T;
             s.t1 = s.fix1 ? 0.0 : ta;
             s.t2 = s.fix2 ? T : tb;
-            y[n + nsa_] = 0.0;
-            ++nsa_;
+            if (k == nsa_) y[n + nsa_++] = 0.0;
             ++r.inserted;
             const bool ok = inner(y, cap);
             if (!ok) {
@@ -950,7 +1008,7 @@ bool StateSolver::run(StateResult& r, int warm) {
             continue;
         }
         if (pp > 1e-9) { why = "PMP verification failed"; break; }
-        if (hiidx_ >= 0) {
+        if (hiidx_ >= 0 && hs_ >= 1.0) {                    // homotopy: only the target problem must hold
             snprintf(why_, sizeof why_, "unsupported constraint order: flat state %d violates its bound (relative degree > 1)", hiidx_);
             why = why_;
             break;
@@ -997,7 +1055,7 @@ bool StateSolver::solve_warm(StateResult& r, int max_its, double shift) {
         StateArc a = r.sa[q];
         if (!a.fix2) a.t2 -= shift;
         if (a.t2 <= 1e-9 * T) continue;                  // ended: drop
-        a.t1 -= shift;
+        if (!touch(a)) a.t1 -= shift;
         double d = r.y[n + q];
         if (a.fix1 || a.t1 <= 1e-9 * T) {
             // starts at 0: only valid with x0 on the bound (no entry condition); otherwise drop it and
@@ -1011,6 +1069,99 @@ bool StateSolver::solve_warm(StateResult& r, int max_its, double shift) {
     }
     r.nsa = k;
     return run(r, max_its);
+}
+
+// Excess of the tier-1 plan (dual y, no arcs) over each target bound: lo_ / hi_ become the bounds at s = 0
+__attribute__((noinline)) void StateSolver::start(const double* y) {
+    double c[MAXN], tw, ta, tb;
+    nsa_ = 0;
+    const bool ok = evaluate(y, ev_[0], false);
+    cvec(y, c);
+    for (int j = 0; j < base_.m_; ++j)
+        for (int side = -1; side <= 1; side += 2) {
+            double& b0 = side > 0 ? hi_[j] : lo_[j];
+            b0 = tgt(j, side);
+            if (ok && isfinite(b0)) b0 += side * fmax(0.0, scan(c, y, j, side, -1.0, &tw, &ta, &tb));
+        }
+}
+
+// IFT predictor from the accepted point in r (current s) to s + h. Leaves r unchanged if the predicted
+// junction times leave the valid region (arc shorter than 0, overlap, entry at 0).
+__attribute__((noinline)) void StateSolver::predict(StateResult& r, double h) {
+    const double T = base_.p_->T;
+    const int n = base_.n_;
+    double dth[2 * MAXSA], dy[NY];
+    StateArc a[MAXSA];
+    nsa_ = r.nsa;
+    for (int q = 0; q < nsa_; ++q) sa_[q] = a[q] = r.sa[q];
+    if (!nsa_ || !tangent(r.y, dth, dy)) return;
+    for (int q = 0, k = 0; q < nsa_; ++q) {
+        if (!a[q].fix1 && !touch(a[q])) a[q].t1 += dth[k++] * h;
+        if (!a[q].fix2) a[q].t2 += dth[k++] * h;
+        if (a[q].fix2 && a[q].t1 >= T * (1 - 1e-9)) a[q].t1 = T;   // entry reached T: terminal touch
+        if ((!a[q].fix1 && a[q].t1 <= 1e-9 * T) || (!touch(a[q]) && a[q].t2 - a[q].t1 <= 1e-9 * T) ||
+            (!a[q].fix2 && a[q].t2 >= T * (1 - 1e-9))) return;
+        for (int o = 0; o < q; ++o)
+            if (a[o].chain == a[q].chain && a[q].t1 < a[o].t2 && a[o].t1 < a[q].t2) return;
+    }
+    for (int q = 0; q < nsa_; ++q) r.sa[q] = a[q];
+    for (int i = 0; i < n + nsa_; ++i) r.y[i] += dy[i] * h;
+}
+
+__attribute__((noinline)) void StateSolver::stalled(StateResult& r, double s) {   // own frame: det
+    char det[200];
+    strncpy(det, r.failure ? r.failure : "?", sizeof det - 1); det[sizeof det - 1] = 0;
+    snprintf(why_, sizeof why_, "homotopy stalled at s = %.4g: %s", s, det);
+    r.failure = why_;
+}
+
+// Cold solve by continuation in the state bounds (NOTES.md 14.6). s = 0: tier 1, each violated bound starts
+// at the tier-1 plan's peak (start), b(s) = s target + (1 - s) peak. Each step runs the junction solver (run:
+// Newton corrector, arc insertion at new violations = births, collapse / wrong sign = deaths) at b(s1), from
+// the last accepted point moved along the IFT tangent (predict). The first step is s = 0 -> 1, i.e. the
+// direct solve; a failed step is halved, an accepted one doubles the next.
+bool StateSolver::solve(StateResult& r) {
+    const int n = base_.n_;
+    hs_ = 1.0;
+    r.steps = 0;
+    r.outer = 0;
+    r.converged = false;
+    r.cost = HUGE_VAL;
+    if (!cold(r)) return false;
+    int its = its_, outer = 0, nb = 0;
+    double yb[NY], s = 0.0, ds = 1.0;                    // last accepted point: yb, sb, nb at s
+    StateArc sb[MAXSA];
+    for (int i = 0; i < n; ++i) yb[i] = r.y[i];
+    for (;;) {
+        const double s1 = fmin(1.0, s + ds);
+        r.nsa = nb;
+        for (int q = 0; q < nb; ++q) r.sa[q] = sb[q];
+        for (int i = 0; i < n + nb; ++i) r.y[i] = yb[i];
+        predict(r, s1 - s);
+        hs_ = s1;
+        for (int q = 0; q < nb; ++q) r.sa[q].b = bnd(r.sa[q].chain, r.sa[q].side);
+        ++r.steps;
+        const bool ok = run(r, MAX_NEWTON);
+        its += r.iterations;
+        outer += r.outer;
+        if (ok) {
+            s = s1;
+            if (s >= 1.0) break;
+            nb = r.nsa;
+            for (int q = 0; q < nb; ++q) sb[q] = r.sa[q];
+            for (int i = 0; i < n + nb; ++i) yb[i] = r.y[i];
+            ds = fmin(2.0 * ds, 1.0 - s);
+        } else if ((ds *= 0.5) < 1.0 / 256) {
+            stalled(r, s);
+            break;
+        } else if (ds == 0.5) {
+            start(yb);                                   // the direct solve failed: bounds at s = 0
+        }
+    }
+    hs_ = 1.0;
+    r.iterations = its;
+    r.outer = outer;
+    return r.converged;
 }
 
 void StateSolver::eval_u(const StateResult& r, double t, double u[MAXM]) const {

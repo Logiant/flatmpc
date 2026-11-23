@@ -10,6 +10,8 @@
 #ifndef LQOCP_STATE_HPP
 #define LQOCP_STATE_HPP
 
+#include <math.h>
+
 #include "lqocp.hpp"
 
 namespace lqocp {
@@ -23,6 +25,7 @@ constexpr int NY = MAXN + MAXSA;     // dual unknowns: nu (or mu with Qf), then 
 struct StateArc {
     int8_t chain, side;              // side +1: upper bound, -1: lower bound
     bool fix1, fix2;                 // t1 = 0 (x0 already at the bound) / t2 = T (rides to the end)
+                                     // fix2 with t1 = T: terminal touch, D_top(T) = b only
     double b, t1, t2;
 };
 
@@ -37,6 +40,7 @@ struct StateResult {
     int iterations;                  // inner Newton iterations (all solves)
     int outer;                       // junction-time Newton iterations
     int inserted;                    // boundary arcs inserted
+    int steps;                       // homotopy steps (solve: 1 = the direct solve at the target bounds)
     double residual, state_violation, pmp_violation, sign_violation;
     bool converged;
     const char* failure;
@@ -49,7 +53,8 @@ public:
     // which fails with "unsupported constraint order" if one is violated. p must stay alive.
     bool setup(const Problem& p, const double* slo, const double* shi);
     const char* setup_failure() const { return sfail_; }
-    bool solve(StateResult& r) { return run(r, -1); }
+    // cold solve by continuation in the state bounds (NOTES.md 14.6)
+    bool solve(StateResult& r);
     // MPC: from the previous arcs and dual iterate, at most max_its inner Newton iterations per solve.
     // shift: time the horizon moved since r was computed (arcs move left by it; an arc that now starts
     // at or before 0 starts at 0, one that ended is dropped). Update x0 with set_x0 first.
@@ -73,10 +78,11 @@ private:
     };
     Solver base_;                    // tier 1 and the setup data
     const char* sfail_ = nullptr;
-    double lo_[MAXM], hi_[MAXM];     // bound on the top state of chain j
+    double lo_[MAXM], hi_[MAXM];     // bound on the top state of chain j at s = 0 (start; target until the first solve)
     double xlo_[MAXN], xhi_[MAXN];   // all flat-state bounds (relative degree > 1: verified only)
     mutable double hiord_;
     mutable int hiidx_, release_;    // release_: fix2 arc whose terminal multiplier has the wrong sign
+    double hs_ = 1.0;                // homotopy parameter s: bound(s) = s target + (1 - s) lo_ / hi_
     int nsa_;                        // working arcs (copied to / from StateResult)
     StateArc sa_[MAXSA];
     int ny_;
@@ -104,7 +110,20 @@ private:
     bool integrate(const double* c, const double* y, Ev& e, bool wantH);
     bool inner(double* y, int max_its);
     double wbasis(int i, double t, double tm) const;
-    bool gres(const double* y, double* g, int* ng, double* vs, double* J = nullptr);
+    bool gres(const double* y, double* g, int* ng, double* vs, double* J = nullptr, const double* zs = nullptr,
+              double* dgs = nullptr);
+    bool tangent(const double* y, double* dth, double* dy);
+    bool touch(const StateArc& s) const { return s.fix2 && s.t1 >= base_.p_->T; }
+    double tgt(int j, int side) const { const int i = base_.off_[j] + base_.p_->orders[j] - 1; return side > 0 ? xhi_[i] : xlo_[i]; }
+    double bnd(int j, int side) const {             // bound at the current s
+        const double t = tgt(j, side);
+        return (hs_ >= 1.0 || !isfinite(t)) ? t : t + (1.0 - hs_) * ((side > 0 ? hi_[j] : lo_[j]) - t);
+    }
+    double dbds(const StateArc& s) const { return tgt(s.chain, s.side) - (s.side > 0 ? hi_[s.chain] : lo_[s.chain]); }
+    void start(const double* y);
+    void predict(StateResult& r, double h);
+    void stalled(StateResult& r, double s);
+    void drop(int q, double* y, unsigned* gone);
     bool junctions(double* y, int max_its, int* outer);
     double scan(const double* c, const double* y, int j, int side, double tw, double* twout, double* ta, double* tb) const;
     double check(const double* y, int* wc, int* ws, double* ta, double* tb, double* tw, double* psign, double* ppmp) const;

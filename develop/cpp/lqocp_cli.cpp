@@ -196,7 +196,7 @@ int main(int argc, char** argv) {
         for (int i = 0; i + 1 < r.narcs; ++i) std::printf("%s%.17g", i ? ", " : "", r.tau[i]);
         std::printf("], \"iterations\": %d, \"solve_time_us\": %.3f, \"converged\": %s, \"method\": \"tier2\"",
                     r.iterations, us, ok ? "true" : "false");
-        std::printf(", \"junction_iterations\": %d, \"inserted\": %d, \"state_arcs\": [", r.outer, r.inserted);
+        std::printf(", \"junction_iterations\": %d, \"inserted\": %d, \"homotopy_steps\": %d, \"state_arcs\": [", r.outer, r.inserted, r.steps);
         for (int q = 0; q < r.nsa; ++q)
             std::printf("%s{\"chain\": %d, \"side\": %d, \"t1\": %.17g, \"t2\": %.17g}", q ? ", " : "",
                         r.sa[q].chain, r.sa[q].side, r.sa[q].t1, r.sa[q].t2);
