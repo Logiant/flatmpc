@@ -1492,8 +1492,10 @@ bool Solver::solve_reduced(Result& R, int max_its, int* its) {
 // =====================================================================================
 namespace {
 
+const double CHORD = 0.1;           // Newton: reuse the factored J while the residual contracts by this
 const double GTOL = 1e-12;           // junction residual tolerance (relative to R)
 const double STOL = 1e-9;            // walked vs Newton junction times (relative to T)
+const double WRESET = 0.3;          // warm start: a capped plan violating PMP by > WRESET*R restarts cold
 const double VTOL = 1e-9;            // PMP verification tolerance (relative to R)
 
 // exp and log without libm's lookup tables (a Teensy keeps those in RAM)
@@ -1650,15 +1652,25 @@ void reflect(double* const* R, int nr, int p, int col, int c1, const double* eta
     }
 }
 
-// t = row M (M row-major n x n with row stride ld). M is streamed row by row: it may live in
-// flash, where sequential reads are much cheaper than strided ones (Teensy 4.1).
-void rowmul(const double* row, const double* M, int n, int ld, double* t) {
-    for (int j = 0; j < n; ++j) t[j] = 0.0;
-    for (int i = 0; i < n; ++i) {
-        const double ri = row[i];
-        if (ri == 0.0) continue;
-        const double* Mi = M + i * ld;
-        for (int j = 0; j < n; ++j) t[j] += ri * Mi[j];
+// rows[0..nr) <- rows M (M row-major n x n), in place. Four rows per pass over M: each element of M
+// is read once per four rows (M may live in flash, slow on a Teensy 4.1; read row by row).
+void relmul(double (*rows)[NCOL], int nr, const double* M, int n) {
+    for (int r0 = 0; r0 < nr; r0 += 4) {
+        double t[4][N2];
+        const int k = (nr - r0 < 4) ? nr - r0 : 4;
+        for (int q = 0; q < 4; ++q)
+            for (int j = 0; j < n; ++j) t[q][j] = 0.0;
+        for (int i = 0; i < n; ++i) {
+            const double* Mi = M + i * n;
+            const double a0 = rows[r0][i], a1 = (k > 1) ? rows[r0 + 1][i] : 0.0,
+                         a2 = (k > 2) ? rows[r0 + 2][i] : 0.0, a3 = (k > 3) ? rows[r0 + 3][i] : 0.0;
+            for (int j = 0; j < n; ++j) {
+                const double m = Mi[j];
+                t[0][j] += a0 * m; t[1][j] += a1 * m; t[2][j] += a2 * m; t[3][j] += a3 * m;
+            }
+        }
+        for (int q = 0; q < k; ++q)
+            for (int j = 0; j < n; ++j) rows[r0 + q][j] = t[q][j];
     }
 }
 
@@ -1687,6 +1699,8 @@ void matvec(const double* M, int n, int ld, const double* v, double* t) {
 }  // namespace
 
 bool GSolver::setup(const Problem& p, BasisFn fn, void* ctx) {
+    mt_.b = nullptr;
+    setup_failure = "unsupported dimensions";
     if (p.m < 1 || p.m > MAXM || !fn) return false;
     p_ = &p;
     bfn_ = fn;
@@ -1699,7 +1713,20 @@ bool GSolver::setup(const Problem& p, BasisFn fn, void* ctx) {
         n_ += p.orders[j];
         end_[j] = n_ - 1;
     }
-    if (n_ > MAXN || !(p.T > 0.0)) return false;
+    if (n_ > MAXN) return false;
+    setup_failure = "non-finite problem data or T <= 0";   // x0 is checked by set_x0
+    bool fin = p.T > 0.0 && isfinite(p.T);
+    for (int i = 0; i < n_; ++i) {
+        fin = fin && isfinite(p.xf[i]);
+        for (int j = 0; j < n_; ++j)
+            fin = fin && (!p.has_cost || isfinite(p.Q[i][j])) && (!p.has_Qf || isfinite(p.Qf[i][j]));
+    }
+    for (int r = 0; r < m_; ++r) {                     // +-inf bounds disable a side; NaN does not
+        fin = fin && (!p.has_bounds || (p.lo[r] == p.lo[r] && p.hi[r] == p.hi[r]));
+        for (int j = 0; j < m_; ++j) fin = fin && isfinite(p.R[r][j]) && isfinite(p.M[r][j]);
+    }
+    if (!fin) return false;
+    setup_failure = "R not SPD";
     set_x0(p.x0);
     // Cholesky R = Lc Lc^T (symmetrised)
     for (int i = 0; i < m_; ++i)
@@ -1744,6 +1771,7 @@ bool GSolver::setup(const Problem& p, BasisFn fn, void* ctx) {
     R_ = 1.0 + mx;
     nsets_ = 0;
     for_sets([&](uint16_t) { ++nsets_; return false; });
+    setup_failure = nullptr;
     return true;
 }
 
@@ -1976,13 +2004,15 @@ void GSolver::cexp(const Arc& a, double L, double* y, bool row, bool aff) const 
         for (int l = 0; l < ww; ++l) out[nc] += af * t2[l] * g[c0 + l];
     }
     for (int i = 0; i < nz; ++i) w[i] = y[i];
+    int lo = 0;                                        // w[0..lo) = 0 (w N^k moves down the staircase)
     for (int k = 0; k < ni; ++k) {
+        while (lo < nz && w[lo] == 0.0) ++lo;
         double wg = 0.0;
-        for (int i = 0; i < nz; ++i) { out[i] += w[i] * fk[k]; wg += w[i] * g[i]; }
+        for (int i = lo; i < nz; ++i) { out[i] += w[i] * fk[k]; wg += w[i] * g[i]; }
         out[nc] += af * wg * fk[k + 1];
         for (int l = nz; l < nc; ++l) {
             double s = 0.0;
-            for (int i = 0; i < nz; ++i) s += w[i] * T[i * nc + l];
+            for (int i = lo; i < nz; ++i) s += w[i] * T[i * nc + l];
             c[l] = s;
         }
         for (int q = 0; q < nb; ++q) {
@@ -1993,12 +2023,12 @@ void GSolver::cexp(const Arc& a, double L, double* y, bool row, bool aff) const 
             for (int l = 0; l < ww; ++l) out[nc] += af * t2[l] * g[c0 + l];
         }
         if (k + 1 < ni) {
-            for (int j = 0; j < nz; ++j) {
+            for (int j = lo; j < nz; ++j) {
                 double s = 0.0;
-                for (int i = 0; i < j; ++i) s += w[i] * T[i * nc + j];
+                for (int i = lo; i < j; ++i) s += w[i] * T[i * nc + j];
                 wn[j] = s;
             }
-            for (int i = 0; i < nz; ++i) w[i] = wn[i];
+            for (int i = lo; i < nz; ++i) w[i] = wn[i];
         }
     }
     for (int i = 0; i <= nc; ++i) y[i] = out[i];
@@ -2243,22 +2273,45 @@ double GSolver::sbound(const RowFn& f, int nder, double t, bool full) const {
     return B;
 }
 
+// fills mt_ for the arc of F at sig (and its bound factors of kind 1 or 2 at half-width h; kind 2:
+// node [lo, hi] with midpoint sig)
+void GSolver::mtab(const ArcFn& F, double sig, double h, int kind, double lo, double hi) const {
+    const SetBasis& b = *F.b;
+    const int n2 = 2 * n_, ns = b.ns, s1 = ns + b.nc;
+    const bool at = (mt_.b == F.b && mt_.L == F.L && mt_.sig == sig);
+    if (at && (kind == 0 || (mt_.kind == kind && mt_.h == h))) return;
+    for (int i = 0; i < n2; ++i) {
+        if (i == ns && s1 > ns) { i = s1 - 1; continue; }
+        const double re = b.re[i], om = b.im[i], anc = (i < ns) ? 0.0 : F.L, t = sig - anc;
+        if (!at) {
+            mt_.e[i] = xexp(re * t);
+            if (om != 0.0) { mt_.e[i + 1] = mt_.e[i]; mt_.cs[i] = cos(om * t); mt_.cs[i + 1] = sin(om * t); }
+        }
+        if (kind == 1) mt_.bnd[i] = xexp(re * t + sqrt(re * re + om * om) * h);
+        if (kind == 2) mt_.bnd[i] = xexp(re * (((re > 0) ? hi : lo) - anc));
+        if (om != 0.0) { mt_.bnd[i + 1] = mt_.bnd[i]; ++i; }
+    }
+    mt_.b = F.b; mt_.L = F.L; mt_.sig = sig;
+    if (kind) { mt_.kind = kind; mt_.h = h; }
+    else if (!at) mt_.kind = 0;
+}
+
 // derivatives d[0..nd] of f at sig (closed form)
 void GSolver::feval(const RowFn& f, double sig, int nd, double* d) const {
     const SetBasis& b = *f.F->b;
-    const double L = f.F->L;
     const int n2 = 2 * n_, ns = b.ns, s1 = ns + b.nc;
     for (int k = 0; k <= nd; ++k) d[k] = 0.0;
     d[0] = f.c0;
+    mtab(*f.F, sig, 0.0, 0);
     for (int i = 0; i < n2;) {
         if (i == ns && s1 > ns) { i = s1; continue; }
-        const double re = b.re[i], t = sig - ((i < ns) ? 0.0 : L), e = xexp(re * t);
+        const double re = b.re[i], e = mt_.e[i];
         if (b.im[i] == 0.0) {
             double v = f.u(i) * e;
             for (int k = 0; k <= nd; ++k) { d[k] += v; v *= re; }
             ++i;
         } else {
-            const double om = b.im[i], c = cos(om * t), sn = sin(om * t), P = f.u(i), Q = f.u(i + 1);
+            const double om = b.im[i], c = mt_.cs[i], sn = mt_.cs[i + 1], P = f.u(i), Q = f.u(i + 1);
             double x = e * (P * c + Q * sn), y = e * (P * sn - Q * c);
             for (int k = 0; k <= nd; ++k) {
                 d[k] += x;
@@ -2313,17 +2366,17 @@ double GSolver::node(const RowFn& f, double lo, double hi, double* d, double* M2
     const int n2 = 2 * n_, ns = b.ns, s1 = ns + b.nc, np = f.F->np;
     const double m = 0.5 * (lo + hi), h = 0.5 * (hi - lo), L = f.F->L;
     double d0 = f.c0, d1 = 0.0, M2 = 0.0, v = f.c0, v1 = 0.0, M2s = 0.0, E = 0.0;
+    mtab(*f.F, m, h, 2, lo, hi);
     for (int i = 0; i < n2;) {
         if (i == ns && s1 > ns) { i = s1; continue; }
-        const double re = b.re[i], anc = (i < ns) ? 0.0 : L, om = b.im[i];
-        const double e = xexp(re * (m - anc)), ee = xexp(re * (((re > 0) ? hi : lo) - anc));
+        const double re = b.re[i], om = b.im[i], e = mt_.e[i], ee = mt_.bnd[i];
         double x, x1, A;
         if (om == 0.0) {
             const double u = f.u(i);
             x = u * e; x1 = re * x; A = fabs(u);
             ++i;
         } else {
-            const double P = f.u(i), Q = f.u(i + 1), c = cos(om * (m - anc)), sn = sin(om * (m - anc));
+            const double P = f.u(i), Q = f.u(i + 1), c = mt_.cs[i], sn = mt_.cs[i + 1];
             x = e * (P * c + Q * sn);
             const double y = e * (P * sn - Q * c);
             x1 = re * x - om * y;
@@ -2511,11 +2564,12 @@ double GSolver::lead(const ArcFn& F, const double* G, double g0, double sig, dou
         const SetBasis& b = *F.b;
         const int n2 = 2 * n_, ns = b.ns, s1 = ns + b.nc;
         double B = fabs(f.c0) + R_, d0, x = 1.0;
+        mtab(F, sig, h, 1);
         for (int i = 0; i < n2;) {
             if (i == ns && s1 > ns) { i = s1; continue; }
-            const double re = b.re[i], om = b.im[i], t = sig - ((i < ns) ? 0.0 : F.L);
+            const double om = b.im[i];
             const double A = (om == 0.0) ? fabs(f.u(i)) : sqrt(f.u(i) * f.u(i) + f.u(i + 1) * f.u(i + 1));
-            B += A * xexp(re * t + sqrt(re * re + om * om) * h);
+            B += A * mt_.bnd[i];
             i += (om == 0.0) ? 1 : 2;
         }
         for (int k = 0; k < F.np; ++k) { B += fabs(f.p(k)) * x; x *= fabs(sig) + h; }
@@ -2811,17 +2865,18 @@ bool GSolver::fstep(const Arc& a, int nb) {
     const SetBasis& b = *a.b;
     const int n = n_, n2 = 2 * n, ns = b.ns, nc = b.nc, s1 = ns + nc;
     const int c1 = N2 + 1 + nb;
-    double t[N2 + 1], E[4], eu[N2];
+    if (nc == n2) { vstep(a); return ortho(c1); }
+    double E[4], eu[N2];
     for (int i = s1; i < n2;) {                        // e^{-Lu L}: (e) or (e cos, e sin) per block
         const int sz = mblk(b.re, b.im, i, -a.L, E);
         eu[i] = E[0];
         if (sz == 2) eu[i + 1] = E[1];
         i += sz;
     }
+    relmul(rel_, n, b.W, n2);                          // modal coordinates: rows W
     for (int r = 0; r < n; ++r) {
-        double* row = rel_[r];
-        rowmul(row, b.W, n2, n2, t);                        // modal coordinates: row W
-        double d = row[N2];
+        double* t = rel_[r];
+        double d = t[N2];
         for (int j = 0; j < ns; ++j) d -= t[j] * a.yp[j];
         for (int j = s1; j < n2; ++j) d -= t[j] * a.yp[j];
         for (int i = s1; i < n2;) {                    // unstable part anchored at the arc end
@@ -2844,8 +2899,7 @@ bool GSolver::fstep(const Arc& a, int nb) {
             d -= t[s1];
             t[s1] = tu;
         }
-        for (int j = 0; j < n2; ++j) row[j] = t[j];
-        row[N2] = d;
+        t[N2] = d;
     }
     // eliminate the stable coefficients a with E_s a - eta_s = -yp_s (lower rows); the column of
     // a_i then holds the coefficients of eta_i
@@ -2875,12 +2929,51 @@ bool GSolver::fstep(const Arc& a, int nb) {
         }
         i += sz;
     }
-    for (int r = 0; r < n; ++r) {                      // back to z: eta = Wi z
-        double* row = rel_[r];
-        rowmul(row, b.Wi, n2, n2, t);
-        for (int j = 0; j < n2; ++j) row[j] = t[j];
+    relmul(rel_, n, b.Wi, n2);                         // back to z: eta = Wi z
+    return ortho(c1);
+}
+
+// Vertex arc (every channel fixed: P = 0, H = [[A, 0], [-Q, -A^T]] nilpotent, forcing f = (Bt q, 0)),
+// in z directly: C' = C e^{-HL} = sum_k w_k, w_k = C (-HL)^k / k!, d' = d + sum_k (w_k f) L / (k + 1)
+// (= C int_0^L e^{-Hs} f ds). Finite sums: w_k = 0 for k >= the nilpotency index (<= 2 n).
+void GSolver::vstep(const Arc& a) {
+    const int n = n_, n2 = 2 * n;
+    double f[MAXM];
+    for (int j = 0; j < m_; ++j) {
+        double s = 0.0;
+        for (int k = 0; k < m_; ++k) s += LiT_[j][k] * a.q[k];
+        f[j] = s;                                      // (Bt q) at row end_[j]
     }
-    // re-orthonormalise the rows (modified Gram-Schmidt, twice), same ops on rhs/sensitivities
+    for (int r = 0; r < n; ++r) {
+        double* row = rel_[r];
+        double w[N2], v[N2], d = row[N2];
+        for (int j = 0; j < n2; ++j) w[j] = row[j];
+        for (int k = 0; k <= n2; ++k) {
+            double wf = 0.0, nz = 0.0;
+            for (int j = 0; j < m_; ++j) wf += w[end_[j]] * f[j];
+            d += wf * a.L / (k + 1);
+            if (k) for (int j = 0; j < n2; ++j) row[j] += w[j];
+            for (int j = 0; j < n2; ++j) v[j] = 0.0;   // v = w H: s-part w_s A - w_l Q, l-part -w_l A^T
+            for (int i = 0; i < n; ++i)
+                if (w[n + i] != 0.0)                   // (w_l vanishes after the longest chain's steps)
+                    for (int j = 0; j < n; ++j) v[j] -= w[n + i] * 0.5 * (p_->Q[i][j] + p_->Q[j][i]);
+            for (int j = 0; j < m_; ++j)
+                for (int q = 0; q + 1 < p_->orders[j]; ++q) {
+                    const int i = off_[j] + q;
+                    v[i + 1] += w[i];
+                    v[n + i] -= w[n + i + 1];
+                }
+            const double c = -a.L / (k + 1);
+            for (int j = 0; j < n2; ++j) { w[j] = c * v[j]; nz += fabs(w[j]); }
+            if (nz == 0.0) break;
+        }
+        row[N2] = d;
+    }
+}
+
+// re-orthonormalise the relation rows (modified Gram-Schmidt, twice), same ops on rhs/sensitivities
+bool GSolver::ortho(int c1) {
+    const int n = n_, n2 = 2 * n;
     for (int i = 0; i < n; ++i) {
         for (int pass = 0; pass < 2; ++pass)
             for (int k = 0; k < i; ++k) {
@@ -3054,16 +3147,15 @@ bool GSolver::recover(const Arc& a, int nb, bool aff, double* xout, double* zb) 
         }
     }
     // upper rows: (C W)_s a = rhs - (C W)_s yp_s - (C W)_c c - (C W)_u u0
+    relmul(rel_, n, b.W, n2);
     for (int r = 0; r < n; ++r) {
         double* row = rel_[r];
-        rowmul(row, b.W, n2, n2, t);
         for (int c = 0; c < ncols; ++c) {
             double s = row[c0 + c];
-            if (aff) for (int j = 0; j < ns; ++j) s -= t[j] * a.yp[j];
-            for (int j = ns; j < n2; ++j) s -= t[j] * (aff ? zb[j] : (double)Z_[j][c]);
+            if (aff) for (int j = 0; j < ns; ++j) s -= row[j] * a.yp[j];
+            for (int j = ns; j < n2; ++j) s -= row[j] * (aff ? zb[j] : (double)Z_[j][c]);
             row[c0 + c] = s;
         }
-        for (int j = 0; j < ns; ++j) row[j] = t[j];
     }
     // QR of the upper a-part (Householder), then absorb the lower rows E_s a = eta_s - yp_s
     for (int k = 0; k < ns; ++k) {
@@ -3313,15 +3405,32 @@ bool GSolver::newton_tau(uint16_t* seq, int* Np, double* tau, int* its) {
     double r[NR], rn[NR], tn[NA], d[NR];
     double rmax = resid(seq, N, tau, r);
     const double tol = GTOL * R_, gap = 1e-12 * p_->T;
-    double prev = HUGE_VAL;
+    double prev = HUGE_VAL, hv[NJ], hvv[NJ];
     int bad = 0;
-    while (*its < MAX_TAU_NEWTON && budget_ > 0) {
+    bool fact = false;                                // J_ holds the QR of the current structure's J
+    int nfresh = 0, nchord = 0;
+    while (nfresh < MAX_TAU_NEWTON && nchord < 2 * MAX_TAU_NEWTON && budget_ > 0) {
         const int nj = N - 1;
         if (rmax <= tol) { *Np = N; return true; }
         if (rmax > 0.5 * prev && ++bad > 2) { *Np = N; return rmax <= 1e3 * tol; }
+        // chord step (reuse the factored J) while the last step contracted well
+        const bool chord = fact && rmax <= CHORD * prev;
         prev = rmax;
         ++*its;
         --budget_;
+        bool sing = false;
+        if (chord) ++nchord;
+        else ++nfresh;
+        if (chord) {
+            for (int q = 0; q < nr; ++q) J_[q][nj] = (real)(-r[q]);
+            for (int k = 0; k < nj; ++k) {              // stored reflections (v below the diagonal)
+                double s = hv[k] * J_[k][nj];
+                for (int q = k + 1; q < nr; ++q) s += J_[q][k] * J_[q][nj];
+                s *= 2.0 / hvv[k];
+                J_[k][nj] = (real)(J_[k][nj] - s * hv[k]);
+                for (int q = k + 1; q < nr; ++q) J_[q][nj] = (real)(J_[q][nj] - s * J_[q][k]);
+            }
+        } else {
         if (nr < nj || !sens(seq, N, tau)) { *Np = N; return false; }
         for (int q = 0; q < nr; ++q) {
             const int k = jq_[q];
@@ -3332,7 +3441,7 @@ bool GSolver::newton_tau(uint16_t* seq, int* Np, double* tau, int* its) {
         double jmax = 0.0;
         for (int q = 0; q < nr; ++q)
             for (int c = 0; c < nj; ++c) jmax = fmax(jmax, fabs(J_[q][c]));
-        bool sing = !(jmax > 0.0);
+        sing = !(jmax > 0.0);
         for (int k = 0; k < nj && !sing; ++k) {
             double sg = 0.0, *v = rn;                  // rn is free until the line search
             for (int q = k; q < nr; ++q) { v[q] = J_[q][k]; sg += v[q] * v[q]; }
@@ -3348,6 +3457,11 @@ bool GSolver::newton_tau(uint16_t* seq, int* Np, double* tau, int* its) {
                 s *= 2.0 / vv;
                 for (int q = k; q < nr; ++q) J_[q][c] = (real)(J_[q][c] - s * v[q]);
             }
+            hv[k] = v[k];
+            hvv[k] = vv;
+            for (int q = k + 1; q < nr; ++q) J_[q][k] = (real)v[q];
+        }
+        fact = !sing;
         }
         if (sing) { *Np = N; return false; }
         for (int i = nj - 1; i >= 0; --i) {
@@ -3383,6 +3497,7 @@ bool GSolver::newton_tau(uint16_t* seq, int* Np, double* tau, int* its) {
                 return false;
             }
             ++events_;
+            fact = false;
             if (nr == 0) { *Np = N; return true; }
             rmax = resid(seq, N, tau, r);
             prev = HUGE_VAL;
@@ -3404,6 +3519,7 @@ bool GSolver::newton_tau(uint16_t* seq, int* Np, double* tau, int* its) {
             }
             alpha *= 0.5;
         }
+        if (!acc && chord && bvp(seq, N, tau)) { fact = false; continue; }   // retry with a fresh J
         if (!acc) {
             bvp(seq, N, tau);                         // restore the state of tau
             *Np = N;
@@ -3524,7 +3640,8 @@ bool GSolver::cold(GResult& R, int max_its) {
     bool conv = false;
     const char* why = nullptr;
     if (!bvp(aseq_, 1, atau_)) {
-        R.failure = bfail() ? bfail() : "linear BVP singular (infeasible endpoint?)";
+        R.failure = bfail() ? bfail() : p_->has_Qf ? "linear BVP singular (ill-conditioned data?)"
+                                                   : "linear BVP singular (infeasible endpoint?)";
         return false;
     }
     if (!p_->has_bounds) {
@@ -3548,8 +3665,9 @@ bool GSolver::cold(GResult& R, int max_its) {
             for (;;) {
                 if (kap == 1.0) { conv = true; break; }
                 if (budget_ <= 0) { why = "iteration cap reached"; break; }
-                if (dl < DL_MIN) { why = "homotopy stalled at bound scale > 1 (bounds infeasible?)"; break; }
-                if (zmax(aseq_, an_, atau_) > 1e8 * (1.0 + z0)) { why = "costate diverged (bounds infeasible?)"; break; }
+                if (dl < DL_MIN) { why = p_->has_Qf ? "homotopy stalled at bound scale > 1 (ill-conditioned: |x0| too large?)"
+                                                  : "homotopy stalled at bound scale > 1 (bounds infeasible?)"; break; }
+                if (zmax(aseq_, an_, atau_) > 1e8 * (1.0 + z0)) { why = p_->has_Qf ? "costate diverged (ill-conditioned: |x0| too large?)" : "costate diverged (bounds infeasible?)"; break; }
                 const int sn = an_;
                 for (int i = 0; i < sn; ++i) sseq[i] = aseq_[i];
                 for (int i = 0; i + 1 < sn; ++i) stau[i] = atau_[i];
@@ -3598,9 +3716,11 @@ bool GSolver::cold(GResult& R, int max_its) {
 // tau and the exact walk at the true bounds: no homotopy. If that fails with iterations left, the
 // cold solve (homotopy) takes over. At most max_its Newton iterations in all; when the cap is hit,
 // R is the current iterate (it satisfies the dynamics and both boundary conditions) with
-// converged = false.
+// converged = false. A previous plan that is not converged and violates PMP by more than WRESET*R
+// (a stale active set asking for inputs far outside the box) is not reused: cold restart.
 bool GSolver::solve_warm(GResult& R, double dt, int max_its) {
-    if (R.narcs < 1 || R.narcs > NA || !x0ok_) return cold(R, max_its);
+    if (R.narcs < 1 || R.narcs > NA || !x0ok_ || (!R.converged && !(R.pmp_violation <= WRESET * R_)))
+        return cold(R, max_its);
     const double T = p_->T;
     an_ = 0;
     for (int k = 0; k < R.narcs; ++k) {

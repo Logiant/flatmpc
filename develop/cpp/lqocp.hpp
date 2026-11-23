@@ -285,7 +285,9 @@ struct GResult {
 class GSolver {
 public:
     // p must stay alive (it is referenced, not copied). R = Lc Lc^T must be SPD.
+    // On false, setup_failure says why (bad dimensions, non-finite data, R not SPD).
     bool setup(const Problem& p, BasisFn fn, void* ctx);
+    const char* setup_failure = nullptr;
     bool solve(GResult& r);
     // MPC warm start from the previous solution in r (x0 updated in the Problem; junction times
     // shifted by -dt); at most max_its Newton iterations (then r is the current iterate)
@@ -375,6 +377,11 @@ private:
     real Z_[N2][NB];                 // backward sensitivities
     double Dj_[NB][MAXM];            // jumps of the sensitivity block (chain-end entries)
     mutable Arc ac_;                 // scratch arc (sweep step, walk, zstart)
+    // modal factors at one point of one arc, shared by all switching rows evaluated there (walk):
+    // e = e^{Re lam (sig - anc)}, cs = (cos, sin)(Im lam (sig - anc)) of a pair, bnd = the bound
+    // factor of lead() (kind 1) or node() (kind 2) at half-width h
+    mutable struct { const SetBasis* b; double L, sig, h; int kind; double e[N2], cs[N2], bnd[N2]; } mt_;
+    void mtab(const ArcFn& F, double sig, double h, int kind, double lo = 0.0, double hi = 0.0) const;
     real J_[NR][NJ + 1];             // junction Jacobian | residual
 
     void wt_of(const double* lam, double* wt) const;
@@ -418,6 +425,8 @@ private:
     double gmax_ratio(const uint16_t* seq, int N, const double* tau);
     void init_rel();
     bool fstep(const Arc& a, int nb);
+    void vstep(const Arc& a);
+    bool ortho(int c1);
     void jump(const uint16_t* seq, int N, const double* tau, int j, double* D) const;
     void inject(int k, int b0, int nb);
     bool advance(const uint16_t* seq, int N, const double* tau, int k, int b0, int nb);

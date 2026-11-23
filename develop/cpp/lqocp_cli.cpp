@@ -208,7 +208,8 @@ int main(int argc, char** argv) {
     }
     if (general) {
         if (!g_gsolver.setup(p, lqocp::BasisBuilder::fn, &g_basis)) {
-            std::fprintf(stderr, "problem setup failed (unsupported dimensions or R not SPD)\n");
+            std::fprintf(stderr, "problem setup failed (%s)\n", g_gsolver.setup_failure);
+            std::printf("{\"cost\": null, \"converged\": false, \"failure\": \"setup: %s\"}\n", g_gsolver.setup_failure);
             return 3;
         }
         g_basis.attach(&g_gsolver);
