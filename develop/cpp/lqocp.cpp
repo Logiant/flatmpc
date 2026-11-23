@@ -1244,15 +1244,25 @@ void reflect(double* const* R, int nr, int p, int col, int c1, const double* eta
     }
 }
 
-// t = row M (M row-major n x n with row stride ld). M is streamed row by row: it may live in
-// flash, where sequential reads are much cheaper than strided ones (Teensy 4.1).
-void rowmul(const double* row, const double* M, int n, int ld, double* t) {
-    for (int j = 0; j < n; ++j) t[j] = 0.0;
-    for (int i = 0; i < n; ++i) {
-        const double ri = row[i];
-        if (ri == 0.0) continue;
-        const double* Mi = M + i * ld;
-        for (int j = 0; j < n; ++j) t[j] += ri * Mi[j];
+// rows[0..nr) <- rows M (M row-major n x n), in place. Four rows per pass over M: each element of M
+// is read once per four rows (M may live in flash, slow on a Teensy 4.1; read row by row).
+void relmul(double (*rows)[NCOL], int nr, const double* M, int n) {
+    for (int r0 = 0; r0 < nr; r0 += 4) {
+        double t[4][N2];
+        const int k = (nr - r0 < 4) ? nr - r0 : 4;
+        for (int q = 0; q < 4; ++q)
+            for (int j = 0; j < n; ++j) t[q][j] = 0.0;
+        for (int i = 0; i < n; ++i) {
+            const double* Mi = M + i * n;
+            const double a0 = rows[r0][i], a1 = (k > 1) ? rows[r0 + 1][i] : 0.0,
+                         a2 = (k > 2) ? rows[r0 + 2][i] : 0.0, a3 = (k > 3) ? rows[r0 + 3][i] : 0.0;
+            for (int j = 0; j < n; ++j) {
+                const double m = Mi[j];
+                t[0][j] += a0 * m; t[1][j] += a1 * m; t[2][j] += a2 * m; t[3][j] += a3 * m;
+            }
+        }
+        for (int q = 0; q < k; ++q)
+            for (int j = 0; j < n; ++j) rows[r0 + q][j] = t[q][j];
     }
 }
 
@@ -2420,17 +2430,17 @@ bool GSolver::fstep(const Arc& a, int nb) {
     const SetBasis& b = *a.b;
     const int n = n_, n2 = 2 * n, ns = b.ns, nc = b.nc, s1 = ns + nc;
     const int c1 = N2 + 1 + nb;
-    double t[N2 + 1], E[4], eu[N2];
+    double E[4], eu[N2];
     for (int i = s1; i < n2;) {                        // e^{-Lu L}: (e) or (e cos, e sin) per block
         const int sz = mblk(b.re, b.im, i, -a.L, E);
         eu[i] = E[0];
         if (sz == 2) eu[i + 1] = E[1];
         i += sz;
     }
+    relmul(rel_, n, b.W, n2);                          // modal coordinates: rows W
     for (int r = 0; r < n; ++r) {
-        double* row = rel_[r];
-        rowmul(row, b.W, n2, n2, t);                        // modal coordinates: row W
-        double d = row[N2];
+        double* t = rel_[r];
+        double d = t[N2];
         for (int j = 0; j < ns; ++j) d -= t[j] * a.yp[j];
         for (int j = s1; j < n2; ++j) d -= t[j] * a.yp[j];
         for (int i = s1; i < n2;) {                    // unstable part anchored at the arc end
@@ -2453,8 +2463,7 @@ bool GSolver::fstep(const Arc& a, int nb) {
             d -= t[s1];
             t[s1] = tu;
         }
-        for (int j = 0; j < n2; ++j) row[j] = t[j];
-        row[N2] = d;
+        t[N2] = d;
     }
     // eliminate the stable coefficients a with E_s a - eta_s = -yp_s (lower rows); the column of
     // a_i then holds the coefficients of eta_i
@@ -2484,11 +2493,7 @@ bool GSolver::fstep(const Arc& a, int nb) {
         }
         i += sz;
     }
-    for (int r = 0; r < n; ++r) {                      // back to z: eta = Wi z
-        double* row = rel_[r];
-        rowmul(row, b.Wi, n2, n2, t);
-        for (int j = 0; j < n2; ++j) row[j] = t[j];
-    }
+    relmul(rel_, n, b.Wi, n2);                         // back to z: eta = Wi z
     // re-orthonormalise the rows (modified Gram-Schmidt, twice), same ops on rhs/sensitivities
     for (int i = 0; i < n; ++i) {
         for (int pass = 0; pass < 2; ++pass)
@@ -2663,16 +2668,15 @@ bool GSolver::recover(const Arc& a, int nb, bool aff, double* xout, double* zb) 
         }
     }
     // upper rows: (C W)_s a = rhs - (C W)_s yp_s - (C W)_c c - (C W)_u u0
+    relmul(rel_, n, b.W, n2);
     for (int r = 0; r < n; ++r) {
         double* row = rel_[r];
-        rowmul(row, b.W, n2, n2, t);
         for (int c = 0; c < ncols; ++c) {
             double s = row[c0 + c];
-            if (aff) for (int j = 0; j < ns; ++j) s -= t[j] * a.yp[j];
-            for (int j = ns; j < n2; ++j) s -= t[j] * (aff ? zb[j] : (double)Z_[j][c]);
+            if (aff) for (int j = 0; j < ns; ++j) s -= row[j] * a.yp[j];
+            for (int j = ns; j < n2; ++j) s -= row[j] * (aff ? zb[j] : (double)Z_[j][c]);
             row[c0 + c] = s;
         }
-        for (int j = 0; j < ns; ++j) row[j] = t[j];
     }
     // QR of the upper a-part (Householder), then absorb the lower rows E_s a = eta_s - yp_s
     for (int k = 0; k < ns; ++k) {
