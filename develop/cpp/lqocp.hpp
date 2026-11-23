@@ -335,6 +335,11 @@ private:
     real Z_[N2][NB];                 // backward sensitivities
     double Dj_[NB][MAXM];            // jumps of the sensitivity block (chain-end entries)
     mutable Arc ac_;                 // scratch arc (sweep step, walk, zstart)
+    // modal factors at one point of one arc, shared by all switching rows evaluated there (walk):
+    // e = e^{Re lam (sig - anc)}, cs = (cos, sin)(Im lam (sig - anc)) of a pair, bnd = the bound
+    // factor of lead() (kind 1) or node() (kind 2) at half-width h
+    mutable struct { const SetBasis* b; double L, sig, h; int kind; double e[N2], cs[N2], bnd[N2]; } mt_;
+    void mtab(const ArcFn& F, double sig, double h, int kind, double lo = 0.0, double hi = 0.0) const;
     real J_[NR][NJ + 1];             // junction Jacobian | residual
 
     void wt_of(const double* lam, double* wt) const;

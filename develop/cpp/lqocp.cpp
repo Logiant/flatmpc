@@ -1291,6 +1291,7 @@ void matvec(const double* M, int n, int ld, const double* v, double* t) {
 }  // namespace
 
 bool GSolver::setup(const Problem& p, BasisFn fn, void* ctx) {
+    mt_.b = nullptr;
     setup_failure = "unsupported dimensions";
     if (p.m < 1 || p.m > MAXM || !fn) return false;
     p_ = &p;
@@ -1862,22 +1863,45 @@ double GSolver::sbound(const RowFn& f, int nder, double t, bool full) const {
     return B;
 }
 
+// fills mt_ for the arc of F at sig (and its bound factors of kind 1 or 2 at half-width h; kind 2:
+// node [lo, hi] with midpoint sig)
+void GSolver::mtab(const ArcFn& F, double sig, double h, int kind, double lo, double hi) const {
+    const SetBasis& b = *F.b;
+    const int n2 = 2 * n_, ns = b.ns, s1 = ns + b.nc;
+    const bool at = (mt_.b == F.b && mt_.L == F.L && mt_.sig == sig);
+    if (at && (kind == 0 || (mt_.kind == kind && mt_.h == h))) return;
+    for (int i = 0; i < n2; ++i) {
+        if (i == ns && s1 > ns) { i = s1 - 1; continue; }
+        const double re = b.re[i], om = b.im[i], anc = (i < ns) ? 0.0 : F.L, t = sig - anc;
+        if (!at) {
+            mt_.e[i] = xexp(re * t);
+            if (om != 0.0) { mt_.e[i + 1] = mt_.e[i]; mt_.cs[i] = cos(om * t); mt_.cs[i + 1] = sin(om * t); }
+        }
+        if (kind == 1) mt_.bnd[i] = xexp(re * t + sqrt(re * re + om * om) * h);
+        if (kind == 2) mt_.bnd[i] = xexp(re * (((re > 0) ? hi : lo) - anc));
+        if (om != 0.0) { mt_.bnd[i + 1] = mt_.bnd[i]; ++i; }
+    }
+    mt_.b = F.b; mt_.L = F.L; mt_.sig = sig;
+    if (kind) { mt_.kind = kind; mt_.h = h; }
+    else if (!at) mt_.kind = 0;
+}
+
 // derivatives d[0..nd] of f at sig (closed form)
 void GSolver::feval(const RowFn& f, double sig, int nd, double* d) const {
     const SetBasis& b = *f.F->b;
-    const double L = f.F->L;
     const int n2 = 2 * n_, ns = b.ns, s1 = ns + b.nc;
     for (int k = 0; k <= nd; ++k) d[k] = 0.0;
     d[0] = f.c0;
+    mtab(*f.F, sig, 0.0, 0);
     for (int i = 0; i < n2;) {
         if (i == ns && s1 > ns) { i = s1; continue; }
-        const double re = b.re[i], t = sig - ((i < ns) ? 0.0 : L), e = xexp(re * t);
+        const double re = b.re[i], e = mt_.e[i];
         if (b.im[i] == 0.0) {
             double v = f.u(i) * e;
             for (int k = 0; k <= nd; ++k) { d[k] += v; v *= re; }
             ++i;
         } else {
-            const double om = b.im[i], c = cos(om * t), sn = sin(om * t), P = f.u(i), Q = f.u(i + 1);
+            const double om = b.im[i], c = mt_.cs[i], sn = mt_.cs[i + 1], P = f.u(i), Q = f.u(i + 1);
             double x = e * (P * c + Q * sn), y = e * (P * sn - Q * c);
             for (int k = 0; k <= nd; ++k) {
                 d[k] += x;
@@ -1932,17 +1956,17 @@ double GSolver::node(const RowFn& f, double lo, double hi, double* d, double* M2
     const int n2 = 2 * n_, ns = b.ns, s1 = ns + b.nc, np = f.F->np;
     const double m = 0.5 * (lo + hi), h = 0.5 * (hi - lo), L = f.F->L;
     double d0 = f.c0, d1 = 0.0, M2 = 0.0, v = f.c0, v1 = 0.0, M2s = 0.0, E = 0.0;
+    mtab(*f.F, m, h, 2, lo, hi);
     for (int i = 0; i < n2;) {
         if (i == ns && s1 > ns) { i = s1; continue; }
-        const double re = b.re[i], anc = (i < ns) ? 0.0 : L, om = b.im[i];
-        const double e = xexp(re * (m - anc)), ee = xexp(re * (((re > 0) ? hi : lo) - anc));
+        const double re = b.re[i], om = b.im[i], e = mt_.e[i], ee = mt_.bnd[i];
         double x, x1, A;
         if (om == 0.0) {
             const double u = f.u(i);
             x = u * e; x1 = re * x; A = fabs(u);
             ++i;
         } else {
-            const double P = f.u(i), Q = f.u(i + 1), c = cos(om * (m - anc)), sn = sin(om * (m - anc));
+            const double P = f.u(i), Q = f.u(i + 1), c = mt_.cs[i], sn = mt_.cs[i + 1];
             x = e * (P * c + Q * sn);
             const double y = e * (P * sn - Q * c);
             x1 = re * x - om * y;
@@ -2130,11 +2154,12 @@ double GSolver::lead(const ArcFn& F, const double* G, double g0, double sig, dou
         const SetBasis& b = *F.b;
         const int n2 = 2 * n_, ns = b.ns, s1 = ns + b.nc;
         double B = fabs(f.c0) + R_, d0, x = 1.0;
+        mtab(F, sig, h, 1);
         for (int i = 0; i < n2;) {
             if (i == ns && s1 > ns) { i = s1; continue; }
-            const double re = b.re[i], om = b.im[i], t = sig - ((i < ns) ? 0.0 : F.L);
+            const double om = b.im[i];
             const double A = (om == 0.0) ? fabs(f.u(i)) : sqrt(f.u(i) * f.u(i) + f.u(i + 1) * f.u(i + 1));
-            B += A * xexp(re * t + sqrt(re * re + om * om) * h);
+            B += A * mt_.bnd[i];
             i += (om == 0.0) ? 1 : 2;
         }
         for (int k = 0; k < F.np; ++k) { B += fabs(f.p(k)) * x; x *= fabs(sig) + h; }
