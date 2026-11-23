@@ -1596,13 +1596,15 @@ void GSolver::cexp(const Arc& a, double L, double* y, bool row, bool aff) const 
         for (int l = 0; l < ww; ++l) out[nc] += af * t2[l] * g[c0 + l];
     }
     for (int i = 0; i < nz; ++i) w[i] = y[i];
+    int lo = 0;                                        // w[0..lo) = 0 (w N^k moves down the staircase)
     for (int k = 0; k < ni; ++k) {
+        while (lo < nz && w[lo] == 0.0) ++lo;
         double wg = 0.0;
-        for (int i = 0; i < nz; ++i) { out[i] += w[i] * fk[k]; wg += w[i] * g[i]; }
+        for (int i = lo; i < nz; ++i) { out[i] += w[i] * fk[k]; wg += w[i] * g[i]; }
         out[nc] += af * wg * fk[k + 1];
         for (int l = nz; l < nc; ++l) {
             double s = 0.0;
-            for (int i = 0; i < nz; ++i) s += w[i] * T[i * nc + l];
+            for (int i = lo; i < nz; ++i) s += w[i] * T[i * nc + l];
             c[l] = s;
         }
         for (int q = 0; q < nb; ++q) {
@@ -1613,12 +1615,12 @@ void GSolver::cexp(const Arc& a, double L, double* y, bool row, bool aff) const 
             for (int l = 0; l < ww; ++l) out[nc] += af * t2[l] * g[c0 + l];
         }
         if (k + 1 < ni) {
-            for (int j = 0; j < nz; ++j) {
+            for (int j = lo; j < nz; ++j) {
                 double s = 0.0;
-                for (int i = 0; i < j; ++i) s += w[i] * T[i * nc + j];
+                for (int i = lo; i < j; ++i) s += w[i] * T[i * nc + j];
                 wn[j] = s;
             }
-            for (int i = 0; i < nz; ++i) w[i] = wn[i];
+            for (int i = lo; i < nz; ++i) w[i] = wn[i];
         }
     }
     for (int i = 0; i <= nc; ++i) y[i] = out[i];
