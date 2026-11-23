@@ -188,7 +188,7 @@ int main(int argc, char** argv) {
     std::printf("], \"iterations\": %d, \"solve_time_us\": %.3f, \"converged\": %s, \"method\": \"%s\"",
                 its, us, conv ? "true" : "false", method.c_str());
     if (!conv) {
-        const char* why = general ? g_gresult.failure : "not converged";
+        const char* why = general ? g_gresult.failure : g_result.failure;
         std::printf(", \"failure\": \"%s\"", why ? why : "not converged");
     }
     std::printf("}\n");

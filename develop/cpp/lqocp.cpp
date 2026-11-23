@@ -1,6 +1,7 @@
 // Solver core. See lqocp.hpp and develop/NOTES.md. No heap, no exceptions, no STL.
 #include "lqocp.hpp"
 
+#include <float.h>
 #include <math.h>
 #include <string.h>
 
@@ -8,19 +9,27 @@ namespace lqocp {
 
 namespace {
 
-const double GL_X[4] = {-0.86113631159405257522, -0.33998104358485626480,
+// Round-off tolerances below are written for double as k * DBL_EPSILON; TS rescales them to
+// the scalar type (1 in double, 2^29 in float). see NOTES 13.6.
+const real EPS = sizeof(real) == 4 ? FLT_EPSILON : DBL_EPSILON;
+#ifndef LQOCP_FTOL
+#define LQOCP_FTOL 32
+#endif
+const real TS = sizeof(real) == 4 ? LQOCP_FTOL * FLT_EPSILON / 1e-12 : 1.0;
+
+const real GL_X[4] = {-0.86113631159405257522, -0.33998104358485626480,
                         0.33998104358485626480, 0.86113631159405257522};
-const double GL_W[4] = {0.34785484513745385737, 0.65214515486254614263,
+const real GL_W[4] = {0.34785484513745385737, 0.65214515486254614263,
                         0.65214515486254614263, 0.34785484513745385737};
 
-double fact(int k) {
-    double f = 1.0;
+real fact(int k) {
+    real f = 1.0;
     for (int i = 2; i <= k; ++i) f *= i;
     return f;
 }
 
-double ipow(double x, int k) {
-    double r = 1.0;
+real ipow(real x, int k) {
+    real r = 1.0;
     for (int i = 0; i < k; ++i) r *= x;
     return r;
 }
@@ -29,30 +38,30 @@ double ipow(double x, int k) {
 // nrhs right-hand sides stored column-wise in B (row stride ldb). Returns false if singular.
 template <class T>
 bool lu_solve(T* A, int n, int ld, T* B, int nrhs, int ldb) {
-    double amax = 0.0;
+    T amax = 0.0;
     for (int i = 0; i < n; ++i)
         for (int j = 0; j < n; ++j) amax = fmax(amax, fabs(A[i * ld + j]));
-    if (amax == 0.0) return false;
+    if (amax == T(0)) return false;
     for (int k = 0; k < n; ++k) {
         int piv = k;
-        double best = fabs(A[k * ld + k]);
+        T best = fabs(A[k * ld + k]);
         for (int i = k + 1; i < n; ++i)
             if (fabs(A[i * ld + k]) > best) { best = fabs(A[i * ld + k]); piv = i; }
-        if (best <= 1e-300 || best < 1e-15 * amax * 1e-3) return false;
+        if (best <= T(1e-300) || best < T(1e-15) * amax * T(1e-3)) return false;
         if (piv != k) {
             for (int j = 0; j < n; ++j) { T t = A[k * ld + j]; A[k * ld + j] = A[piv * ld + j]; A[piv * ld + j] = t; }
             for (int j = 0; j < nrhs; ++j) { T t = B[k * ldb + j]; B[k * ldb + j] = B[piv * ldb + j]; B[piv * ldb + j] = t; }
         }
         for (int i = k + 1; i < n; ++i) {
-            double f = A[i * ld + k] / A[k * ld + k];
-            if (f == 0.0) continue;
+            T f = A[i * ld + k] / A[k * ld + k];
+            if (f == T(0)) continue;
             for (int j = k + 1; j < n; ++j) A[i * ld + j] -= f * A[k * ld + j];
             for (int j = 0; j < nrhs; ++j) B[i * ldb + j] -= f * B[k * ldb + j];
         }
     }
     for (int j = 0; j < nrhs; ++j) {
         for (int i = n - 1; i >= 0; --i) {
-            double s = B[i * ldb + j];
+            T s = B[i * ldb + j];
             for (int k = i + 1; k < n; ++k) s -= A[i * ld + k] * B[k * ldb + j];
             B[i * ldb + j] = s / A[i * ld + i];
         }
@@ -91,43 +100,43 @@ bool Solver::setup(const Problem& p) {
         for (int j = 0; j < m_; ++j) { Lc_[i][j] = 0.0; Lci_[i][j] = (i == j) ? 1.0 : 0.0; }
     if (!rI_) {
         for (int j = 0; j < m_; ++j) {
-            double d = p.R[j][j];
+            real d = p.R[j][j];
             for (int k = 0; k < j; ++k) d -= Lc_[j][k] * Lc_[j][k];
             if (!(d > 0.0)) return false;           // R not SPD
             Lc_[j][j] = sqrt(d);
             for (int i = j + 1; i < m_; ++i) {
-                double s = p.R[i][j];
+                real s = p.R[i][j];
                 for (int k = 0; k < j; ++k) s -= Lc_[i][k] * Lc_[j][k];
                 Lc_[i][j] = s / Lc_[j][j];
             }
         }
         for (int j = 0; j < m_; ++j)                 // Lci = Lc^-1, column j by forward substitution
             for (int i = 0; i < m_; ++i) {
-                double s = (i == j) ? 1.0 : 0.0;
+                real s = (i == j) ? 1.0 : 0.0;
                 for (int k = 0; k < i; ++k) s -= Lc_[i][k] * Lci_[k][j];
                 Lci_[i][j] = s / Lc_[i][i];
             }
     }
-    double Mrow[MAXM][MAXM];
+    real Mrow[MAXM][MAXM];
     for (int r = 0; r < m_; ++r)
         for (int j = 0; j < m_; ++j) {
-            double s = 0.0;
+            real s = 0.0;
             for (int k = 0; k < m_; ++k) s += p.M[r][k] * Lci_[j][k];
             Mrow[r][j] = rI_ ? p.M[r][j] : s;
         }
     // Qf = Cf^T Cf (Cf = L^T, semidefinite Cholesky: a zero pivot leaves a zero row)
     for (int i = 0; i < MAXN * MAXN; ++i) Cf_[i] = 0.0;
     if (qf_) {
-        double qmax = 0.0;
+        real qmax = 0.0;
         for (int i = 0; i < n_; ++i) qmax = fmax(qmax, fabs(p.Qf[i][i]));
         for (int j = 0; j < n_; ++j) {
-            double d = p.Qf[j][j];
+            real d = p.Qf[j][j];
             for (int k = 0; k < j; ++k) d -= Cf_[k * MAXN + j] * Cf_[k * MAXN + j];
-            if (d < -1e-12 * qmax) return false;    // Qf not PSD
-            if (d <= 1e-14 * qmax) continue;
+            if (d < -1e-12 * TS * qmax) return false;    // Qf not PSD
+            if (d <= 1e-14 * TS * qmax) continue;
             Cf_[j * MAXN + j] = sqrt(d);
             for (int i = j + 1; i < n_; ++i) {
-                double s = p.Qf[i][j];
+                real s = p.Qf[i][j];
                 for (int k = 0; k < j; ++k) s -= Cf_[k * MAXN + i] * Cf_[k * MAXN + j];
                 Cf_[j * MAXN + i] = s / Cf_[j * MAXN + j];
             }
@@ -166,9 +175,9 @@ bool Solver::setup(const Problem& p) {
     }
     // newton-mode data
     R_ = 1.0;
-    double mx = 0.0;
+    real mx = 0.0;
     for (int k = 0; k < 2 * m_; ++k) {
-        double s = 0.0;
+        real s = 0.0;
         for (int j = 0; j < m_; ++j) s += rows_[k][j] * rows_[k][j];
         rownorm2_[k] = s;
         if (finite_[k]) mx = fmax(mx, fabs(rhs_[k]));
@@ -185,14 +194,14 @@ bool Solver::setup(const Problem& p) {
         for (int r = 0; r < k; ++r) {
             const int mm = k - 1 - r;
             for (int q = 0; q <= mm; ++q) {
-                const double binom = fact(mm) / (fact(q) * fact(mm - q));
+                const real binom = fact(mm) / (fact(q) * fact(mm - q));
                 Lm_[(o + q) * MAXN + (o + r)] =
                     binom * ipow(p.T, mm - q) * ((q % 2) ? -1.0 : 1.0) / fact(mm);
             }
         }
     }
     {
-        double A[MAXN * MAXN];
+        real A[MAXN * MAXN];
         for (int i = 0; i < MAXN * MAXN; ++i) A[i] = Lm_[i];
         for (int i = 0; i < n_; ++i) Linv_[i * MAXN + i] = 1.0;
         if (!lu_solve(A, n_, MAXN, Linv_, n_, MAXN)) return false;
@@ -205,24 +214,24 @@ bool Solver::set_x0(const double* x0) {
         if (!isfinite(x0[i])) return false;
         x0_[i] = x0[i];
     }
-    phi_x0(p_->T, free_);
+    phi_x0((real)p_->T, free_);
     for (int i = 0; i < n_; ++i) {
-        double s = 0.0;
-        for (int j = i; j < n_; ++j) s += Cf_[i * MAXN + j] * (p_->xf[j] - free_[j]);
+        real s = 0.0;
+        for (int j = i; j < n_; ++j) s += Cf_[i * MAXN + j] * ((real)p_->xf[j] - free_[j]);
         g_[i] = s;
     }
     return true;
 }
 
-void Solver::w_of(const double* c, double t, double* w) const {
+void Solver::w_of(const real* c, real t, real* w) const {
     for (int j = 0; j < m_; ++j) {
-        double s = 0.0, tp = 1.0;
+        real s = 0.0, tp = 1.0;
         for (int k = 0; k < p_->orders[j]; ++k) { s += c[off_[j] + k] * tp; tp *= t; }
         w[j] = s;
     }
 }
 
-void Solver::phib(double dt, double K[MAXN][MAXM]) const {
+void Solver::phib(real dt, real K[MAXN][MAXM]) const {
     for (int i = 0; i < n_; ++i)
         for (int j = 0; j < m_; ++j) K[i][j] = 0.0;
     for (int j = 0; j < m_; ++j) {
@@ -231,18 +240,18 @@ void Solver::phib(double dt, double K[MAXN][MAXM]) const {
     }
 }
 
-void Solver::phi_x0(double dt, double* s) const {
+void Solver::phi_x0(real dt, real* s) const {
     for (int j = 0; j < m_; ++j) {
         int k = p_->orders[j], o = off_[j];
         for (int r = 0; r < k; ++r) {
-            double acc = 0.0;
+            real acc = 0.0;
             for (int l = r; l < k; ++l) acc += ipow(dt, l - r) / fact(l - r) * x0_[o + l];
             s[o + r] = acc;
         }
     }
 }
 
-bool Solver::affine(uint16_t S, double P[MAXM][MAXM], double q[MAXM]) const {
+bool Solver::affine(uint16_t S, real P[MAXM][MAXM], real q[MAXM]) const {
     int idx[MAXM], na = 0;
     for (int k = 0; k < 2 * m_; ++k)
         if (S & (1u << k)) { if (na >= MAXM) return false; idx[na++] = k; }
@@ -251,11 +260,11 @@ bool Solver::affine(uint16_t S, double P[MAXM][MAXM], double q[MAXM]) const {
         for (int j = 0; j < m_; ++j) P[i][j] = (i == j) ? 1.0 : 0.0;
     }
     if (na == 0) return true;
-    double G[MAXM * MAXM], X[MAXM * (MAXM + 1)];
+    real G[MAXM * MAXM], X[MAXM * (MAXM + 1)];
     const int ldx = MAXM + 1;
     for (int a = 0; a < na; ++a) {
         for (int b = 0; b < na; ++b) {
-            double s = 0.0;
+            real s = 0.0;
             for (int j = 0; j < m_; ++j) s += rows_[idx[a]][j] * rows_[idx[b]][j];
             G[a * MAXM + b] = s;
         }
@@ -265,7 +274,7 @@ bool Solver::affine(uint16_t S, double P[MAXM][MAXM], double q[MAXM]) const {
     if (!lu_solve(G, na, MAXM, X, m_ + 1, ldx)) return false;
     for (int i = 0; i < m_; ++i) {
         for (int a = 0; a < na; ++a) {
-            double ai = rows_[idx[a]][i];
+            real ai = rows_[idx[a]][i];
             for (int j = 0; j < m_; ++j) P[i][j] -= ai * X[a * ldx + j];
             q[i] += ai * X[a * ldx + m_];
         }
@@ -273,20 +282,20 @@ bool Solver::affine(uint16_t S, double P[MAXM][MAXM], double q[MAXM]) const {
     return true;
 }
 
-bool Solver::pq(uint16_t S, double P[MAXM][MAXM], double q[MAXM]) const {
+bool Solver::pq(uint16_t S, real P[MAXM][MAXM], real q[MAXM]) const {
     if (!affine(S, P, q)) return false;
     if (rI_) return true;
-    double Pt[MAXM][MAXM], qt[MAXM];               // back to v = Lc^-T vt
+    real Pt[MAXM][MAXM], qt[MAXM];               // back to v = Lc^-T vt
     for (int a = 0; a < m_; ++a) {
         qt[a] = q[a];
         for (int b = 0; b < m_; ++b) {
-            double t = 0.0;
+            real t = 0.0;
             for (int k = 0; k < m_; ++k) t += P[a][k] * Lci_[k][b];
             Pt[a][b] = t;
         }
     }
     for (int a = 0; a < m_; ++a) {
-        double t = 0.0;
+        real t = 0.0;
         for (int k = 0; k < m_; ++k) t += Lci_[k][a] * qt[k];
         q[a] = t;
         for (int b = 0; b < m_; ++b) {
@@ -299,44 +308,44 @@ bool Solver::pq(uint16_t S, double P[MAXM][MAXM], double q[MAXM]) const {
 }
 
 bool Solver::sets_ok(const uint16_t* S, int n) const {
-    double P[MAXM][MAXM], q[MAXM];
+    real P[MAXM][MAXM], q[MAXM];
     for (int i = 0; i < n; ++i)
         if (!affine(S[i], P, q)) return false;
     return true;
 }
 
-void Solver::v_on(const double P[MAXM][MAXM], const double* q, const double* c, double t, double* v) const {
-    double w[MAXM];
+void Solver::v_on(const real P[MAXM][MAXM], const real* q, const real* c, real t, real* v) const {
+    real w[MAXM];
     w_of(c, t, w);
     for (int i = 0; i < m_; ++i) {
-        double s = q[i];
+        real s = q[i];
         for (int j = 0; j < m_; ++j) s += P[i][j] * w[j];
         v[i] = s;
     }
 }
 
-void Solver::assemble(const uint16_t* S, const double* tau, int n, double* G, double* h) const {
+void Solver::assemble(const uint16_t* S, const real* tau, int n, real* G, real* h) const {
     // s(T) = G c + h ; G is also the exact Jacobian ds(T)/dc. Row i of e^{A(T-t)} B has one
     // nonzero, (T-t)^(k-1-r)/(k-1-r)! in column l (state i = entry r of chain l, order k).
-    double P[MAXM][MAXM], q[MAXM], KP[MAXM], tp[MAXK];
-    memset(G, 0, sizeof(double) * MAXN * MAXN);
+    real P[MAXM][MAXM], q[MAXM], KP[MAXM], tp[MAXK];
+    memset(G, 0, sizeof(real) * MAXN * MAXN);
     for (int i = 0; i < n_; ++i) h[i] = free_[i];
     for (int a = 0; a < n; ++a) {
-        double t0, t1;
+        real t0, t1;
         span(tau, n, a, &t0, &t1);
         if (!(t1 > t0)) continue;
         pq(S[a], P, q);
-        const double hw = 0.5 * (t1 - t0);
+        const real hw = 0.5 * (t1 - t0);
         for (int g = 0; g < 4; ++g) {
-            const double t = t0 + hw * (GL_X[g] + 1.0);
-            const double wg = GL_W[g] * hw;
+            const real t = t0 + hw * (GL_X[g] + 1.0);
+            const real wg = GL_W[g] * hw;
             tp[0] = 1.0;
             for (int k = 1; k < MAXK; ++k) tp[k] = tp[k - 1] * t;
             for (int l = 0; l < m_; ++l) {
                 const int k = p_->orders[l];
                 for (int r = 0; r < k; ++r) {
                     const int i = off_[l] + r;
-                    const double K = ipow(p_->T - t, k - 1 - r) / fact(k - 1 - r);
+                    const real K = ipow((real)p_->T - t, k - 1 - r) / fact(k - 1 - r);
                     for (int j = 0; j < m_; ++j) KP[j] = wg * (K * P[l][j]);
                     h[i] += wg * (K * q[l]);
                     for (int j = 0; j < m_; ++j)
@@ -348,19 +357,19 @@ void Solver::assemble(const uint16_t* S, const double* tau, int n, double* G, do
 }
 
 // uses G_ and W_
-bool Solver::solve_c(const uint16_t* S, const double* tau, int n, double* c) const {
-    double h[MAXN];
-    double* M = G_;
+bool Solver::solve_c(const uint16_t* S, const real* tau, int n, real* c) const {
+    real h[MAXN];
+    real* M = G_;
     assemble(S, tau, n, G_, h);
-    for (int i = 0; i < n_; ++i) h[i] = p_->xf[i] - h[i];
+    for (int i = 0; i < n_; ++i) h[i] = (real)p_->xf[i] - h[i];
     if (qf_) {
-        double b[MAXN];
+        real b[MAXN];
         for (int i = 0; i < n_; ++i) {
             b[i] = 0.0;
-            for (int k = 0; k < n_; ++k) b[i] += p_->Qf[i][k] * h[k];
+            for (int k = 0; k < n_; ++k) b[i] += (real)p_->Qf[i][k] * h[k];
             for (int j = 0; j < n_; ++j) {
-                double t = Linv_[i * MAXN + j];
-                for (int k = 0; k < n_; ++k) t += p_->Qf[i][k] * G_[k * MAXN + j];
+                real t = Linv_[i * MAXN + j];
+                for (int k = 0; k < n_; ++k) t += (real)p_->Qf[i][k] * G_[k * MAXN + j];
                 W_[i * MAXN + j] = t;
             }
         }
@@ -372,48 +381,48 @@ bool Solver::solve_c(const uint16_t* S, const double* tau, int n, double* c) con
     return true;
 }
 
-double Solver::cost(const uint16_t* S, const double* tau, int n, const double* c) const {
-    double J = 0.0, v[MAXM], P[MAXM][MAXM], q[MAXM];
+real Solver::cost(const uint16_t* S, const real* tau, int n, const real* c) const {
+    real J = 0.0, v[MAXM], P[MAXM][MAXM], q[MAXM];
     for (int a = 0; a < n; ++a) {
-        double t0, t1;
+        real t0, t1;
         span(tau, n, a, &t0, &t1);
         pq(S[a], P, q);
-        const double hw = 0.5 * (t1 - t0);
+        const real hw = 0.5 * (t1 - t0);
         for (int g = 0; g < 4; ++g) {
             v_on(P, q, c, t0 + hw * (GL_X[g] + 1.0), v);
-            double s = 0.0;
+            real s = 0.0;
             for (int j = 0; j < m_; ++j) s += rI_ ? v[j] * v[j] : v[j] * vR(j, v);
             J += 0.5 * GL_W[g] * hw * s;
         }
     }
     if (qf_) {
-        double h[MAXN], e[MAXN];
+        real h[MAXN], e[MAXN];
         assemble(S, tau, n, G_, h);
         for (int i = 0; i < n_; ++i) {
-            e[i] = h[i] - p_->xf[i];
+            e[i] = h[i] - (real)p_->xf[i];
             for (int j = 0; j < n_; ++j) e[i] += G_[i * MAXN + j] * c[j];
         }
         for (int i = 0; i < n_; ++i)
-            for (int j = 0; j < n_; ++j) J += 0.5 * e[i] * p_->Qf[i][j] * e[j];
+            for (int j = 0; j < n_; ++j) J += 0.5 * e[i] * (real)p_->Qf[i][j] * e[j];
     }
     return J;
 }
 
 #ifndef LQOCP_NO_TAU
-bool Solver::residual(const uint16_t* S, int nseq, const double* tau, double* res, int* nres,
-                      double* c) const {
+bool Solver::residual(const uint16_t* S, int nseq, const real* tau, real* res, int* nres,
+                      real* c) const {
     if (!solve_c(S, tau, nseq, c)) return false;
     int nr = 0;
-    double v[MAXM], P[MAXM][MAXM], q[MAXM];
+    real v[MAXM], P[MAXM][MAXM], q[MAXM];
     for (int k = 0; k + 1 < nseq; ++k) {
         const uint16_t L = S[k], R = S[k + 1], X = (uint16_t)(L ^ R);
         for (int key = 0; key < 2 * m_; ++key) {
             if (!(X & (1u << key))) continue;
             pq((R & (1u << key)) ? L : R, P, q);   // the side where key is inactive
             v_on(P, q, c, tau[k], v);
-            double g = -rhs_[key];
+            real g = -rhs_[key];
             for (int j = 0; j < m_; ++j) {
-                double vt = rI_ ? v[j] : 0.0;
+                real vt = rI_ ? v[j] : 0.0;
                 if (!rI_) for (int i = j; i < m_; ++i) vt += Lc_[i][j] * v[i];
                 g += rows_[key][j] * vt;
             }
@@ -425,25 +434,25 @@ bool Solver::residual(const uint16_t* S, int nseq, const double* tau, double* re
     return true;
 }
 
-bool Solver::newton(const uint16_t* S, int nseq, double* tau, double* c, int* its, double* resmax) const {
+bool Solver::newton(const uint16_t* S, int nseq, real* tau, real* c, int* its, real* resmax) const {
     const int nj = nseq - 1;
-    const double tol = 1e-12;
-    const double T = p_->T;
-    double r[MAXRES], rp[MAXRES], rm[MAXRES], rn[MAXRES];
-    double J[MAXRES][MAXJ_TAU];
-    double tn[MAXJ_TAU], tt[MAXJ_TAU], cn[MAXN], ctmp[MAXN];
+    const real tol = 1e-12;
+    const real T = (real)p_->T;
+    real r[MAXRES], rp[MAXRES], rm[MAXRES], rn[MAXRES];
+    real J[MAXRES][MAXJ_TAU];
+    real tn[MAXJ_TAU], tt[MAXJ_TAU], cn[MAXN], ctmp[MAXN];
     int nr, nr2;
     *its = 0;
     if (!residual(S, nseq, tau, r, &nr, c)) return false;
-    double rmax = 0.0;
+    real rmax = 0.0;
     for (int i = 0; i < nr; ++i) rmax = fmax(rmax, fabs(r[i]));
     *resmax = rmax;
     if (nj == 0) return true;
-    const double gap = 1e-9 * T;
+    const real gap = 1e-9 * T;
     for (int it = 1; it <= MAX_NEWTON; ++it) {
         if (rmax < tol) return true;
         *its = it;
-        const double hstep = 1e-7 * fmax(1.0, T);
+        const real hstep = 1e-7 * fmax(1.0, T);
         for (int i = 0; i < nj; ++i) {
             for (int q = 0; q < nj; ++q) tt[q] = tau[q];
             tt[i] = tau[i] + hstep;
@@ -453,34 +462,34 @@ bool Solver::newton(const uint16_t* S, int nseq, double* tau, double* c, int* it
             for (int q = 0; q < nr; ++q) J[q][i] = (rp[q] - rm[q]) / (2.0 * hstep);
         }
         // Gauss-Newton step from the normal equations (J^T J) d = -J^T r
-        double N[MAXJ_TAU * MAXJ_TAU], d[MAXJ_TAU];
+        real N[MAXJ_TAU * MAXJ_TAU], d[MAXJ_TAU];
         for (int a = 0; a < nj; ++a) {
-            double s = 0.0;
+            real s = 0.0;
             for (int q = 0; q < nr; ++q) s += J[q][a] * r[q];
             d[a] = -s;
             for (int b = 0; b < nj; ++b) {
-                double g = 0.0;
+                real g = 0.0;
                 for (int q = 0; q < nr; ++q) g += J[q][a] * J[q][b];
                 N[a * MAXJ_TAU + b] = g;
             }
         }
         if (!lu_solve(N, nj, MAXJ_TAU, d, 1, 1)) return false;
-        double nr0 = 0.0;
+        real nr0 = 0.0;
         for (int q = 0; q < nr; ++q) nr0 += r[q] * r[q];
         nr0 = sqrt(nr0);
-        double alpha = 1.0;
+        real alpha = 1.0;
         bool accepted = false;
         while (alpha > 1e-6) {
             bool ordered = true;
             for (int a = 0; a < nj; ++a) tn[a] = tau[a] + alpha * d[a];
-            double prev = 0.0;
+            real prev = 0.0;
             for (int a = 0; a <= nj; ++a) {
-                const double cur = (a < nj) ? tn[a] : T;
+                const real cur = (a < nj) ? tn[a] : T;
                 if (!(cur - prev > gap)) ordered = false;
                 prev = cur;
             }
             if (ordered && residual(S, nseq, tn, rn, &nr2, cn) && nr2 == nr) {
-                double nn = 0.0;
+                real nn = 0.0;
                 for (int q = 0; q < nr; ++q) nn += rn[q] * rn[q];
                 nn = sqrt(nn);
                 if (nn < (1.0 - 1e-4 * alpha) * nr0 || nn < tol) { accepted = true; break; }
@@ -525,7 +534,7 @@ bool Solver::start(Result& R, int method, int warm_its) {
 // Active-set sequence for the tau method: the exact event walk of the newton method (per arc and
 // row, the cubic gap's roots in closed form; section 7.3). Fails if the walk fails or needs more
 // junctions than the tau method supports.
-bool Solver::detect_exact(const double* c) {
+bool Solver::detect_exact(const real* c) {
     const Eval& e = ew_.ev[0];
     if (!walk(c, ew_.ev[0]) || e.narcs > MAXJ_TAU + 1) return false;
     ew_.nseq2 = e.narcs;
@@ -549,14 +558,14 @@ bool Solver::solve_tau(Result& R) {
     R.iterations = 1;
     bool conv = !p_->has_bounds;
     if (p_->has_bounds) {
-        double c_try[MAXN];
-        double c0n = 1.0;
+        real c_try[MAXN];
+        real c0n = 1.0;
         for (int i = 0; i < n_; ++i) c0n = fmax(c0n, 1.0 + fabs(R.c[i]));
         for (int outer = 1; outer <= MAX_OUTER; ++outer) {
             R.outer_iterations = outer;
             // early exits: iteration cap, diverging w (dual unbounded: infeasible)
             if (R.newton_iterations > MAX_TAU_TOTAL) break;
-            double cn = 0.0;
+            real cn = 0.0;
             for (int i = 0; i < n_; ++i) cn = fmax(cn, fabs(R.c[i]));
             if (cn > 1e6 * c0n) break;
             // 2) active-set sequence from the pointwise H-minimiser of the current w(t)
@@ -564,7 +573,7 @@ bool Solver::solve_tau(Result& R) {
             if (outer == 1 && ew_.nseq2 == 1 && ew_.seq2[0] == 0) { conv = true; break; }
             // 3) junction-time Newton with inner linear BC solve
             int its = 0;
-            double rmax = 0.0;
+            real rmax = 0.0;
             bool ok = newton(ew_.seq2, ew_.nseq2, ew_.tau2, c_try, &its, &rmax);
             R.newton_iterations += its;
             R.iterations += 1 + its;
@@ -599,49 +608,54 @@ bool Solver::solve_tau(Result& R) {
 
 void Solver::eval_u(const Result& R, double t, double u[MAXM]) const {
     if (t < 0.0) t = 0.0;
-    if (t > p_->T) t = p_->T;
+    if (t > (real)p_->T) t = (real)p_->T;
     int a = 0;
     while (a < R.narcs - 1 && t >= R.tau[a]) ++a;
-    double P[MAXM][MAXM], q[MAXM];
+    real P[MAXM][MAXM], q[MAXM];
     pq(R.S[a], P, q);
-    v_on(P, q, R.c, t, u);
+    real v[MAXM];
+    v_on(P, q, R.c, (real)t, v);
+    for (int j = 0; j < m_; ++j) u[j] = v[j];
 }
 
-void Solver::eval_x(const Result& R, double t, double x[MAXN]) const {
+void Solver::eval_x(const Result& R, double td, double xd[MAXN]) const {
+    real t = (real)td, x[MAXN];
     if (t < 0.0) t = 0.0;
-    if (t > p_->T) t = p_->T;
+    if (t > (real)p_->T) t = (real)p_->T;
     phi_x0(t, x);
-    double K[MAXN][MAXM], v[MAXM], P[MAXM][MAXM], q[MAXM];
+    real K[MAXN][MAXM], v[MAXM], P[MAXM][MAXM], q[MAXM];
     for (int a = 0; a < R.narcs; ++a) {
-        double t0, t1;
+        real t0, t1;
         span(R.tau, R.narcs, a, &t0, &t1);
         if (t0 >= t) break;
         if (t1 > t) t1 = t;
         pq(R.S[a], P, q);
-        const double hw = 0.5 * (t1 - t0);
+        const real hw = 0.5 * (t1 - t0);
         for (int g = 0; g < 4; ++g) {
-            const double tt = t0 + hw * (GL_X[g] + 1.0);
+            const real tt = t0 + hw * (GL_X[g] + 1.0);
             v_on(P, q, R.c, tt, v);
             phib(t - tt, K);
             for (int i = 0; i < n_; ++i) {
-                double s = 0.0;
+                real s = 0.0;
                 for (int j = 0; j < m_; ++j) s += K[i][j] * v[j];
                 x[i] += GL_W[g] * hw * s;
             }
         }
     }
+    for (int i = 0; i < n_; ++i) xd[i] = x[i];
 }
 
-bool Solver::mean_u(const Result& R, double t0, double t1, double u[MAXM]) const {
+bool Solver::mean_u(const Result& R, double t0d, double t1d, double u[MAXM]) const {
+    const real t0 = (real)t0d, t1 = (real)t1d;
     if (R.narcs < 1 || !(t1 > t0)) return false;
-    double acc[MAXM] = {0.0, 0.0, 0.0, 0.0}, v[MAXM], P[MAXM][MAXM], q[MAXM];
+    real acc[MAXM] = {0.0, 0.0, 0.0, 0.0}, v[MAXM], P[MAXM][MAXM], q[MAXM];
     for (int a = 0; a < R.narcs; ++a) {             // v is a cubic per arc: 4-point Gauss is exact
-        double a0, a1;
+        real a0, a1;
         span(R.tau, R.narcs, a, &a0, &a1);
-        const double lo = fmax(t0, a0), hi = fmin(t1, a1);
+        const real lo = fmax(t0, a0), hi = fmin(t1, a1);
         if (!(hi > lo)) continue;
         pq(R.S[a], P, q);
-        const double hw = 0.5 * (hi - lo);
+        const real hw = 0.5 * (hi - lo);
         for (int g = 0; g < 4; ++g) {
             v_on(P, q, R.c, lo + hw * (GL_X[g] + 1.0), v);
             for (int j = 0; j < m_; ++j) acc[j] += GL_W[g] * hw * v[j];
@@ -663,32 +677,30 @@ int Solver::switch_times(const Result& R, double* out, int maxout) const {
 // =====================================================================================
 namespace {
 
-const double EPS = 2.220446049250313e-16;
-
-double pval(const double* b, int len, double s) {
-    double r = 0.0;
+real pval(const real* b, int len, real s) {
+    real r = 0.0;
     for (int i = len - 1; i >= 0; --i) r = r * s + b[i];
     return r;
 }
 
 // coefficients of p(t0 + s) from those of p(t) (len <= 4)
-void shift(const double* a, int len, double t0, double* b) {
+void shift(const real* a, int len, real t0, real* b) {
     for (int i = 0; i < len; ++i) {
-        double s = 0.0;
+        real s = 0.0;
         for (int p = i; p < len; ++p) s += a[p] * (fact(p) / (fact(i) * fact(p - i))) * ipow(t0, p - i);
         b[i] = s;
     }
 }
 
-double pscale(const double* b, int len, double L) {
-    double s = 0.0;
+real pscale(const real* b, int len, real L) {
+    real s = 0.0;
     for (int i = 0; i < len; ++i) s += fabs(b[i]) * ipow(L, i);
     return s;
 }
 
 // Divide out the root at s=0 (drop leading coefficients with |b_i| L^i <= tol).
 // Returns reduced length (0 if ~identically zero); k = multiplicity removed.
-int strip(const double* b, int len, double L, double tol, double* red, int* kout) {
+int strip(const real* b, int len, real L, real tol, real* red, int* kout) {
     int k = 0;
     while (k < len && fabs(b[k]) * ipow(L, k) <= tol) ++k;
     *kout = k;
@@ -700,33 +712,33 @@ int strip(const double* b, int len, double L, double tol, double* red, int* kout
 }
 
 // real roots of a degree <= 2 polynomial (ascending), sorted; returns count
-int roots_le2(const double* d0, int len, double* out) {
-    double d[3] = {0, 0, 0};
+int roots_le2(const real* d0, int len, real* out) {
+    real d[3] = {0, 0, 0};
     for (int i = 0; i < len && i < 3; ++i) d[i] = d0[i];
     while (len > 0 && d[len - 1] == 0.0) --len;
     if (len <= 1) return 0;
     if (len == 2) { out[0] = -d[0] / d[1]; return 1; }
-    const double c0 = d[0], b1 = d[1], a2 = d[2];
-    const double disc = b1 * b1 - 4 * a2 * c0;
+    const real c0 = d[0], b1 = d[1], a2 = d[2];
+    const real disc = b1 * b1 - 4 * a2 * c0;
     if (disc < 0) {
-        if (disc > -1e-14 * (b1 * b1 + fabs(4 * a2 * c0))) { out[0] = -b1 / (2 * a2); return 1; }
+        if (disc > -1e-14 * TS * (b1 * b1 + fabs(4 * a2 * c0))) { out[0] = -b1 / (2 * a2); return 1; }
         return 0;
     }
-    const double sq = sqrt(disc);
-    const double qq = -0.5 * (b1 + (b1 >= 0 ? sq : -sq));
+    const real sq = sqrt(disc);
+    const real qq = -0.5 * (b1 + (b1 >= 0 ? sq : -sq));
     if (qq == 0.0) { out[0] = 0.0; return 1; }
-    double r0 = qq / a2, r1 = c0 / qq;
-    if (r0 > r1) { double t = r0; r0 = r1; r1 = t; }
+    real r0 = qq / a2, r1 = c0 / qq;
+    if (r0 > r1) { real t = r0; r0 = r1; r1 = t; }
     out[0] = r0; out[1] = r1;
     return 2;
 }
 
-double bisect(const double* r, int len, double a, double b) {
-    double fa = pval(r, len, a);
+real bisect(const real* r, int len, real a, real b) {
+    real fa = pval(r, len, a);
     for (int it = 0; it < 200; ++it) {
-        const double mid = 0.5 * (a + b);
+        const real mid = 0.5 * (a + b);
         if (mid <= a || mid >= b) break;
-        const double fm = pval(r, len, mid);
+        const real fm = pval(r, len, mid);
         if (((fm > 0) == (fa > 0)) && fm != 0.0) { a = mid; fa = fm; }
         else b = mid;
     }
@@ -735,19 +747,19 @@ double bisect(const double* r, int len, double a, double b) {
 
 struct Cross {
     int n;
-    double root[4];
+    real root[4];
     bool simple[4];
 };
 
 // Sign changes of phi(s) = s^k red(s) on (0, L] (tangential touches are not events).
-void crossings(const double* red, int len, int k, double L, double tol, Cross& o) {
+void crossings(const real* red, int len, int k, real L, real tol, Cross& o) {
     o.n = 0;
     if (len <= 1) return;
-    double d[3];
+    real d[3];
     for (int i = 1; i < len; ++i) d[i - 1] = i * red[i];
-    double cr[2];
+    real cr[2];
     const int nc = roots_le2(d, len - 1, cr);
-    double pts[4], vals[4];
+    real pts[4], vals[4];
     int np = 0;
     pts[np++] = 0.0;
     for (int i = 0; i < nc; ++i)
@@ -756,14 +768,14 @@ void crossings(const double* red, int len, int k, double L, double tol, Cross& o
     vals[0] = red[0];
     for (int i = 1; i < np; ++i) vals[i] = pval(red, len, pts[i]);
     int zeros[4], nz = 0;
-    double sig = vals[0] > 0 ? 1.0 : -1.0;
+    real sig = vals[0] > 0 ? 1.0 : -1.0;
     for (int i = 1; i < np; ++i) {
-        const double v = vals[i], x = pts[i];
+        const real v = vals[i], x = pts[i];
         if (fabs(v) * ipow(x, k) <= tol) {
             if (i < np - 1) zeros[nz++] = i;
             continue;
         }
-        const double sg = v > 0 ? 1.0 : -1.0;
+        const real sg = v > 0 ? 1.0 : -1.0;
         if (sg != sig) {
             if (vals[i - 1] * v <= 0) {
                 o.root[o.n] = bisect(red, len, pts[i - 1], x);
@@ -793,22 +805,22 @@ bool Solver::valid_set(uint16_t S) const {
     return cnt <= m_;
 }
 
-void Solver::row_polys(uint16_t S, const double* c, double phi[2 * MAXM][4],
+void Solver::row_polys(uint16_t S, const real* c, real phi[2 * MAXM][4],
                        bool has[2 * MAXM]) const {
-    double Wc[MAXM][4];
+    real Wc[MAXM][4];
     for (int j = 0; j < m_; ++j)
         for (int p = 0; p < 4; ++p) {
-            double s = 0.0;
+            real s = 0.0;
             for (int k = 0; k <= j; ++k) s += Lci_[j][k] * ((p < p_->orders[k]) ? c[off_[k] + p] : 0.0);
             Wc[j][p] = s;
         }
     int idx[MAXM], na = 0;
     {                                                 // own scope: stack shared with the block below
-        double P[MAXM][MAXM], q[MAXM], V[MAXM][4];
+        real P[MAXM][MAXM], q[MAXM], V[MAXM][4];
         affine(S, P, q);
         for (int i = 0; i < m_; ++i)
             for (int p = 0; p < 4; ++p) {
-                double s = (p == 0) ? q[i] : 0.0;
+                real s = (p == 0) ? q[i] : 0.0;
                 for (int j = 0; j < m_; ++j) s += P[i][j] * Wc[j][p];
                 V[i][p] = s;
             }
@@ -818,22 +830,22 @@ void Solver::row_polys(uint16_t S, const double* c, double phi[2 * MAXM][4],
             has[key] = true;
             if (S & (1u << key)) { idx[na++] = key; continue; }
             for (int p = 0; p < 4; ++p) {
-                double s = 0.0;
+                real s = 0.0;
                 for (int j = 0; j < m_; ++j) s += rows_[key][j] * V[j][p];
                 phi[key][p] = s - ((p == 0) ? rhs_[key] : 0.0);
             }
         }
     }
     if (na > 0) {
-        double G[MAXM * MAXM], X[MAXM * 4];
+        real G[MAXM * MAXM], X[MAXM * 4];
         for (int a = 0; a < na; ++a) {
             for (int b = 0; b < na; ++b) {
-                double g = 0.0;
+                real g = 0.0;
                 for (int j = 0; j < m_; ++j) g += rows_[idx[a]][j] * rows_[idx[b]][j];
                 G[a * MAXM + b] = g;
             }
             for (int p = 0; p < 4; ++p) {
-                double s = 0.0;
+                real s = 0.0;
                 for (int j = 0; j < m_; ++j) s += rows_[idx[a]][j] * Wc[j][p];
                 X[a * 4 + p] = s - ((p == 0) ? rhs_[idx[a]] : 0.0);
             }
@@ -847,14 +859,14 @@ void Solver::row_polys(uint16_t S, const double* c, double phi[2 * MAXM][4],
     }
 }
 
-bool Solver::lex_ok(uint16_t S, const double* c, double t, double phi[2 * MAXM][4], bool has[2 * MAXM]) const {
-    double b[4];
+bool Solver::lex_ok(uint16_t S, const real* c, real t, real phi[2 * MAXM][4], bool has[2 * MAXM]) const {
+    real b[4];
     row_polys(S, c, phi, has);
-    const double T = p_->T;
+    const real T = (real)p_->T;
     for (int key = 0; key < 2 * m_; ++key) {
         if (!has[key]) continue;
         shift(phi[key], 4, t, b);
-        const double tol = 1e-12 * (pscale(b, 4, T) + R_);
+        const real tol = 1e-12 * TS * (pscale(b, 4, T) + R_);
         for (int i = 0; i < 4; ++i) {
             if (fabs(b[i]) * ipow(T, i) > tol) {
                 if (b[i] > 0) return false;
@@ -865,7 +877,7 @@ bool Solver::lex_ok(uint16_t S, const double* c, double t, double phi[2 * MAXM][
     return true;
 }
 
-bool Solver::lex_set(const double* c, double t, uint16_t guess, uint16_t* out, double phi[2 * MAXM][4],
+bool Solver::lex_set(const real* c, real t, uint16_t guess, uint16_t* out, real phi[2 * MAXM][4],
                      bool has[2 * MAXM]) const {
     if (guess != 0xFFFFu && valid_set(guess) && lex_ok(guess, c, t, phi, has)) { *out = guess; return true; }
     for (int i = 0; i < nsets_; ++i)
@@ -873,31 +885,31 @@ bool Solver::lex_set(const double* c, double t, uint16_t guess, uint16_t* out, d
     return false;
 }
 
-bool Solver::walk(const double* c, Eval& e) {
+bool Solver::walk(const real* c, Eval& e) {
     e.ndeg = 0;
     if (identity_) return walk_box(c, e);
-    const double T = p_->T;
+    const real T = (real)p_->T;
     // G_ is free during the walk (evaluate refills it after); phi is also lex_set's scratch (dead there)
-    double (*const phi)[4] = reinterpret_cast<double (*)[4]>(G_);
+    real (*const phi)[4] = reinterpret_cast<real (*)[4]>(G_);
     bool has[2 * MAXM];
     uint16_t S;
     if (!lex_set(c, 0.0, 0, &S, phi, has)) return false;   // (a) initial set: one-sided KKT at 0+
     int ns = 0, stall = 0;
     e.S[ns++] = S;
-    double t = 0.0;
+    real t = 0.0;
     for (;;) {
-        const double L = T - t;
+        const real L = T - t;
         row_polys(S, c, phi, has);
-        double rootk[2 * MAXM];
+        real rootk[2 * MAXM];
         bool simplek[2 * MAXM], evk[2 * MAXM];
-        double s1 = HUGE_VAL;
+        real s1 = HUGE_VAL;
         for (int key = 0; key < 2 * m_; ++key) {
             evk[key] = false;
             if (!has[key]) continue;
-            double b[4], red[4];
+            real b[4], red[4];
             int k;
             shift(phi[key], 4, t, b);
-            const double tol = 1e-12 * (pscale(b, 4, L) + R_);
+            const real tol = 1e-12 * TS * (pscale(b, 4, L) + R_);
             const int rl = strip(b, 4, L, tol, red, &k);
             if (rl == 0) continue;
             if (red[0] > 0) {                            // inconsistent at t+: degenerate event
@@ -912,12 +924,12 @@ bool Solver::walk(const double* c, Eval& e) {
                 if (cr.root[0] < s1) s1 = cr.root[0];
             }
         }
-        if (s1 == HUGE_VAL || t + s1 >= T * (1 - 1e-14)) break;
+        if (s1 == (real)HUGE_VAL || t + s1 >= T * (1 - 1e-14 * TS)) break;
         int ngroup = 0, gkey = -1;
         bool gsimple = false;
         uint16_t gmask = 0;
         for (int key = 0; key < 2 * m_; ++key)
-            if (evk[key] && rootk[key] <= s1 + 1e-12 * T) {
+            if (evk[key] && rootk[key] <= s1 + 1e-12 * TS * T) {
                 ++ngroup; gkey = key; gsimple = simplek[key]; gmask |= (uint16_t)(1u << key);
             }
         t += s1;
@@ -946,27 +958,27 @@ bool Solver::walk(const double* c, Eval& e) {
     return sets_ok(e.S, ns);
 }
 
-bool Solver::walk_box(const double* c, Eval& e) {
+bool Solver::walk_box(const real* c, Eval& e) {
     // Umap = identity: v_j = clip(w_j, lo_j, hi_j) per chain, events = roots of w_j - bound.
-    const double T = p_->T;
-    double times[MAXARC_E];
+    const real T = (real)p_->T;
+    real times[MAXARC_E];
     int nt = 0;
     for (int j = 0; j < m_; ++j) {
         for (int side = 0; side < 2; ++side) {
             const int key = 2 * j + side;
             if (!finite_[key]) continue;
-            const double sgn = side ? -1.0 : 1.0;
-            double b[4], red[4];
+            const real sgn = side ? -1.0 : 1.0;
+            real b[4], red[4];
             for (int p = 0; p < 4; ++p) b[p] = (p < p_->orders[j]) ? sgn * c[off_[j] + p] : 0.0;
             b[0] -= rhs_[key];                       // rhs_ = hi (upper) or -lo (lower)
-            const double tol = 1e-12 * (pscale(b, 4, T) + R_);
+            const real tol = 1e-12 * TS * (pscale(b, 4, T) + R_);
             int k;
             const int rl = strip(b, 4, T, tol, red, &k);
             if (rl == 0) continue;
             Cross cr;
             crossings(red, rl, k, T, tol, cr);
             for (int i = 0; i < cr.n; ++i) {
-                if (cr.root[i] >= T * (1 - 1e-14)) continue;
+                if (cr.root[i] >= T * (1 - 1e-14 * TS)) continue;
                 bool dup = false;
                 for (int q = 0; q < nt; ++q) if (times[q] == cr.root[i]) dup = true;
                 if (!dup) { if (nt >= MAXARC_E) { capfail_ = true; return false; } times[nt++] = cr.root[i]; }
@@ -974,20 +986,20 @@ bool Solver::walk_box(const double* c, Eval& e) {
         }
     }
     for (int i = 1; i < nt; ++i) {                   // insertion sort
-        double x = times[i];
+        real x = times[i];
         int q = i - 1;
         while (q >= 0 && times[q] > x) { times[q + 1] = times[q]; --q; }
         times[q + 1] = x;
     }
     int ns = 0;
-    double w[MAXM];
+    real w[MAXM];
     for (int i = 0; i <= nt; ++i) {
-        const double a = (i == 0) ? 0.0 : times[i - 1], b = (i == nt) ? T : times[i];
+        const real a = (i == 0) ? 0.0 : times[i - 1], b = (i == nt) ? T : times[i];
         w_of(c, 0.5 * (a + b), w);                   // no root inside: any interior point
         uint16_t S = 0;
         for (int j = 0; j < m_; ++j) {
-            if (finite_[2 * j] && w[j] > p_->hi[j]) S |= (uint16_t)(1u << (2 * j));
-            else if (finite_[2 * j + 1] && w[j] < p_->lo[j]) S |= (uint16_t)(1u << (2 * j + 1));
+            if (finite_[2 * j] && w[j] > (real)p_->hi[j]) S |= (uint16_t)(1u << (2 * j));
+            else if (finite_[2 * j + 1] && w[j] < (real)p_->lo[j]) S |= (uint16_t)(1u << (2 * j + 1));
         }
         if (ns == 0 || S != e.S[ns - 1]) {
             if (ns >= MAXARC_E) { capfail_ = true; return false; }
@@ -999,25 +1011,25 @@ bool Solver::walk_box(const double* c, Eval& e) {
     return sets_ok(e.S, ns);
 }
 
-double Solver::dual(const uint16_t* S, const double* tau, int n, const double* c, const double* mu) const {
-    double val = 0.0;
+real Solver::dual(const uint16_t* S, const real* tau, int n, const real* c, const real* mu) const {
+    real val = 0.0;
     for (int i = 0; i < n_ && qf_; ++i) val += mu[i] * (g_[i] - 0.5 * mu[i]);
     for (int i = 0; i < n_ && !qf_; ++i) {
-        double nu = 0.0;
+        real nu = 0.0;
         for (int j = 0; j < n_; ++j) nu += Linv_[i * MAXN + j] * c[j];
-        val += nu * (p_->xf[i] - free_[i]);
+        val += nu * ((real)p_->xf[i] - free_[i]);
     }
-    double w[MAXM], v[MAXM], P[MAXM][MAXM], q[MAXM];
+    real w[MAXM], v[MAXM], P[MAXM][MAXM], q[MAXM];
     for (int a = 0; a < n; ++a) {
-        double t0, t1;
+        real t0, t1;
         span(tau, n, a, &t0, &t1);
         pq(S[a], P, q);
-        const double hw = 0.5 * (t1 - t0);
+        const real hw = 0.5 * (t1 - t0);
         for (int g = 0; g < 4; ++g) {
-            const double t = t0 + hw * (GL_X[g] + 1.0);
+            const real t = t0 + hw * (GL_X[g] + 1.0);
             w_of(c, t, w);
             v_on(P, q, c, t, v);
-            double s = 0.0;
+            real s = 0.0;
             for (int j = 0; j < m_; ++j) s += 0.5 * v[j] * (rI_ ? v[j] : vR(j, v)) - w[j] * v[j];
             val += GL_W[g] * hw * s;
         }
@@ -1025,24 +1037,24 @@ double Solver::dual(const uint16_t* S, const double* tau, int n, const double* c
     return val;
 }
 
-bool Solver::evaluate(const double* c, const double* mu, Eval& e) {
+bool Solver::evaluate(const real* c, const real* mu, Eval& e) {
     if (!walk(c, e)) return false;
-    double h[MAXN];
+    real h[MAXN];
     assemble(e.S, e.tau, e.narcs, G_, h);
-    double sc = 1.0;
+    real sc = 1.0;
     for (int i = 0; i < n_; ++i) {
-        double gc = 0.0, s = 0.0;
+        real gc = 0.0, s = 0.0;
         for (int j = 0; j < n_; ++j) { gc += G_[i * MAXN + j] * c[j]; s += fabs(G_[i * MAXN + j] * c[j]); }
-        e.F[i] = gc + h[i] - p_->xf[i];
-        sc = fmax(sc, fabs(p_->xf[i]));
+        e.F[i] = gc + h[i] - (real)p_->xf[i];
+        sc = fmax(sc, fabs((real)p_->xf[i]));
         sc = fmax(sc, fabs(free_[i]));
         sc = fmax(sc, s + fabs(h[i] - free_[i]));
     }
     if (qf_) {                                       // transversality: F = Cf (s(T) - xf) + mu
-        double r[MAXN], sq = 0.0;
+        real r[MAXN], sq = 0.0;
         for (int i = 0; i < n_; ++i) r[i] = e.F[i];
         for (int i = 0; i < n_; ++i) {
-            double f = mu[i], a = fabs(mu[i]);
+            real f = mu[i], a = fabs(mu[i]);
             for (int j = i; j < n_; ++j) { f += Cf_[i * MAXN + j] * r[j]; a += fabs(Cf_[i * MAXN + j]) * sc; }
             e.F[i] = f;
             sq = fmax(sq, a);
@@ -1054,16 +1066,17 @@ bool Solver::evaluate(const double* c, const double* mu, Eval& e) {
     return true;
 }
 
-double Solver::verify(const uint16_t* S, const double* tau, int n, const double* c) const {
-    double worst = 0.0, phi[2 * MAXM][4], b[4], d[3], cr[2];
+real Solver::verify(const uint16_t* S, const real* tau, int n, const real* c, real* amp) const {
+    real worst = 0.0, a_max = 0.0, phi[2 * MAXM][4], b[4], d[3], cr[2];
     bool has[2 * MAXM];
     for (int a = 0; a < n; ++a) {
-        double t0, t1;
+        real t0, t1;
         span(tau, n, a, &t0, &t1);
-        const double L = t1 - t0;
+        const real L = t1 - t0;
         row_polys(S[a], c, phi, has);
         for (int key = 0; key < 2 * m_; ++key) {
             if (!has[key]) continue;
+            a_max = fmax(a_max, pscale(phi[key], 4, (real)p_->T));
             shift(phi[key], 4, t0, b);
             worst = fmax(worst, fmax(b[0], pval(b, 4, L)));
             for (int i = 1; i < 4; ++i) d[i - 1] = i * b[i];
@@ -1072,6 +1085,7 @@ double Solver::verify(const uint16_t* S, const double* tau, int n, const double*
                 if (cr[i] > 0.0 && cr[i] < L) worst = fmax(worst, pval(b, 4, cr[i]));
         }
     }
+    if (amp) *amp = a_max;
     return worst;
 }
 
@@ -1083,20 +1097,20 @@ bool Solver::solve_newton(Result& R, int warm_its) {
     R.box_fast_path = identity_;
     R.narcs = 0;
     R.failure = "unconstrained start failed";
-    double* const c = R.c;                          // the iterate lives in R
-    double* const mu = R.mu;
+    real* const c = R.c;                          // the iterate lives in R
+    real* const mu = R.mu;
     const int max_its = warm_its < 0 ? MAX_NEWTON : warm_its;
     if (!(warm_its >= 0 && qf_))
         for (int i = 0; i < n_; ++i) mu[i] = 0.0;
     if (qf_) {                                      // c = Lm Cf^T mu
-        double* const nu = W_;                      // workspace (free here)
+        real* const nu = W_;                      // workspace (free here)
         for (int i = 0; i < n_; ++i) {
-            double s = 0.0;
+            real s = 0.0;
             for (int j = 0; j <= i; ++j) s += Cf_[j * MAXN + i] * mu[j];
             nu[i] = s;
         }
         for (int i = 0; i < n_; ++i) {
-            double s = 0.0;
+            real s = 0.0;
             for (int j = 0; j < n_; ++j) s += Lm_[i * MAXN + j] * nu[j];
             c[i] = s;
         }
@@ -1106,86 +1120,87 @@ bool Solver::solve_newton(Result& R, int warm_its) {
         const uint16_t S0 = 0;                      // unconstrained start
         if (!solve_c(&S0, nullptr, 1, c)) return false;
     }
-    double c0 = 1.0;
+    real c0 = 1.0;
     for (int i = 0; i < n_; ++i) c0 = fmax(c0, 1.0 + fabs(c[i]));
     const char* why = "event walk failed";
     int cur = 0;
     bool ok = evaluate(c, mu, ew_.ev[cur]);
     bool conv = false;
-    const double rtol = 1e-12;
+    // float: stop at the round-off level of F's terms (scale); double keeps 1e-12
+    const real rtol = sizeof(real) == 4 ? EPS : 1e-12;
     int its = 0;
     while (ok) {
         Eval& E = ew_.ev[cur];
-        double Fn = 0.0, F2 = 0.0;
+        real Fn = 0.0, F2 = 0.0;
         for (int i = 0; i < n_; ++i) { Fn = fmax(Fn, fabs(E.F[i])); F2 += E.F[i] * E.F[i]; }
         if (Fn <= rtol * E.scale) { conv = true; break; }
         if (its >= max_its) { why = "iteration cap"; break; }
         if (!qf_) {   // dual unbounded (infeasible problem): the iterates c diverge
-            double cm = 0.0;
+            real cm = 0.0;
             for (int i = 0; i < n_; ++i) cm = fmax(cm, fabs(c[i]));
             if (cm > 1e6 * c0) { why = "iterates diverge (infeasible?)"; break; }
         }
         ++its;
         // (J Lm) d_nu = -F, J Lm = int K P K^T dt symmetric PSD; d_c = Lm d_nu
         // workspace: E's ds(T)/dc in G_ -> H in W_; X and A reuse G_ (evaluate refills it)
-        double* const H = W_;
-        double dnu[MAXN];
+        real* const H = W_;
+        real dnu[MAXN];
         for (int i = 0; i < n_; ++i)
             for (int j = 0; j < n_; ++j) {
-                double s = 0.0;
+                real s = 0.0;
                 for (int k = 0; k < n_; ++k) s += G_[i * MAXN + k] * Lm_[k * MAXN + j];
                 H[i * MAXN + j] = s;
             }
         for (int i = 0; i < n_; ++i)
             for (int j = i + 1; j < n_; ++j) {
-                const double s = 0.5 * (H[i * MAXN + j] + H[j * MAXN + i]);
+                const real s = 0.5 * (H[i * MAXN + j] + H[j * MAXN + i]);
                 H[i * MAXN + j] = H[j * MAXN + i] = s;
             }
         if (qf_) {   // -Hess D(mu) = Cf H Cf^T + I (uniformly positive definite)
-            double* const X = G_;
+            real* const X = G_;
             for (int i = 0; i < n_; ++i)
                 for (int j = 0; j < n_; ++j) {
-                    double s = 0.0;
+                    real s = 0.0;
                     for (int k = i; k < n_; ++k) s += Cf_[i * MAXN + k] * H[k * MAXN + j];
                     X[i * MAXN + j] = s;
                 }
             for (int i = 0; i < n_; ++i)
                 for (int j = i; j < n_; ++j) {
-                    double s = (i == j) ? 1.0 : 0.0;
+                    real s = (i == j) ? 1.0 : 0.0;
                     for (int k = j; k < n_; ++k) s += X[i * MAXN + k] * Cf_[j * MAXN + k];
                     H[i * MAXN + j] = H[j * MAXN + i] = s;
                 }
         }
-        double hmax = 0.0;
+        real hmax = 0.0;
         for (int i = 0; i < n_ * MAXN; ++i) hmax = fmax(hmax, fabs(H[i]));
-        double rho = 0.0;
+        real rho = 0.0;
         bool solved = false;
         for (int attempt = 0; attempt < 20 && !solved; ++attempt) {
-            double* const A = G_;
+            real* const A = G_;
             for (int i = 0; i < MAXN * MAXN; ++i) A[i] = H[i];
             for (int i = 0; i < n_; ++i) { A[i * MAXN + i] += rho; dnu[i] = -E.F[i]; }
             solved = lu_solve(A, n_, MAXN, dnu, 1, 1);
-            rho = (rho == 0.0) ? 1e-12 * hmax : 10.0 * rho;
+            rho = (rho == 0.0) ? 1e-12 * TS * hmax : 10.0 * rho;
         }
         if (!solved) { why = "singular Newton matrix"; break; }
         // H is dead: the step and the trial point live in W_
-        double* const dmu = W_, * const d = W_ + MAXN, * const cn = W_ + 2 * MAXN, * const mun = W_ + 3 * MAXN;
-        double slope = 0.0;
+        real* const dmu = W_, * const d = W_ + MAXN, * const cn = W_ + 2 * MAXN, * const mun = W_ + 3 * MAXN;
+        real slope = 0.0;
         for (int i = 0; i < n_; ++i) slope -= E.F[i] * dnu[i];
         if (qf_) {                                  // solved for d_mu; d_nu = Cf^T d_mu
             for (int i = 0; i < n_; ++i) dmu[i] = dnu[i];
             for (int i = 0; i < n_; ++i) {
-                double s = 0.0;
+                real s = 0.0;
                 for (int j = 0; j <= i; ++j) s += Cf_[j * MAXN + i] * dmu[j];
                 dnu[i] = s;
             }
         }
         for (int i = 0; i < n_; ++i) {
-            double s = 0.0;
+            real s = 0.0;
             for (int j = 0; j < n_; ++j) s += Lm_[i * MAXN + j] * dnu[j];
             d[i] = s;
         }
-        double alpha = 1.0;
+        real alpha = 1.0;
         bool accepted = false;
         const int nxt = 1 - cur;
         while (alpha >= 1e-10) {
@@ -1194,7 +1209,7 @@ bool Solver::solve_newton(Result& R, int warm_its) {
             if (evaluate(cn, mun, ew_.ev[nxt])) {
                 const Eval& N = ew_.ev[nxt];
                 if (N.D >= E.D + 1e-4 * alpha * slope) { accepted = true; break; }
-                double nF2 = 0.0;
+                real nF2 = 0.0;
                 for (int i = 0; i < n_; ++i) nF2 += N.F[i] * N.F[i];
                 if (alpha * slope <= 1e3 * EPS * (1.0 + fabs(E.D)) && nF2 < F2) { accepted = true; break; }
             }
@@ -1211,12 +1226,15 @@ bool Solver::solve_newton(Result& R, int warm_its) {
     R.narcs = E.narcs;
     for (int i = 0; i < E.narcs; ++i) R.S[i] = E.S[i];
     for (int i = 0; i + 1 < E.narcs; ++i) R.tau[i] = E.tau[i];
-    double Fn = 0.0;
+    real Fn = 0.0;
     for (int i = 0; i < n_; ++i) Fn = fmax(Fn, fabs(E.F[i]));
     R.residual = Fn;
     R.degenerate_events = E.ndeg;
-    R.pmp_violation = verify(R.S, R.tau, R.narcs, R.c);
-    if (conv && R.pmp_violation > 1e-9 * R_) { conv = false; why = "PMP verification failed"; }
+    real amp;
+    R.pmp_violation = verify(R.S, R.tau, R.narcs, R.c, &amp);
+    // float: the walk's own event tolerance (round-off of the monomial row polynomials)
+    const real vtol = sizeof(real) == 4 ? 1e-12 * TS * (amp + R_) : 1e-9 * R_;
+    if (conv && R.pmp_violation > vtol) { conv = false; why = "PMP verification failed"; }
     R.cost = cost(R.S, R.tau, R.narcs, R.c);
     R.converged = conv;
     R.failure = conv ? nullptr : capfail_ ? CAPFAIL : why;

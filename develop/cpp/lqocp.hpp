@@ -84,15 +84,15 @@ struct Result {
     int method;
     int narcs;
     uint16_t S[MAXARC_E];            // active signed rows: bit 2r = upper of row r, 2r+1 = lower
-    double tau[MAXJ_E];              // switch times: arc a is [tau[a-1], tau[a]] (0 and T at the ends)
-    double c[MAXN];                  // energy: coefficients of the switching polynomial w(t)
-    double mu[MAXN];                 // energy with Qf (newton): dual iterate, nu = Cf^T mu, c = Lm nu
-    double cost;
+    real tau[MAXJ_E];              // switch times: arc a is [tau[a-1], tau[a]] (0 and T at the ends)
+    real c[MAXN];                  // energy: coefficients of the switching polynomial w(t)
+    real mu[MAXN];                 // energy with Qf (newton): dual iterate, nu = Cf^T mu, c = Lm nu
+    real cost;
     int iterations;                  // tau: BC solves + Newton its; newton: Newton iterations
     int newton_iterations;
     int outer_iterations;
-    double residual;                 // tau: junction residual; newton: |F|_inf / terminal residual
-    double pmp_violation;            // max violation of the optimality conditions found
+    real residual;                 // tau: junction residual; newton: |F|_inf / terminal residual
+    real pmp_violation;            // max violation of the optimality conditions found
     int backtracks;
     int degenerate_events;
     bool box_fast_path;
@@ -121,80 +121,80 @@ private:
     struct Eval {                    // energy newton: evaluation of one iterate c (its ds(T)/dc is in G_)
         int narcs;
         uint16_t S[MAXARC_E];
-        double tau[MAXJ_E];
-        double F[MAXN];
-        double scale, D;
+        real tau[MAXJ_E];
+        real F[MAXN];
+        real scale, D;
         int ndeg;
     };
     struct EnergyWork {
 #ifndef LQOCP_NO_TAU
         int nseq;
         uint16_t seq[MAXARC_E];
-        double tau[MAXJ_E];
+        real tau[MAXJ_E];
         int nseq2;
         uint16_t seq2[MAXARC_E];
-        double tau2[MAXJ_E];
+        real tau2[MAXJ_E];
 #endif
         Eval ev[2];
     };
     const Problem* p_;
-    double x0_[MAXN];
+    real x0_[MAXN];
     int n_, m_, off_[MAXM];
-    double rows_[2 * MAXM][MAXM], rhs_[2 * MAXM], rownorm2_[2 * MAXM];
+    real rows_[2 * MAXM][MAXM], rhs_[2 * MAXM], rownorm2_[2 * MAXM];
     bool finite_[2 * MAXM];
     uint16_t sets_[MAXSETS];
     int nsets_;
-    double free_[MAXN];
-    double rhs_scale_;
-    double R_;
+    real free_[MAXN];
+    real rhs_scale_;
+    real R_;
     bool identity_;
     bool general_;
     bool rI_, qf_;                   // R = I; terminal cost (else fixed endpoint)
-    double Lc_[MAXM][MAXM], Lci_[MAXM][MAXM];       // R = Lc Lc^T; projection in vt = Lc^T v
-    double Lm_[MAXN * MAXN], Linv_[MAXN * MAXN];   // energy: c = Lm nu
-    double Cf_[MAXN * MAXN], g_[MAXN];             // Qf = Cf^T Cf; g = Cf (xf - e^{AT} x0)
+    real Lc_[MAXM][MAXM], Lci_[MAXM][MAXM];       // R = Lc Lc^T; projection in vt = Lc^T v
+    real Lm_[MAXN * MAXN], Linv_[MAXN * MAXN];   // energy: c = Lm nu
+    real Cf_[MAXN * MAXN], g_[MAXN];             // Qf = Cf^T Cf; g = Cf (xf - e^{AT} x0)
     EnergyWork ew_;
-    mutable double G_[MAXN * MAXN], W_[MAXN * MAXN];  // workspace: ds(T)/dc of ev[cur]; Newton matrix
+    mutable real G_[MAXN * MAXN], W_[MAXN * MAXN];  // workspace: ds(T)/dc of ev[cur]; Newton matrix
     bool capfail_;                   // MAXARC_E was exceeded during this solve
 
     // shared / energy (an arc sequence is S[0..n-1] with switch times tau[0..n-2])
-    void w_of(const double* c, double t, double* w) const;
-    void phib(double dt, double K[MAXN][MAXM]) const;
-    void phi_x0(double dt, double* s) const;
-    bool affine(uint16_t S, double P[MAXM][MAXM], double q[MAXM]) const;
-    bool pq(uint16_t S, double P[MAXM][MAXM], double q[MAXM]) const;   // v = P w + q on set S
-    void span(const double* tau, int n, int a, double* t0, double* t1) const {
+    void w_of(const real* c, real t, real* w) const;
+    void phib(real dt, real K[MAXN][MAXM]) const;
+    void phi_x0(real dt, real* s) const;
+    bool affine(uint16_t S, real P[MAXM][MAXM], real q[MAXM]) const;
+    bool pq(uint16_t S, real P[MAXM][MAXM], real q[MAXM]) const;   // v = P w + q on set S
+    void span(const real* tau, int n, int a, real* t0, real* t1) const {
         *t0 = a ? tau[a - 1] : 0.0;
-        *t1 = (a + 1 < n) ? tau[a] : p_->T;
+        *t1 = (a + 1 < n) ? tau[a] : (real)p_->T;
     }
     bool sets_ok(const uint16_t* S, int n) const;
-    void assemble(const uint16_t* S, const double* tau, int n, double* G, double* h) const;
-    bool solve_c(const uint16_t* S, const double* tau, int n, double* c) const;
-    double cost(const uint16_t* S, const double* tau, int n, const double* c) const;
-    double vR(int j, const double* v) const {        // (R v)_j
-        double s = 0.0;
-        for (int k = 0; k < m_; ++k) s += p_->R[j][k] * v[k];
+    void assemble(const uint16_t* S, const real* tau, int n, real* G, real* h) const;
+    bool solve_c(const uint16_t* S, const real* tau, int n, real* c) const;
+    real cost(const uint16_t* S, const real* tau, int n, const real* c) const;
+    real vR(int j, const real* v) const {        // (R v)_j
+        real s = 0.0;
+        for (int k = 0; k < m_; ++k) s += (real)p_->R[j][k] * v[k];
         return s;
     }
-    void v_on(const double P[MAXM][MAXM], const double* q, const double* c, double t, double* v) const;
+    void v_on(const real P[MAXM][MAXM], const real* q, const real* c, real t, real* v) const;
 #ifndef LQOCP_NO_TAU
-    bool residual(const uint16_t* S, int nseq, const double* tau, double* res, int* nres, double* c) const;
-    bool newton(const uint16_t* S, int nseq, double* tau, double* c, int* its, double* resmax) const;
+    bool residual(const uint16_t* S, int nseq, const real* tau, real* res, int* nres, real* c) const;
+    bool newton(const uint16_t* S, int nseq, real* tau, real* c, int* its, real* resmax) const;
     bool solve_tau(Result& r);
-    bool detect_exact(const double* c);
+    bool detect_exact(const real* c);
 #endif
     bool start(Result& r, int method, int warm_its);
     bool solve_newton(Result& r, int warm_its);
-    void row_polys(uint16_t S, const double* c, double phi[2 * MAXM][4], bool has[2 * MAXM]) const;
-    bool lex_ok(uint16_t S, const double* c, double t, double phi[2 * MAXM][4], bool has[2 * MAXM]) const;
-    bool lex_set(const double* c, double t, uint16_t guess, uint16_t* out, double phi[2 * MAXM][4],
+    void row_polys(uint16_t S, const real* c, real phi[2 * MAXM][4], bool has[2 * MAXM]) const;
+    bool lex_ok(uint16_t S, const real* c, real t, real phi[2 * MAXM][4], bool has[2 * MAXM]) const;
+    bool lex_set(const real* c, real t, uint16_t guess, uint16_t* out, real phi[2 * MAXM][4],
                  bool has[2 * MAXM]) const;
     bool valid_set(uint16_t S) const;
-    bool walk(const double* c, Eval& e);
-    bool walk_box(const double* c, Eval& e);
-    bool evaluate(const double* c, const double* mu, Eval& e);
-    double dual(const uint16_t* S, const double* tau, int n, const double* c, const double* mu) const;
-    double verify(const uint16_t* S, const double* tau, int n, const double* c) const;
+    bool walk(const real* c, Eval& e);
+    bool walk_box(const real* c, Eval& e);
+    bool evaluate(const real* c, const real* mu, Eval& e);
+    real dual(const uint16_t* S, const real* tau, int n, const real* c, const real* mu) const;
+    real verify(const uint16_t* S, const real* tau, int n, const real* c, real* amp = nullptr) const;
 };
 
 // =====================================================================================
