@@ -910,23 +910,16 @@ bool StateSolver::run(StateResult& r, int warm) {
             for (int q = 0; q < nsa_; ++q)
                 if (sa_[q].chain == wc && ta < sa_[q].t2 && tb > sa_[q].t1) why = "overlapping boundary arcs";
             if (why) break;
-            // initial boundary arc: the violation interval [ta, tb]; if the pinned problem has no
-            // solution from there, a shorter piece around the worst point
+            // initial boundary arc: the violation interval [ta, tb]
             StateArc& s = sa_[nsa_];
             s.chain = (int8_t)wc; s.side = (int8_t)ws; s.b = ws > 0 ? hi_[wc] : lo_[wc];
             s.fix1 = ta <= 0.0; s.fix2 = tb >= T;
+            s.t1 = s.fix1 ? 0.0 : ta;
+            s.t2 = s.fix2 ? T : tb;
+            y[n + nsa_] = 0.0;
             ++nsa_;
             ++r.inserted;
-            double ysave[NY];
-            for (int i = 0; i < n + nsa_ - 1; ++i) ysave[i] = y[i];
-            bool ok = false;
-            for (double f = 1.0; f > 0.05 && !ok; f *= 0.5) {
-                s.t1 = s.fix1 ? 0.0 : tw - f * (tw - ta);
-                s.t2 = s.fix2 ? T : tw + f * (tb - tw);
-                for (int i = 0; i < n + nsa_ - 1; ++i) y[i] = ysave[i];
-                y[n + nsa_ - 1] = 0.0;
-                ok = inner(y, cap);
-            }
+            const bool ok = inner(y, cap);
             if (!ok) {
                 strncpy(det, why_, sizeof det - 1); det[sizeof det - 1] = 0;
                 snprintf(why_, sizeof why_, "arc order rejected: insertion on %c (%s)", CH[wc], det);
