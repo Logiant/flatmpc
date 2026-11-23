@@ -6,7 +6,7 @@
 // See platformio.ini.
 #include <Arduino.h>
 #include <algorithm>
-#if defined(BENCH_TINY) || defined(BENCH_ENERGY)
+#if defined(BENCH_TINY) || defined(BENCH_ENERGY) || defined(BENCH_TIER2)
 #include "bench_data.h"
 #endif
 
@@ -24,8 +24,24 @@ static lqocp::Solver es;
 static lqocp::Result er;
 #include "qf_q0.h"                                    // TQ0: TINY with Q = 0, in flash
 #endif
+#ifdef BENCH_TIER2
+#include "lqocp_state.hpp"
+static lqocp::StateSolver ts;
+static lqocp::StateResult tr;
+#include "qf_q0.h"                                    // TQ0: TINY with Q = 0, in flash
+// |x_phys| <= 5 on every physical state, in flat coordinates (quad_problem.Tf2p, one nonzero per row);
+// only the roll/pitch/yaw rates and z speed are enforced, the rest is verified on the result
+static double SLO[12], SHI[12];
+static bool tier2_setup() {
+    static const double G2 = 19.619999999999997, H = 0.49999999999999994;
+    static const int F[12] = {0, 4, 8, 6, 2, 10, 1, 5, 9, 7, 3, 11};
+    static const double A[12] = {1, 1, 1, -1 / G2, 1 / G2, 1, 1, 1, 1, -1 / (G2 * H), 1 / (G2 * H), 1 / H};
+    for (int i = 0; i < 12; ++i) { SLO[F[i]] = -5.0 / fabs(A[i]); SHI[F[i]] = 5.0 / fabs(A[i]); }
+    return ts.setup(TQ0, SLO, SHI);
+}
+#endif
 
-#if defined(BENCH_TINY) || defined(BENCH_ENERGY)
+#if defined(BENCH_TINY) || defined(BENCH_ENERGY) || defined(BENCH_TIER2)
 #ifdef BENCH_TINY
 static const lqocp::Problem& loop_prob() { return BENCH_PROB[2]; }
 static bool loop_setup() { return gs.setup(BENCH_PROB[2], lookup, nullptr); }
@@ -34,6 +50,19 @@ static bool loop_solve(int k, double dt, int cap) { return (k == 0) ? gs.solve(g
 static int loop_u(double dt, double* u) {
     gs.mean_u(gr, 0.0, dt, u);                        // saturated to the bounds; false: holds u
     return gr.iterations;
+}
+#elif defined(BENCH_TIER2)
+static const lqocp::Problem& loop_prob() { return TQ0; }
+static bool loop_setup() { return tier2_setup(); }
+static void loop_x0(const double* x) { ts.set_x0(x); }
+static bool loop_solve(int k, double dt, int cap) {
+    if (k == 0) return ts.solve(tr);
+    if (ts.solve_warm(tr, cap, dt)) return true;
+    return (tr.failure && strstr(tr.failure, "iteration cap")) ? false : ts.solve(tr);   // cold fallback
+}
+static int loop_u(double dt, double* u) {
+    ts.mean_u(tr, 0.0, dt, u);
+    return tr.iterations;
 }
 #else
 static const lqocp::Problem& loop_prob() { return TQ0; }
@@ -137,6 +166,17 @@ void loop() {
         bool ok = es.setup(TQ0) && es.solve(er, lqocp::METHOD_NEWTON);   // TinyMPC's own Q=0 terminal weight
         const uint32_t t1 = micros();
         report("TINY_Q0", er.cost, er.iterations, t1 - t0, ok, er.narcs - 1);
+        closed_loop(100);
+        closed_loop(5);
+    }
+#elif defined(BENCH_TIER2)
+    {
+        const uint32_t t0 = micros();
+        bool ok = tier2_setup() && ts.solve(tr);
+        const uint32_t t1 = micros();
+        report("TINY_Q0_X5", tr.cost, tr.iterations, t1 - t0, ok, tr.narcs - 1);
+        if (!ok) Serial.printf("  failure: %s\n", tr.failure ? tr.failure : "setup");
+        Serial.printf("  sizeof(StateSolver)=%u sizeof(StateResult)=%u\n", (unsigned)sizeof(ts), (unsigned)sizeof(tr));
         closed_loop(100);
         closed_loop(5);
     }
