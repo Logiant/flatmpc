@@ -43,3 +43,16 @@ references:
     identifiers:
       - type: other
         value: "arXiv:2604.13007"
+  - type: article
+    title: "A Graph-Based Approach to Generate Energy-Optimal Robot Trajectories in Polygonal Environments"
+    authors:
+      - family-names: Beaver
+        given-names: Logan E.
+      - family-names: Tron
+        given-names: Roberto
+      - family-names: Cassandras
+        given-names: Christos G.
+    year: 2022
+    identifiers:
+      - type: other
+        value: "arXiv:2211.05251"
