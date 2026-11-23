@@ -106,6 +106,7 @@ class Solver {
 public:
     // p must stay alive (it is referenced, not copied; it may live in flash). Problem.x0 is copied.
     bool setup(const Problem& p);
+    const char* setup_failure() const { return sfail_; }   // why setup returned false
     // Returns r.converged. A general cost returns false (use GSolver).
     bool solve(Result& r, int method = METHOD_NEWTON);
     // MPC warm start (newton): first Newton on the switch times of the previous pattern r.S (at most
@@ -122,6 +123,7 @@ public:
     bool is_general() const { return general_; }
 
 private:
+    friend class StateSolver;        // tier 2 (lqocp_state.hpp) reuses the setup data
     struct Eval {                    // energy newton: evaluation of one iterate c (its ds(T)/dc is in G_)
         int narcs;
         uint16_t S[MAXARC_E];
@@ -143,6 +145,9 @@ private:
     };
     const Problem* p_;
     real x0_[MAXN];
+    const char* sfail_ = nullptr;
+    static const char* check_problem(const Problem& p);
+    bool setup_(const Problem& p);
     int n_, m_, off_[MAXM];
     real rows_[2 * MAXM][MAXM], rhs_[2 * MAXM], rownorm2_[2 * MAXM];
     bool finite_[2 * MAXM];
@@ -157,8 +162,13 @@ private:
     real Lc_[MAXM][MAXM], Lci_[MAXM][MAXM];       // R = Lc Lc^T; projection in vt = Lc^T v
     real Lm_[MAXN * MAXN], Linv_[MAXN * MAXN];   // energy: c = Lm nu
     real Cf_[MAXN * MAXN], g_[MAXN];             // Qf = Cf^T Cf; g = Cf (xf - e^{AT} x0)
-    EnergyWork ew_;
-    mutable real G_[MAXN * MAXN], W_[MAXN * MAXN];  // workspace: ds(T)/dc of ev[cur]; Newton matrix
+    union {                          // tier-1 solve scratch; StateSolver reuses it as xs_ after the tier-1 solve
+        struct {
+            EnergyWork ew_;
+            mutable real G_[MAXN * MAXN], W_[MAXN * MAXN];  // workspace: ds(T)/dc of ev[cur]; Newton matrix
+        };
+        double xs_[(sizeof(EnergyWork) + 2 * MAXN * MAXN * sizeof(real)) / sizeof(double)];
+    };
     bool capfail_;                   // MAXARC_E was exceeded during this solve
 
     // shared / energy (an arc sequence is S[0..n-1] with switch times tau[0..n-2])

@@ -1,7 +1,10 @@
 // Quadrotor hover problem (problem/quad_problem.py, TinyMPC 20 Hz params): nx=12 nu=4 N=10 rho=5.
 #pragma once
 #include "tiny_api.hpp"
-static const int NX = 12, NU = 4, NH = 10;
+#ifndef NH_KNOTS
+#define NH_KNOTS 10   // knot count (host heap tally sweeps it)
+#endif
+static const int NX = 12, NU = 4, NH = NH_KNOTS;
 static const tinytype A_rm[NX * NX] = {
  1,0,0,0,0.0245250,0,0.0500000,0,0,0,0.0002044,0,
  0,1,0,-0.0245250,0,0,0,0.0500000,0,-0.0002044,0,0,
