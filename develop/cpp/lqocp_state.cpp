@@ -680,7 +680,14 @@ bool StateSolver::junctions(double* y, int max_its, int* outer) {
             for (int i = 0; i < nt; ++i) tn = fmax(tn, fabs(gt[i]));
             if (nt != ng || tn < gn) { acc = true; break; }
         }
-        if (!acc) { strcpy(why_, "junction Newton stalled"); return false; }
+        if (!acc) {                                     // back to the last iterate, so the plan left behind is its plan
+            for (int q = 0; q < nsa_; ++q) sa_[q].fix2 = fix2s[q];
+            for (int k = 0; k < nu; ++k) *tv[k] = tau0[k];
+            for (int i = 0; i < ny; ++i) y[i] = y0[i];
+            inner(y, max_its);
+            strcpy(why_, "junction Newton stalled");
+            return false;
+        }
     }
     strcpy(why_, "junction Newton iteration cap");
     return false;
