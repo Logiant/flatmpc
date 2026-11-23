@@ -909,7 +909,7 @@ bool Solver::walk(const real* c, Eval& e) {
             real b[4], red[4];
             int k;
             shift(phi[key], 4, t, b);
-            const real tol = 1e-12 * TS * (pscale(b, 4, L) + R_);
+            const real tol = 1e-12 * TS * (pscale(b, 4, T) + R_);   // as lex_ok: no stall on a tiny last arc
             const int rl = strip(b, 4, L, tol, red, &k);
             if (rl == 0) continue;
             if (red[0] > 0) {                            // inconsistent at t+: degenerate event
