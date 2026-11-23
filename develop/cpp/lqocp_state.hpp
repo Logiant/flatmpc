@@ -16,9 +16,6 @@
 
 namespace lqocp {
 
-#ifndef LQOCP_MAXSA
-#define LQOCP_MAXSA 4
-#endif
 constexpr int MAXSA = LQOCP_MAXSA;   // max boundary (state) arcs
 constexpr int NY = MAXN + MAXSA;     // dual unknowns: nu (or mu with Qf), then one Delta per arc
 

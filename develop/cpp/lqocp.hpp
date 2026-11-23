@@ -31,6 +31,9 @@ typedef float real;
 typedef double real;
 #endif
 
+#ifndef LQOCP_MAXSA
+#define LQOCP_MAXSA 6                // tier 2: max boundary (state) arcs; sizes the shared scratch below
+#endif
 constexpr int MAXM = 4;              // inputs / chains
 constexpr int MAXN = 12;             // states = sum of chain orders
 constexpr int MAXK = 4;              // max chain order (energy cost: 4-pt Gauss-Legendre is exact, |v|^2 has degree 2K-2)
@@ -158,12 +161,16 @@ private:
     double Lc_[MAXM][MAXM], Lci_[MAXM][MAXM];       // R = Lc Lc^T; projection in vt = Lc^T v
     double Lm_[MAXN * MAXN], Linv_[MAXN * MAXN];   // energy: c = Lm nu
     double Cf_[MAXN * MAXN], g_[MAXN];             // Qf = Cf^T Cf; g = Cf (xf - e^{AT} x0)
+    // scratch sizes in doubles: tier-1 solve; tier 2 (lqocp_state.hpp: H (NY x NY) and Z (NY x 2 MAXSA))
+    static constexpr int XS_T1 = (sizeof(EnergyWork) + 2 * MAXN * MAXN * sizeof(double)) / sizeof(double);
+    static constexpr int XS_NY = MAXN + LQOCP_MAXSA;
+    static constexpr int XS_T2 = XS_NY * XS_NY + (XS_NY * (XS_NY + 1) / 2 > XS_NY * 2 * LQOCP_MAXSA ? XS_NY * (XS_NY + 1) / 2 : XS_NY * 2 * LQOCP_MAXSA);
     union {                          // tier-1 solve scratch; StateSolver reuses it as xs_ after the tier-1 solve
         struct {
             EnergyWork ew_;
             mutable double G_[MAXN * MAXN], W_[MAXN * MAXN];  // workspace: ds(T)/dc of ev[cur]; Newton matrix
         };
-        double xs_[(sizeof(EnergyWork) + 2 * MAXN * MAXN * sizeof(double)) / sizeof(double)];
+        double xs_[XS_T1 > XS_T2 ? XS_T1 : XS_T2];
     };
     bool capfail_;                   // MAXARC_E was exceeded during this solve
 
