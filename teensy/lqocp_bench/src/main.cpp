@@ -22,6 +22,7 @@ static const lqocp::SetBasis* lookup(void*, uint16_t S) {
 #ifdef BENCH_ENERGY
 static lqocp::Solver es;
 static lqocp::Result er;
+#include "qf_q0.h"
 static lqocp::Problem tq0;                             // TINY with Q = 0 (RAM copy)
 #endif
 
@@ -135,6 +136,8 @@ void loop() {
     {
         memcpy(&tq0, &BENCH_PROB[2], sizeof(tq0));
         memset(tq0.Q, 0, sizeof(tq0.Q));
+        memcpy(tq0.Qf, QF_Q0, sizeof(tq0.Qf));   // TinyMPC's own Q=0 terminal weight
+        tq0.has_Qf = 1;
         const uint32_t t0 = micros();
         bool ok = es.setup(tq0) && es.solve(er, lqocp::METHOD_NEWTON);
         const uint32_t t1 = micros();
