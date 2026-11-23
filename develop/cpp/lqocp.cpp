@@ -737,14 +737,11 @@ struct Cross {
     int n;
     double root[4];
     bool simple[4];
-    int nt;
-    double touch[4];
 };
 
-// Sign changes of phi(s) = s^k red(s) on (0, L]; tangential touches recorded separately.
+// Sign changes of phi(s) = s^k red(s) on (0, L] (tangential touches are not events).
 void crossings(const double* red, int len, int k, double L, double tol, Cross& o) {
     o.n = 0;
-    o.nt = 0;
     if (len <= 1) return;
     double d[3];
     for (int i = 1; i < len; ++i) d[i - 1] = i * red[i];
@@ -776,10 +773,7 @@ void crossings(const double* red, int len, int k, double L, double tol, Cross& o
                 o.simple[o.n] = false;
             }
             ++o.n;
-            for (int z = 0; z + 1 < nz; ++z) o.touch[o.nt++] = pts[zeros[z]];
             sig = sg;
-        } else {
-            for (int z = 0; z < nz; ++z) o.touch[o.nt++] = pts[zeros[z]];
         }
         nz = 0;
     }
@@ -801,30 +795,33 @@ bool Solver::valid_set(uint16_t S) const {
 
 void Solver::row_polys(uint16_t S, const double* c, double phi[2 * MAXM][4],
                        bool has[2 * MAXM]) const {
-    double Wc[MAXM][4], P[MAXM][MAXM], q[MAXM], V[MAXM][4];
+    double Wc[MAXM][4];
     for (int j = 0; j < m_; ++j)
         for (int p = 0; p < 4; ++p) {
             double s = 0.0;
             for (int k = 0; k <= j; ++k) s += Lci_[j][k] * ((p < p_->orders[k]) ? c[off_[k] + p] : 0.0);
             Wc[j][p] = s;
         }
-    affine(S, P, q);
-    for (int i = 0; i < m_; ++i)
-        for (int p = 0; p < 4; ++p) {
-            double s = (p == 0) ? q[i] : 0.0;
-            for (int j = 0; j < m_; ++j) s += P[i][j] * Wc[j][p];
-            V[i][p] = s;
-        }
     int idx[MAXM], na = 0;
-    for (int key = 0; key < 2 * m_; ++key) {
-        has[key] = false;
-        if (!finite_[key]) continue;
-        has[key] = true;
-        if (S & (1u << key)) { idx[na++] = key; continue; }
-        for (int p = 0; p < 4; ++p) {
-            double s = 0.0;
-            for (int j = 0; j < m_; ++j) s += rows_[key][j] * V[j][p];
-            phi[key][p] = s - ((p == 0) ? rhs_[key] : 0.0);
+    {                                                 // own scope: stack shared with the block below
+        double P[MAXM][MAXM], q[MAXM], V[MAXM][4];
+        affine(S, P, q);
+        for (int i = 0; i < m_; ++i)
+            for (int p = 0; p < 4; ++p) {
+                double s = (p == 0) ? q[i] : 0.0;
+                for (int j = 0; j < m_; ++j) s += P[i][j] * Wc[j][p];
+                V[i][p] = s;
+            }
+        for (int key = 0; key < 2 * m_; ++key) {
+            has[key] = false;
+            if (!finite_[key]) continue;
+            has[key] = true;
+            if (S & (1u << key)) { idx[na++] = key; continue; }
+            for (int p = 0; p < 4; ++p) {
+                double s = 0.0;
+                for (int j = 0; j < m_; ++j) s += rows_[key][j] * V[j][p];
+                phi[key][p] = s - ((p == 0) ? rhs_[key] : 0.0);
+            }
         }
     }
     if (na > 0) {
@@ -850,9 +847,8 @@ void Solver::row_polys(uint16_t S, const double* c, double phi[2 * MAXM][4],
     }
 }
 
-bool Solver::lex_ok(uint16_t S, const double* c, double t) const {
-    double phi[2 * MAXM][4], b[4];
-    bool has[2 * MAXM];
+bool Solver::lex_ok(uint16_t S, const double* c, double t, double phi[2 * MAXM][4], bool has[2 * MAXM]) const {
+    double b[4];
     row_polys(S, c, phi, has);
     const double T = p_->T;
     for (int key = 0; key < 2 * m_; ++key) {
@@ -869,10 +865,11 @@ bool Solver::lex_ok(uint16_t S, const double* c, double t) const {
     return true;
 }
 
-bool Solver::lex_set(const double* c, double t, uint16_t guess, uint16_t* out) const {
-    if (guess != 0xFFFFu && valid_set(guess) && lex_ok(guess, c, t)) { *out = guess; return true; }
+bool Solver::lex_set(const double* c, double t, uint16_t guess, uint16_t* out, double phi[2 * MAXM][4],
+                     bool has[2 * MAXM]) const {
+    if (guess != 0xFFFFu && valid_set(guess) && lex_ok(guess, c, t, phi, has)) { *out = guess; return true; }
     for (int i = 0; i < nsets_; ++i)
-        if (lex_ok(sets_[i], c, t)) { *out = sets_[i]; return true; }
+        if (lex_ok(sets_[i], c, t, phi, has)) { *out = sets_[i]; return true; }
     return false;
 }
 
@@ -880,13 +877,14 @@ bool Solver::walk(const double* c, Eval& e) {
     e.ndeg = 0;
     if (identity_) return walk_box(c, e);
     const double T = p_->T;
+    // G_ is free during the walk (evaluate refills it after); phi is also lex_set's scratch (dead there)
+    double (*const phi)[4] = reinterpret_cast<double (*)[4]>(G_);
+    bool has[2 * MAXM];
     uint16_t S;
-    if (!lex_set(c, 0.0, 0, &S)) return false;      // (a) initial set: one-sided KKT at 0+
+    if (!lex_set(c, 0.0, 0, &S, phi, has)) return false;   // (a) initial set: one-sided KKT at 0+
     int ns = 0, stall = 0;
     e.S[ns++] = S;
     double t = 0.0;
-    double phi[2 * MAXM][4];
-    bool has[2 * MAXM];
     for (;;) {
         const double L = T - t;
         row_polys(S, c, phi, has);
@@ -932,7 +930,7 @@ bool Solver::walk(const double* c, Eval& e) {
         if (Snew == 0xFFFFu) {                           // (b) degenerate event
             ++e.ndeg;
             const uint16_t guess = (uint16_t)(S ^ gmask);
-            if (!lex_set(c, t, valid_set(guess) ? guess : 0xFFFFu, &Snew)) return false;
+            if (!lex_set(c, t, valid_set(guess) ? guess : 0xFFFFu, &Snew, phi, has)) return false;
         }
         if (Snew != S) {
             if (ns >= MAXARC_E) { capfail_ = true; return false; }
@@ -1085,22 +1083,25 @@ bool Solver::solve_newton(Result& R, int warm_its) {
     R.box_fast_path = identity_;
     R.narcs = 0;
     R.failure = "unconstrained start failed";
-    double c[MAXN], cn[MAXN], mu[MAXN], mun[MAXN];
+    double* const c = R.c;                          // the iterate lives in R
+    double* const mu = R.mu;
     const int max_its = warm_its < 0 ? MAX_NEWTON : warm_its;
-    for (int i = 0; i < n_; ++i) mu[i] = (warm_its >= 0 && qf_) ? R.mu[i] : 0.0;
+    if (!(warm_its >= 0 && qf_))
+        for (int i = 0; i < n_; ++i) mu[i] = 0.0;
     if (qf_) {                                      // c = Lm Cf^T mu
+        double* const nu = W_;                      // workspace (free here)
         for (int i = 0; i < n_; ++i) {
             double s = 0.0;
             for (int j = 0; j <= i; ++j) s += Cf_[j * MAXN + i] * mu[j];
-            mun[i] = s;
+            nu[i] = s;
         }
         for (int i = 0; i < n_; ++i) {
             double s = 0.0;
-            for (int j = 0; j < n_; ++j) s += Lm_[i * MAXN + j] * mun[j];
+            for (int j = 0; j < n_; ++j) s += Lm_[i * MAXN + j] * nu[j];
             c[i] = s;
         }
     } else if (warm_its >= 0) {
-        for (int i = 0; i < n_; ++i) c[i] = R.c[i];
+        // warm: c = R.c
     } else {
         const uint16_t S0 = 0;                      // unconstrained start
         if (!solve_c(&S0, nullptr, 1, c)) return false;
@@ -1128,7 +1129,7 @@ bool Solver::solve_newton(Result& R, int warm_its) {
         // (J Lm) d_nu = -F, J Lm = int K P K^T dt symmetric PSD; d_c = Lm d_nu
         // workspace: E's ds(T)/dc in G_ -> H in W_; X and A reuse G_ (evaluate refills it)
         double* const H = W_;
-        double dnu[MAXN], d[MAXN];
+        double dnu[MAXN];
         for (int i = 0; i < n_; ++i)
             for (int j = 0; j < n_; ++j) {
                 double s = 0.0;
@@ -1167,7 +1168,9 @@ bool Solver::solve_newton(Result& R, int warm_its) {
             rho = (rho == 0.0) ? 1e-12 * hmax : 10.0 * rho;
         }
         if (!solved) { why = "singular Newton matrix"; break; }
-        double slope = 0.0, dmu[MAXN];
+        // H is dead: the step and the trial point live in W_
+        double* const dmu = W_, * const d = W_ + MAXN, * const cn = W_ + 2 * MAXN, * const mun = W_ + 3 * MAXN;
+        double slope = 0.0;
         for (int i = 0; i < n_; ++i) slope -= E.F[i] * dnu[i];
         if (qf_) {                                  // solved for d_mu; d_nu = Cf^T d_mu
             for (int i = 0; i < n_; ++i) dmu[i] = dnu[i];
@@ -1208,7 +1211,6 @@ bool Solver::solve_newton(Result& R, int warm_its) {
     R.narcs = E.narcs;
     for (int i = 0; i < E.narcs; ++i) R.S[i] = E.S[i];
     for (int i = 0; i + 1 < E.narcs; ++i) R.tau[i] = E.tau[i];
-    for (int i = 0; i < n_; ++i) { R.c[i] = c[i]; R.mu[i] = mu[i]; }
     double Fn = 0.0;
     for (int i = 0; i < n_; ++i) Fn = fmax(Fn, fabs(E.F[i]));
     R.residual = Fn;

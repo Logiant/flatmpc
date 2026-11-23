@@ -186,8 +186,9 @@ private:
     bool start(Result& r, int method, int warm_its);
     bool solve_newton(Result& r, int warm_its);
     void row_polys(uint16_t S, const double* c, double phi[2 * MAXM][4], bool has[2 * MAXM]) const;
-    bool lex_ok(uint16_t S, const double* c, double t) const;
-    bool lex_set(const double* c, double t, uint16_t guess, uint16_t* out) const;
+    bool lex_ok(uint16_t S, const double* c, double t, double phi[2 * MAXM][4], bool has[2 * MAXM]) const;
+    bool lex_set(const double* c, double t, uint16_t guess, uint16_t* out, double phi[2 * MAXM][4],
+                 bool has[2 * MAXM]) const;
     bool valid_set(uint16_t S) const;
     bool walk(const double* c, Eval& e);
     bool walk_box(const double* c, Eval& e);

@@ -22,8 +22,7 @@ static const lqocp::SetBasis* lookup(void*, uint16_t S) {
 #ifdef BENCH_ENERGY
 static lqocp::Solver es;
 static lqocp::Result er;
-#include "qf_q0.h"
-static lqocp::Problem tq0;                             // TINY with Q = 0 (RAM copy)
+#include "qf_q0.h"                                    // TQ0: TINY with Q = 0, in flash
 #endif
 
 #if defined(BENCH_TINY) || defined(BENCH_ENERGY)
@@ -37,8 +36,8 @@ static int loop_u(double dt, double* u) {
     return gr.iterations;
 }
 #else
-static const lqocp::Problem& loop_prob() { return tq0; }
-static bool loop_setup() { return es.setup(tq0); }
+static const lqocp::Problem& loop_prob() { return TQ0; }
+static bool loop_setup() { return es.setup(TQ0); }
 static void loop_x0(const double* x) { es.set_x0(x); }
 static bool loop_solve(int k, double, int cap) { return (k == 0) ? es.solve(er) : es.solve_warm(er, cap); }
 static int loop_u(double dt, double* u) {
@@ -134,12 +133,8 @@ void loop() {
         report(k ? "B" : "A", er.cost, er.iterations, t1 - t0, ok, er.narcs - 1);
     }
     {
-        memcpy(&tq0, &BENCH_PROB[2], sizeof(tq0));
-        memset(tq0.Q, 0, sizeof(tq0.Q));
-        memcpy(tq0.Qf, QF_Q0, sizeof(tq0.Qf));   // TinyMPC's own Q=0 terminal weight
-        tq0.has_Qf = 1;
         const uint32_t t0 = micros();
-        bool ok = es.setup(tq0) && es.solve(er, lqocp::METHOD_NEWTON);
+        bool ok = es.setup(TQ0) && es.solve(er, lqocp::METHOD_NEWTON);   // TinyMPC's own Q=0 terminal weight
         const uint32_t t1 = micros();
         report("TINY_Q0", er.cost, er.iterations, t1 - t0, ok, er.narcs - 1);
         closed_loop(100);
