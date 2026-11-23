@@ -193,11 +193,10 @@ bool StateSolver::kkt(uint16_t S, const double Wc[MAXM][4], double Pv[MAXM][MAXM
     return true;
 }
 
-bool StateSolver::lex(const double Wc[MAXM][4], uint16_t pin, double t, uint16_t guess, uint16_t* out) const {
+bool StateSolver::lex(const double Wc[MAXM][4], uint16_t pin, double t, double T, uint16_t guess, uint16_t* out) const {
     const Solver& B = base_;
     double Pv[MAXM][MAXM], Vv[MAXM][4], phi[2 * MAXM][4], sig[MAXM][4], b[4];
     bool has[2 * MAXM];
-    const double T = B.p_->T;
     for (int i = -1; i < B.nsets_; ++i) {
         const uint16_t cand = (i < 0) ? guess : B.sets_[i];
         if (i < 0 && !B.valid_set(cand)) continue;
@@ -242,7 +241,7 @@ bool StateSolver::walk(const double* c, const double* y, Ev& e) const {
         for (int q = 0; q < nsa_; ++q)
             if (sa_[q].t1 <= tm && tm < sa_[q].t2) pin |= (uint16_t)(1u << sa_[q].chain);
         wpoly(c, y, sa_, nsa_, tm, Wc);
-        if (!lex(Wc, pin, ta, (uint16_t)(S & 0xFF), &S)) return false;
+        if (!lex(Wc, pin, ta, tb - ta, (uint16_t)(S & 0xFF), &S)) return false;
         if (ns >= MAXARC_E) return false;
         if (ns) e.tau[ns - 1] = ta;
         e.S[ns++] = S;
@@ -286,7 +285,7 @@ bool StateSolver::walk(const double* c, const double* y, Ev& e) const {
             }
             if (Snew == 0xFFFFu) {
                 const uint16_t guess = (uint16_t)((S ^ gmask) & 0xFF);
-                if (!lex(Wc, pin, t, B.valid_set(guess) ? guess : 0xFFFFu, &Snew)) return false;
+                if (!lex(Wc, pin, t, tb - t, B.valid_set(guess) ? guess : 0xFFFFu, &Snew)) return false;
             }
             if (Snew != S) {
                 if (ns >= MAXARC_E) return false;
@@ -482,17 +481,16 @@ bool StateSolver::gres(const double* y, double* g, int* ng, double* vs) {
         for (int side = 0; side < 2; ++side) {
             if (side == 0 ? sa_[q].fix1 : sa_[q].fix2) continue;
             const double tj = side == 0 ? sa_[q].t1 : sa_[q].t2;
-            int best = -1;                               // arc ending (side 0) / starting (side 1) at tj
+            int ab = -1;                                 // arc ending at tj (ab + 1 starts there)
             double bd = HUGE_VAL;
-            for (int a = 0; a < e.narcs; ++a) {
-                double t0, t1;
-                span_(e.tau, e.narcs, a, T, &t0, &t1);
-                if (!(t1 > t0)) continue;
-                const double dd = fabs((side == 0 ? t1 : t0) - tj);
-                if (dd < bd) { bd = dd; best = a; }
+            for (int a = 0; a + 1 < e.narcs; ++a) {
+                const double dd = fabs(e.tau[a] - tj);
+                if (dd < bd) { bd = dd; ab = a; }
             }
-            if (best < 0 || bd > 1e-12 * T) return false;
-            vpoly(e.S, e.tau, e.narcs, best, c, y, sa_, nsa_, V);
+            if (ab < 0 || bd > 1e-12 * T) return false;
+            // control continuity: v_j(t1-) = 0, v_j(t2+) = 0 (v_j = 0 on the arc). This is dJ/dtj = 0
+            // when the thrust rows active at the junction do not change (NOTES.md 14.2).
+            vpoly(e.S, e.tau, e.narcs, side == 0 ? ab : ab + 1, c, y, sa_, nsa_, V);
             g[k++] = peval(V[j], tj);
         }
     }
@@ -500,7 +498,7 @@ bool StateSolver::gres(const double* y, double* g, int* ng, double* vs) {
     return true;
 }
 
-// Newton (finite-difference Jacobian) on the free junction times: v_j(t1-) = 0, v_j(t2+) = 0.
+// Newton (finite-difference Jacobian) on the free junction times: dJ/dt = 0 at each (see gres).
 // false with collapsed_ = q: arc q collapsed (t2 <= t1).
 bool StateSolver::junctions(double* y, int max_its, int* outer) {
     const double T = base_.p_->T;
@@ -556,7 +554,10 @@ bool StateSolver::junctions(double* y, int max_its, int* outer) {
                 StateArc& s = sa_[q];
                 if (!s.fix2 && s.t2 >= T * (1 - 1e-9)) { s.t2 = T; s.fix2 = true; }
                 if (!s.fix1 && s.t1 <= 1e-9 * T) bad = true;
-                if (s.t2 - s.t1 <= 1e-9 * T) { collapsed_ = q; return false; }
+                if (s.t2 - s.t1 <= 1e-9 * T) {           // collapse only if no shorter step avoids it
+                    if (al <= 1.0 / 256) { collapsed_ = q; return false; }
+                    bad = true;
+                }
             }
             if (bad) continue;
             for (int i = 0; i < ny; ++i) y[i] = y0[i];
@@ -622,8 +623,8 @@ double StateSolver::scan(const double* c, const double* y, int j, int side, doub
     return worst;
 }
 
-double StateSolver::check(const double* y, int* wc, int* ws, double* ta, double* tb, double* psign,
-                          double* ppmp) const {
+double StateSolver::check(const double* y, int* wc, int* ws, double* ta, double* tb, double* twout,
+                          double* psign, double* ppmp) const {
     const Solver& B = base_;
     const Ev& e = ev_[0];
     const double T = B.p_->T;
@@ -640,6 +641,7 @@ double StateSolver::check(const double* y, int* wc, int* ws, double* ta, double*
             if (v > worst) { worst = v; *wc = j; *ws = side; tw = xx; }
         }
     if (*wc >= 0) scan(c, y, *wc, *ws, tw, &xx, ta, tb);
+    *twout = tw;
     // eta = -side * sig' >= 0 on boundary arcs; thrust rows feasible with mu >= 0 (Solver::verify)
     double ps = 0.0, pp = 0.0;
     for (int a = 0; a < e.narcs; ++a) {
@@ -783,15 +785,22 @@ bool StateSolver::run(StateResult& r, int warm) {
     const char* why = nullptr;
     bool conv = false;
     char seq[160], det[64];
+    unsigned gone = 0;                                       // chains whose boundary arc collapsed
+    seq[0] = 0;
     if (!inner(y, cap)) why = why_;
     for (int pass = 0; !why && pass < 3 * MAXSA + 3; ++pass) {
         if (nsa_) {
             collapsed_ = -1;
             if (!junctions(y, cap, &r.outer)) {
                 if (collapsed_ >= 0) {                       // collapsed arc: q = 1 touch = drop it
+                    sequence(ev_[0].S, ev_[0].narcs, sa_, nsa_, ev_[0].tau, seq, sizeof seq);
+                    gone |= 1u << sa_[collapsed_].chain;
                     for (int q = collapsed_; q + 1 < nsa_; ++q) { sa_[q] = sa_[q + 1]; y[n + q] = y[n + q + 1]; }
                     --nsa_;
-                    if (!inner(y, cap)) why = why_;
+                    if (!inner(y, cap)) {
+                        snprintf(why_, sizeof why_, "arc order rejected: %s (arc collapsed, re-solve failed)", seq);
+                        why = why_;
+                    }
                     continue;
                 }
                 strncpy(det, why_, sizeof det - 1); det[sizeof det - 1] = 0;
@@ -802,8 +811,8 @@ bool StateSolver::run(StateResult& r, int warm) {
             }
         }
         int wc, ws;
-        double ta, tb, ps, pp;
-        const double viol = check(y, &wc, &ws, &ta, &tb, &ps, &pp);
+        double ta, tb, tw, ps, pp;
+        const double viol = check(y, &wc, &ws, &ta, &tb, &tw, &ps, &pp);
         r.state_violation = viol; r.sign_violation = ps; r.pmp_violation = pp;
         if (ps > TOL_SIGN) {
             sequence(ev_[0].S, ev_[0].narcs, sa_, nsa_, ev_[0].tau, seq, sizeof seq);
@@ -813,16 +822,32 @@ bool StateSolver::run(StateResult& r, int warm) {
         }
         if (viol > TOL_X) {
             if (nsa_ >= MAXSA) { why = "state arc capacity LQOCP_MAXSA exceeded"; break; }
+            if (gone & (1u << wc)) {                         // the arc collapsed but the violation is back
+                snprintf(why_, sizeof why_, "arc order rejected: %s (boundary arc on %c collapsed, violation remains)", seq, CH[wc]);
+                why = why_;
+                break;
+            }
             for (int q = 0; q < nsa_; ++q)
                 if (sa_[q].chain == wc && ta < sa_[q].t2 && tb > sa_[q].t1) why = "overlapping boundary arcs";
             if (why) break;
+            // initial boundary arc: the violation interval [ta, tb]; if the pinned problem has no
+            // solution from there, a shorter piece around the worst point
             StateArc& s = sa_[nsa_];
             s.chain = (int8_t)wc; s.side = (int8_t)ws; s.b = ws > 0 ? hi_[wc] : lo_[wc];
-            s.t1 = ta; s.t2 = tb; s.fix1 = ta <= 0.0; s.fix2 = tb >= T;
-            y[n + nsa_] = 0.0;
+            s.fix1 = ta <= 0.0; s.fix2 = tb >= T;
             ++nsa_;
             ++r.inserted;
-            if (!inner(y, cap)) {
+            double ysave[NY];
+            for (int i = 0; i < n + nsa_ - 1; ++i) ysave[i] = y[i];
+            bool ok = false;
+            for (double f = 1.0; f > 0.05 && !ok; f *= 0.5) {
+                s.t1 = s.fix1 ? 0.0 : tw - f * (tw - ta);
+                s.t2 = s.fix2 ? T : tw + f * (tb - tw);
+                for (int i = 0; i < n + nsa_ - 1; ++i) y[i] = ysave[i];
+                y[n + nsa_ - 1] = 0.0;
+                ok = inner(y, cap);
+            }
+            if (!ok) {
                 strncpy(det, why_, sizeof det - 1); det[sizeof det - 1] = 0;
                 snprintf(why_, sizeof why_, "arc order rejected: insertion on %c (%s)", CH[wc], det);
                 why = why_;

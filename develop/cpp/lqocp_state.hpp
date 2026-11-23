@@ -88,7 +88,7 @@ private:
     void wpoly(const double* c, const double* y, const StateArc* sa, int nsa, double tm, double Wc[MAXM][4]) const;
     bool kkt(uint16_t S, const double Wc[MAXM][4], double Pv[MAXM][MAXM], double Vv[MAXM][4],
              double phi[2 * MAXM][4], bool has[2 * MAXM], double sig[MAXM][4]) const;
-    bool lex(const double Wc[MAXM][4], uint16_t pin, double t, uint16_t guess, uint16_t* out) const;
+    bool lex(const double Wc[MAXM][4], uint16_t pin, double t, double L, uint16_t guess, uint16_t* out) const;
     bool walk(const double* c, const double* y, Ev& e) const;
     void cvec(const double* y, double* c) const;
     bool evaluate(const double* y, Ev& e, bool wantH);
@@ -96,7 +96,7 @@ private:
     bool gres(const double* y, double* g, int* ng, double* vs);
     bool junctions(double* y, int max_its, int* outer);
     double scan(const double* c, const double* y, int j, int side, double tw, double* twout, double* ta, double* tb) const;
-    double check(const double* y, int* wc, int* ws, double* ta, double* tb, double* psign, double* ppmp) const;
+    double check(const double* y, int* wc, int* ws, double* ta, double* tb, double* tw, double* psign, double* ppmp) const;
     void fill(StateResult& r) const;
     void vpoly(const uint16_t* S, const double* tau, int n, int a, const double* c, const double* y,
                const StateArc* sa, int nsa, double V[MAXM][4]) const;
