@@ -1085,6 +1085,7 @@ bool Solver::solve_newton(Result& R) {
 // =====================================================================================
 namespace {
 
+const double CHORD = 0.1;           // Newton: reuse the factored J while the residual contracts by this
 const double GTOL = 1e-12;           // junction residual tolerance (relative to R)
 const double STOL = 1e-9;            // walked vs Newton junction times (relative to T)
 const double WRESET = 0.3;          // warm start: a capped plan violating PMP by > WRESET*R restarts cold
@@ -2997,15 +2998,32 @@ bool GSolver::newton_tau(uint16_t* seq, int* Np, double* tau, int* its) {
     double r[NR], rn[NR], tn[NA], d[NR];
     double rmax = resid(seq, N, tau, r);
     const double tol = GTOL * R_, gap = 1e-12 * p_->T;
-    double prev = HUGE_VAL;
+    double prev = HUGE_VAL, hv[NJ], hvv[NJ];
     int bad = 0;
-    while (*its < MAX_TAU_NEWTON && budget_ > 0) {
+    bool fact = false;                                // J_ holds the QR of the current structure's J
+    int nfresh = 0, nchord = 0;
+    while (nfresh < MAX_TAU_NEWTON && nchord < 2 * MAX_TAU_NEWTON && budget_ > 0) {
         const int nj = N - 1;
         if (rmax <= tol) { *Np = N; return true; }
         if (rmax > 0.5 * prev && ++bad > 2) { *Np = N; return rmax <= 1e3 * tol; }
+        // chord step (reuse the factored J) while the last step contracted well
+        const bool chord = fact && rmax <= CHORD * prev;
         prev = rmax;
         ++*its;
         --budget_;
+        bool sing = false;
+        if (chord) ++nchord;
+        else ++nfresh;
+        if (chord) {
+            for (int q = 0; q < nr; ++q) J_[q][nj] = (real)(-r[q]);
+            for (int k = 0; k < nj; ++k) {              // stored reflections (v below the diagonal)
+                double s = hv[k] * J_[k][nj];
+                for (int q = k + 1; q < nr; ++q) s += J_[q][k] * J_[q][nj];
+                s *= 2.0 / hvv[k];
+                J_[k][nj] = (real)(J_[k][nj] - s * hv[k]);
+                for (int q = k + 1; q < nr; ++q) J_[q][nj] = (real)(J_[q][nj] - s * J_[q][k]);
+            }
+        } else {
         if (nr < nj || !sens(seq, N, tau)) { *Np = N; return false; }
         for (int q = 0; q < nr; ++q) {
             const int k = jq_[q];
@@ -3016,7 +3034,7 @@ bool GSolver::newton_tau(uint16_t* seq, int* Np, double* tau, int* its) {
         double jmax = 0.0;
         for (int q = 0; q < nr; ++q)
             for (int c = 0; c < nj; ++c) jmax = fmax(jmax, fabs(J_[q][c]));
-        bool sing = !(jmax > 0.0);
+        sing = !(jmax > 0.0);
         for (int k = 0; k < nj && !sing; ++k) {
             double sg = 0.0, *v = rn;                  // rn is free until the line search
             for (int q = k; q < nr; ++q) { v[q] = J_[q][k]; sg += v[q] * v[q]; }
@@ -3032,6 +3050,11 @@ bool GSolver::newton_tau(uint16_t* seq, int* Np, double* tau, int* its) {
                 s *= 2.0 / vv;
                 for (int q = k; q < nr; ++q) J_[q][c] = (real)(J_[q][c] - s * v[q]);
             }
+            hv[k] = v[k];
+            hvv[k] = vv;
+            for (int q = k + 1; q < nr; ++q) J_[q][k] = (real)v[q];
+        }
+        fact = !sing;
         }
         if (sing) { *Np = N; return false; }
         for (int i = nj - 1; i >= 0; --i) {
@@ -3067,6 +3090,7 @@ bool GSolver::newton_tau(uint16_t* seq, int* Np, double* tau, int* its) {
                 return false;
             }
             ++events_;
+            fact = false;
             if (nr == 0) { *Np = N; return true; }
             rmax = resid(seq, N, tau, r);
             prev = HUGE_VAL;
@@ -3088,6 +3112,7 @@ bool GSolver::newton_tau(uint16_t* seq, int* Np, double* tau, int* its) {
             }
             alpha *= 0.5;
         }
+        if (!acc && chord && bvp(seq, N, tau)) { fact = false; continue; }   // retry with a fresh J
         if (!acc) {
             bvp(seq, N, tau);                         // restore the state of tau
             *Np = N;
