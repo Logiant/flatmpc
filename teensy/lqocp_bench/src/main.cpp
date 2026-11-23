@@ -4,7 +4,9 @@
 // started (solve_warm), applying the mean of the planned input over the step. See platformio.ini.
 #include <Arduino.h>
 #include <algorithm>
-#if defined(BENCH_TINY) || defined(BENCH_ENERGY)
+#if defined(BENCH_Q0)                                  // TINY with Q = 0 (gen/gen_q0_table.cpp); implies BENCH_TINY
+#include "bench_data_q0.h"
+#elif defined(BENCH_TINY) || defined(BENCH_ENERGY)
 #include "bench_data.h"
 #endif
 
@@ -48,6 +50,7 @@ static void closed_loop(int cap) {
     double x[lqocp::MAXN], u[lqocp::MAXM] = {0.0, 0.0, 0.0, 0.0}, J = 0.0;
     float t[STEPS];
     int itot = 0, itmax = 0, nconv = 0;
+    double umax = 0.0, Jq = 0.0;                      // max |M u| applied; J_cl scored with TINY's Q
     for (int i = 0; i < 12; ++i) x[i] = p.x0[i];
     gs.setup(p, lookup, nullptr);
     for (int k = 0; k < STEPS; ++k) {
@@ -66,6 +69,19 @@ static void closed_loop(int cap) {
         for (int i = 0; i < 4; ++i)
             for (int j = 0; j < 4; ++j) ur += u[i] * p.R[i][j] * u[j];
         J += 0.5 * (sq + ur) * dt;
+#ifdef BENCH_Q0
+        double sqt = 0.0;
+        for (int i = 0; i < 12; ++i)
+            for (int j = 0; j < 12; ++j) sqt += x[i] * TINY_QSCORE[i * 12 + j] * x[j];
+        Jq += 0.5 * (sqt + ur) * dt;
+#else
+        Jq = J;
+#endif
+        for (int r = 0; r < 4; ++r) {
+            double mu = 0.0;
+            for (int j = 0; j < 4; ++j) mu += p.M[r][j] * u[j];
+            umax = std::max(umax, fabs(mu));
+        }
         zoh_step(p, dt, u, x);
     }
     double xn = 0.0, tsum = 0.0;
@@ -74,8 +90,8 @@ static void closed_loop(int cap) {
     std::sort(t + 1, t + STEPS);                       // warm steps 1..99
     for (int k = 1; k < STEPS; ++k) tsum += t[k];
     Serial.printf("loop cap=%d cold_us=%.1f warm(99) mean=%.1f median=%.1f max=%.1f min=%.1f us "
-                  "total_iter=%d max_iter=%d converged=%d/%d J_cl=%.9f |x_end|=%.3g\n",
-                  cap, cold, tsum / (STEPS - 1), t[50], t[STEPS - 1], t[1], itot, itmax, nconv, STEPS, J,
+                  "total_iter=%d max_iter=%d converged=%d/%d J_cl=%.9f J_cl_tinyQ=%.9f max|u|=%.6f |x_end|=%.3g\n",
+                  cap, cold, tsum / (STEPS - 1), t[50], t[STEPS - 1], t[1], itot, itmax, nconv, STEPS, J, Jq, umax,
                   sqrt(xn));
 }
 #endif
