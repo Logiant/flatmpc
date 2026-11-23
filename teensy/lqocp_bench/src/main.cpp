@@ -1,7 +1,9 @@
 // lqocp bench on Teensy 4.1: solves TINY (general cost) or A and B (energy cost) and prints
 // cost, iterations and solve time (setup + solve) over serial. With BENCH_TINY it also runs the
 // closed loop of teensy/tinympc_bench: 100 MPC steps at dt = 0.05 on the exact ZOH model, warm
-// started (solve_warm), applying the mean of the planned input over the step. See platformio.ini.
+// started (solve_warm), applying the mean of the planned input over the step. With BENCH_ENERGY
+// the same cold solve and loop run on TINY with Q = 0 (energy path: terminal cost Qf, TINY's R).
+// See platformio.ini.
 #include <Arduino.h>
 #include <algorithm>
 #if defined(BENCH_TINY) || defined(BENCH_ENERGY)
@@ -20,9 +22,30 @@ static const lqocp::SetBasis* lookup(void*, uint16_t S) {
 #ifdef BENCH_ENERGY
 static lqocp::Solver es;
 static lqocp::Result er;
+static lqocp::Problem tq0;                             // TINY with Q = 0 (RAM copy)
 #endif
 
+#if defined(BENCH_TINY) || defined(BENCH_ENERGY)
 #ifdef BENCH_TINY
+static const lqocp::Problem& loop_prob() { return BENCH_PROB[2]; }
+static bool loop_setup() { return gs.setup(BENCH_PROB[2], lookup, nullptr); }
+static void loop_x0(const double* x) { gs.set_x0(x); }
+static bool loop_solve(int k, double dt, int cap) { return (k == 0) ? gs.solve(gr) : gs.solve_warm(gr, dt, cap); }
+static int loop_u(double dt, double* u) {
+    gs.mean_u(gr, 0.0, dt, u);                        // saturated to the bounds; false: holds u
+    return gr.iterations;
+}
+#else
+static const lqocp::Problem& loop_prob() { return tq0; }
+static bool loop_setup() { return es.setup(tq0); }
+static void loop_x0(const double* x) { es.set_x0(x); }
+static bool loop_solve(int k, double, int cap) { return (k == 0) ? es.solve(er) : es.solve_warm(er, cap); }
+static int loop_u(double dt, double* u) {
+    es.mean_u(er, 0.0, dt, u);                        // v = Proj(w) is feasible for any iterate
+    return er.iterations;
+}
+#endif
+
 static float cyc_us(uint32_t c) { return c / (F_CPU_ACTUAL / 1e6f); }
 
 // x+ = Ad x + Bd u: exact zero-order hold of the integrator chains (dt^k / k!)
@@ -44,21 +67,21 @@ static void zoh_step(const lqocp::Problem& p, double dt, const double* u, double
 static void closed_loop(int cap) {
     const int STEPS = 100;
     const double dt = 0.05;
-    const lqocp::Problem& p = BENCH_PROB[2];
+    const lqocp::Problem& p = loop_prob();
     double x[lqocp::MAXN], u[lqocp::MAXM] = {0.0, 0.0, 0.0, 0.0}, J = 0.0;
     float t[STEPS];
     int itot = 0, itmax = 0, nconv = 0;
     for (int i = 0; i < 12; ++i) x[i] = p.x0[i];
-    gs.setup(p, lookup, nullptr);
+    loop_setup();
     for (int k = 0; k < STEPS; ++k) {
-        gs.set_x0(x);
+        loop_x0(x);
         const uint32_t c0 = ARM_DWT_CYCCNT, m0 = micros();
-        const bool ok = (k == 0) ? gs.solve(gr) : gs.solve_warm(gr, dt, cap);
+        const bool ok = loop_solve(k, dt, cap);
         const uint32_t c1 = ARM_DWT_CYCCNT, m1 = micros();
         t[k] = (m1 - m0 > 1000000u) ? (float)(m1 - m0) : cyc_us(c1 - c0);   // the cycle counter wraps after 7.2 s
-        gs.mean_u(gr, 0.0, dt, u);                    // saturated to the bounds; false: holds u
-        itot += gr.iterations;
-        itmax = std::max(itmax, gr.iterations);
+        const int its = loop_u(dt, u);
+        itot += its;
+        itmax = std::max(itmax, its);
         nconv += ok;
         double sq = 0.0, ur = 0.0;                    // stage cost 1/2 (x'Qx + u'Ru) dt
         for (int i = 0; i < 12; ++i)
@@ -108,6 +131,16 @@ void loop() {
         bool ok = es.setup(BENCH_PROB[k]) && es.solve(er, lqocp::METHOD_NEWTON);
         const uint32_t t1 = micros();
         report(k ? "B" : "A", er.cost, er.iterations, t1 - t0, ok, er.narcs - 1);
+    }
+    {
+        memcpy(&tq0, &BENCH_PROB[2], sizeof(tq0));
+        memset(tq0.Q, 0, sizeof(tq0.Q));
+        const uint32_t t0 = micros();
+        bool ok = es.setup(tq0) && es.solve(er, lqocp::METHOD_NEWTON);
+        const uint32_t t1 = micros();
+        report("TINY_Q0", er.cost, er.iterations, t1 - t0, ok, er.narcs - 1);
+        closed_loop(100);
+        closed_loop(5);
     }
 #else
     const uint32_t t0 = micros();

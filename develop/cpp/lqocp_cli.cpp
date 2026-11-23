@@ -131,7 +131,7 @@ int main(int argc, char** argv) {
         return 3;
     }
     if (meth == lqocp::METHOD_TAU && general) {
-        std::fprintf(stderr, "method 'tau' supports only the energy cost (Q=0, R=I, fixed endpoint)\n");
+        std::fprintf(stderr, "method 'tau' supports only the energy cost (Q = 0)\n");
         return 3;
     }
     bool ok;
