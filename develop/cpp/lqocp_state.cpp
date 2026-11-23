@@ -894,6 +894,24 @@ bool StateSolver::run(StateResult& r, int warm) {
     return conv;
 }
 
+bool StateSolver::solve_warm(StateResult& r, int max_its, double shift) {
+    const double T = base_.p_->T;
+    const int n = base_.n_;
+    int k = 0;
+    for (int q = 0; q < r.nsa && q < MAXSA; ++q) {
+        StateArc a = r.sa[q];
+        if (!a.fix2) a.t2 -= shift;
+        if (a.t2 <= 1e-9 * T) continue;                  // ended: drop
+        a.t1 -= shift;
+        double d = r.y[n + q];
+        if (a.fix1 || a.t1 <= 1e-9 * T) { a.t1 = 0.0; a.fix1 = true; d = 0.0; }
+        r.sa[k] = a;
+        r.y[n + k++] = d;
+    }
+    r.nsa = k;
+    return run(r, max_its);
+}
+
 void StateSolver::eval_u(const StateResult& r, double t, double u[MAXM]) const {
     const double T = base_.p_->T;
     if (t < 0.0) t = 0.0;

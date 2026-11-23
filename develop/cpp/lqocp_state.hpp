@@ -50,8 +50,10 @@ public:
     bool setup(const Problem& p, const double* slo, const double* shi);
     const char* setup_failure() const { return sfail_; }
     bool solve(StateResult& r) { return run(r, -1); }
-    // MPC: from the previous arcs and dual iterate, at most max_its inner Newton iterations per solve
-    bool solve_warm(StateResult& r, int max_its) { return run(r, max_its); }
+    // MPC: from the previous arcs and dual iterate, at most max_its inner Newton iterations per solve.
+    // shift: time the horizon moved since r was computed (arcs move left by it; an arc that now starts
+    // at or before 0 starts at 0, one that ended is dropped). Update x0 with set_x0 first.
+    bool solve_warm(StateResult& r, int max_its, double shift = 0.0);
     bool set_x0(const double* x0) { return base_.set_x0(x0); }
     bool mean_u(const StateResult& r, double t0, double t1, double u[MAXM]) const;
     void eval_u(const StateResult& r, double t, double u[MAXM]) const;
