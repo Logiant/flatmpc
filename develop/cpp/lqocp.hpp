@@ -2,7 +2,8 @@
 // polytopic input constraint lo <= M v <= hi. Port of develop/python/lqocp.py.
 //
 // Costs:
-//   energy  : J = 1/2 int |v|^2, fixed endpoint (Q = 0, R = I, no Qf)
+//   energy  : Q = 0: J = 1/2 int v'Rv [+ 1/2 (s(T)-xf)'Qf(s(T)-xf)], else fixed endpoint
+//             (polynomial costate, NOTES.md sections 7 and 13)
 //   general : J = 1/2 int (s'Qs + v'Rv) + 1/2 (s(T)-xf)'Qf(s(T)-xf)  (or fixed endpoint)
 // Methods:
 //   METHOD_NEWTON (default): energy -> Newton on the 12 polynomial coefficients, exact cubic
@@ -67,7 +68,7 @@ struct Problem {
     int has_bounds;                  // 0: unconstrained
     double M[MAXM][MAXM];            // u = M v
     double lo[MAXM], hi[MAXM];       // +-HUGE_VAL disables a side
-    int has_cost;                    // 0: energy cost (Q = 0, R = I, fixed endpoint)
+    int has_cost;                    // 0: energy cost (Q = 0, R = I, fixed endpoint); Q = 0 is always energy
     double Q[MAXN][MAXN];
     double R[MAXM][MAXM];
     int has_Qf;                      // 0: fixed endpoint s(T) = xf
@@ -86,6 +87,7 @@ struct Result {
     int narcs;
     Arc arcs[MAXARC_E];
     double c[MAXN];                  // energy: coefficients of the switching polynomial w(t)
+    double mu[MAXN];                 // energy with Qf (newton): dual iterate, nu = Cf^T mu, c = Lm nu
     double cost;
     int iterations;                  // tau: BC solves + Newton its; newton: Newton iterations
     int newton_iterations;
@@ -105,6 +107,12 @@ public:
     bool setup(const Problem& p);
     // Returns r.converged. A general cost returns false (use GSolver).
     bool solve(Result& r, int method = METHOD_NEWTON);
+    // MPC warm start (newton): from the previous r.c / r.mu, at most max_its Newton iterations
+    // (then r is the current iterate; its v = Proj(w) is feasible). Update x0 with set_x0 first.
+    bool solve_warm(Result& r, int max_its);
+    bool set_x0(const double* x0);   // false if x0 is not finite
+    // mean u on [t0, t1] (what a zero-order hold should apply); false: no plan
+    bool mean_u(const Result& r, double t0, double t1, double u[MAXM]) const;
     void eval_u(const Result& r, double t, double u[MAXM]) const;
     void eval_x(const Result& r, double t, double x[MAXN]) const;
     int switch_times(const Result& r, double* out, int maxout) const;
@@ -144,7 +152,10 @@ private:
     double R_;
     bool identity_;
     bool general_;
+    bool rI_, qf_;                   // R = I; terminal cost (else fixed endpoint)
+    double Lc_[MAXM][MAXM], Lci_[MAXM][MAXM];       // R = Lc Lc^T; projection in vt = Lc^T v
     double Lm_[MAXN * MAXN], Linv_[MAXN * MAXN];   // energy: c = Lm nu
+    double Cf_[MAXN * MAXN], g_[MAXN];             // Qf = Cf^T Cf; g = Cf (xf - e^{AT} x0)
     EnergyWork ew_;
 
     // shared / energy
@@ -161,18 +172,24 @@ private:
     bool residual(Arc* arcs, int nseq, const double* tau, double* res, int* nres, double* c) const;
     bool newton(Arc* arcs, int nseq, double* tau, double* c, int* its, double* resmax) const;
     double cost(const Arc* arcs, int narcs, const double* c) const;
+    double vR(int j, const double* v) const {        // (R v)_j
+        double s = 0.0;
+        for (int k = 0; k < m_; ++k) s += p_.R[j][k] * v[k];
+        return s;
+    }
     void v_on(const Arc& a, const double* c, double t, double* v) const;
     bool solve_tau(Result& r);
     bool detect_exact(const double* c);
-    bool solve_newton(Result& r);
+    bool start(Result& r, int method, int warm_its);
+    bool solve_newton(Result& r, int warm_its);
     void row_polys(uint16_t S, const double* c, double phi[2 * MAXM][4], bool has[2 * MAXM]) const;
     bool lex_ok(uint16_t S, const double* c, double t) const;
     bool lex_set(const double* c, double t, uint16_t guess, uint16_t* out) const;
     bool valid_set(uint16_t S) const;
     bool walk(const double* c, Eval& e);
     bool walk_box(const double* c, Eval& e);
-    bool evaluate(const double* c, Eval& e);
-    double dual(const Arc* arcs, int narcs, const double* c) const;
+    bool evaluate(const double* c, const double* mu, Eval& e);
+    double dual(const Arc* arcs, int narcs, const double* c, const double* mu) const;
     double verify(const Arc* arcs, int narcs, const double* c) const;
 };
 

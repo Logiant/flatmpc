@@ -73,22 +73,66 @@ bool Solver::setup(const Problem& p) {
         n_ += p.orders[j];
     }
     if (n_ > MAXN || !(p.T > 0.0)) return false;
-    // energy cost (Q = 0, R = I, fixed endpoint) or general LQ cost
+    // Q = 0: energy path (polynomial costate; any R, optional Qf); else general LQ cost
     general_ = false;
+    rI_ = true;
+    qf_ = p.has_cost && p.has_Qf;
     if (p.has_cost) {
-        bool energy = !p.has_Qf;
         for (int i = 0; i < n_; ++i)
             for (int j = 0; j < n_; ++j)
-                if (p.Q[i][j] != 0.0) energy = false;
+                if (p.Q[i][j] != 0.0) general_ = true;
         for (int i = 0; i < m_; ++i)
             for (int j = 0; j < m_; ++j)
-                if (p.R[i][j] != ((i == j) ? 1.0 : 0.0)) energy = false;
-        general_ = !energy;
+                if (p.R[i][j] != ((i == j) ? 1.0 : 0.0)) rI_ = false;
+    }
+    if (general_) return true;                      // general cost: use GSolver
+    // R = Lc Lc^T: with vt = Lc^T v the cost is |vt|^2 and the rows act on vt (M Lc^-T)
+    for (int i = 0; i < m_; ++i)
+        for (int j = 0; j < m_; ++j) { Lc_[i][j] = 0.0; Lci_[i][j] = (i == j) ? 1.0 : 0.0; }
+    if (!rI_) {
+        for (int j = 0; j < m_; ++j) {
+            double d = p.R[j][j];
+            for (int k = 0; k < j; ++k) d -= Lc_[j][k] * Lc_[j][k];
+            if (!(d > 0.0)) return false;           // R not SPD
+            Lc_[j][j] = sqrt(d);
+            for (int i = j + 1; i < m_; ++i) {
+                double s = p.R[i][j];
+                for (int k = 0; k < j; ++k) s -= Lc_[i][k] * Lc_[j][k];
+                Lc_[i][j] = s / Lc_[j][j];
+            }
+        }
+        for (int j = 0; j < m_; ++j)                 // Lci = Lc^-1, column j by forward substitution
+            for (int i = 0; i < m_; ++i) {
+                double s = (i == j) ? 1.0 : 0.0;
+                for (int k = 0; k < i; ++k) s -= Lc_[i][k] * Lci_[k][j];
+                Lci_[i][j] = s / Lc_[i][i];
+            }
     }
     double Mrow[MAXM][MAXM];
     for (int r = 0; r < m_; ++r)
-        for (int j = 0; j < m_; ++j) Mrow[r][j] = p.M[r][j];
-    if (general_) return true;                      // general cost: use GSolver
+        for (int j = 0; j < m_; ++j) {
+            double s = 0.0;
+            for (int k = 0; k < m_; ++k) s += p.M[r][k] * Lci_[j][k];
+            Mrow[r][j] = rI_ ? p.M[r][j] : s;
+        }
+    // Qf = Cf^T Cf (Cf = L^T, semidefinite Cholesky: a zero pivot leaves a zero row)
+    for (int i = 0; i < MAXN * MAXN; ++i) Cf_[i] = 0.0;
+    if (qf_) {
+        double qmax = 0.0;
+        for (int i = 0; i < n_; ++i) qmax = fmax(qmax, fabs(p.Qf[i][i]));
+        for (int j = 0; j < n_; ++j) {
+            double d = p.Qf[j][j];
+            for (int k = 0; k < j; ++k) d -= Cf_[k * MAXN + j] * Cf_[k * MAXN + j];
+            if (d < -1e-12 * qmax) return false;    // Qf not PSD
+            if (d <= 1e-14 * qmax) continue;
+            Cf_[j * MAXN + j] = sqrt(d);
+            for (int i = j + 1; i < n_; ++i) {
+                double s = p.Qf[i][j];
+                for (int k = 0; k < j; ++k) s -= Cf_[k * MAXN + i] * Cf_[k * MAXN + j];
+                Cf_[j * MAXN + i] = s / Cf_[j * MAXN + j];
+            }
+        }
+    }
     rhs_scale_ = 1.0;
     for (int r = 0; r < m_; ++r) {
         for (int j = 0; j < m_; ++j) {
@@ -120,7 +164,6 @@ bool Solver::setup(const Problem& p) {
             if (ok && cnt == sz) sets_[nsets_++] = S;
         }
     }
-    phi_x0(p.T, free_);
     // newton-mode data
     R_ = 1.0;
     double mx = 0.0;
@@ -131,7 +174,7 @@ bool Solver::setup(const Problem& p) {
         if (finite_[k]) mx = fmax(mx, fabs(rhs_[k]));
     }
     R_ = 1.0 + mx;
-    identity_ = p.has_bounds != 0 && !general_;
+    identity_ = p.has_bounds != 0 && rI_;
     for (int r = 0; r < m_; ++r)
         for (int j = 0; j < m_; ++j)
             if (p.M[r][j] != ((r == j) ? 1.0 : 0.0)) identity_ = false;
@@ -153,6 +196,20 @@ bool Solver::setup(const Problem& p) {
         for (int i = 0; i < MAXN * MAXN; ++i) A[i] = Lm_[i];
         for (int i = 0; i < n_; ++i) Linv_[i * MAXN + i] = 1.0;
         if (!lu_solve(A, n_, MAXN, Linv_, n_, MAXN)) return false;
+    }
+    return set_x0(p.x0);
+}
+
+bool Solver::set_x0(const double* x0) {
+    for (int i = 0; i < n_; ++i) {
+        if (!isfinite(x0[i])) return false;
+        p_.x0[i] = x0[i];
+    }
+    phi_x0(p_.T, free_);
+    for (int i = 0; i < n_; ++i) {
+        double s = 0.0;
+        for (int j = i; j < n_; ++j) s += Cf_[i * MAXN + j] * (p_.xf[j] - free_[j]);
+        g_[i] = s;
     }
     return true;
 }
@@ -272,6 +329,26 @@ bool Solver::build_arcs(const uint16_t* seq, int nseq, const double* tau, Arc* a
     for (int i = 0; i < nseq; ++i) {
         arcs[i].S = seq[i];
         if (!affine(seq[i], arcs[i].P, arcs[i].q)) return false;
+        if (rI_) continue;
+        double P[MAXM][MAXM], q[MAXM];
+        for (int a = 0; a < m_; ++a) {
+            q[a] = arcs[i].q[a];
+            for (int b = 0; b < m_; ++b) {
+                double t = 0.0;
+                for (int k = 0; k < m_; ++k) t += arcs[i].P[a][k] * Lci_[k][b];
+                P[a][b] = t;
+            }
+        }
+        for (int a = 0; a < m_; ++a) {
+            double t = 0.0;
+            for (int k = 0; k < m_; ++k) t += Lci_[k][a] * q[k];
+            arcs[i].q[a] = t;
+            for (int b = 0; b < m_; ++b) {
+                t = 0.0;
+                for (int k = 0; k < m_; ++k) t += Lci_[k][a] * P[k][b];
+                arcs[i].P[a][b] = t;
+            }
+        }
     }
     set_times(arcs, nseq, tau);
     return true;
@@ -326,6 +403,20 @@ bool Solver::solve_c(const Arc* arcs, int narcs, double* c) const {
     double G[MAXN * MAXN], h[MAXN];
     assemble(arcs, narcs, G, h);
     for (int i = 0; i < n_; ++i) h[i] = p_.xf[i] - h[i];
+    if (qf_) {
+        double A[MAXN * MAXN], b[MAXN];
+        for (int i = 0; i < n_; ++i) {
+            b[i] = 0.0;
+            for (int k = 0; k < n_; ++k) b[i] += p_.Qf[i][k] * h[k];
+            for (int j = 0; j < n_; ++j) {
+                double t = Linv_[i * MAXN + j];
+                for (int k = 0; k < n_; ++k) t += p_.Qf[i][k] * G[k * MAXN + j];
+                A[i * MAXN + j] = t;
+            }
+        }
+        for (int i = 0; i < n_ * MAXN; ++i) G[i] = A[i];
+        for (int i = 0; i < n_; ++i) h[i] = b[i];
+    }
     if (!lu_solve(G, n_, MAXN, h, 1, 1)) return false;
     for (int i = 0; i < n_; ++i) c[i] = h[i];
     return true;
@@ -344,7 +435,11 @@ bool Solver::residual(Arc* arcs, int nseq, const double* tau, double* res, int* 
             const Arc& side = (R & (1u << key)) ? arcs[k] : arcs[k + 1];  // key inactive here
             v_on(side, c, tau[k], v);
             double g = -rhs_[key];
-            for (int j = 0; j < m_; ++j) g += rows_[key][j] * v[j];
+            for (int j = 0; j < m_; ++j) {
+                double vt = rI_ ? v[j] : 0.0;
+                if (!rI_) for (int i = j; i < m_; ++i) vt += Lc_[i][j] * v[i];
+                g += rows_[key][j] * vt;
+            }
             if (nr >= MAXRES) return false;
             res[nr++] = g;
         }
@@ -433,14 +528,27 @@ double Solver::cost(const Arc* arcs, int narcs, const double* c) const {
         for (int g = 0; g < 4; ++g) {
             v_on(arcs[a], c, arcs[a].t0 + hw * (GL_X[g] + 1.0), v);
             double s = 0.0;
-            for (int j = 0; j < m_; ++j) s += v[j] * v[j];
+            for (int j = 0; j < m_; ++j) s += rI_ ? v[j] * v[j] : v[j] * vR(j, v);
             J += 0.5 * GL_W[g] * hw * s;
         }
+    }
+    if (qf_) {
+        double G[MAXN * MAXN], h[MAXN], e[MAXN];
+        assemble(arcs, narcs, G, h);
+        for (int i = 0; i < n_; ++i) {
+            e[i] = h[i] - p_.xf[i];
+            for (int j = 0; j < n_; ++j) e[i] += G[i * MAXN + j] * c[j];
+        }
+        for (int i = 0; i < n_; ++i)
+            for (int j = 0; j < n_; ++j) J += 0.5 * e[i] * p_.Qf[i][j] * e[j];
     }
     return J;
 }
 
-bool Solver::solve(Result& R, int method) {
+bool Solver::solve(Result& R, int method) { return start(R, method, -1); }
+bool Solver::solve_warm(Result& R, int max_its) { return start(R, METHOD_NEWTON, max_its); }
+
+bool Solver::start(Result& R, int method, int warm_its) {
     R.method = method;
     R.converged = false;
     if (general_) return false;                       // general cost: use GSolver
@@ -448,7 +556,7 @@ bool Solver::solve(Result& R, int method) {
     R.degenerate_events = 0;
     R.ntouch = 0;
     R.box_fast_path = false;
-    if (method == METHOD_NEWTON) return solve_newton(R);
+    if (method == METHOD_NEWTON) return solve_newton(R, warm_its);
     return solve_tau(R);
 }
 
@@ -554,6 +662,22 @@ void Solver::eval_x(const Result& R, double t, double x[MAXN]) const {
             }
         }
     }
+}
+
+bool Solver::mean_u(const Result& R, double t0, double t1, double u[MAXM]) const {
+    if (R.narcs < 1 || !(t1 > t0)) return false;
+    double acc[MAXM] = {0.0, 0.0, 0.0, 0.0}, v[MAXM];
+    for (int a = 0; a < R.narcs; ++a) {             // v is a cubic per arc: 4-point Gauss is exact
+        const double lo = fmax(t0, R.arcs[a].t0), hi = fmin(t1, R.arcs[a].t1);
+        if (!(hi > lo)) continue;
+        const double hw = 0.5 * (hi - lo);
+        for (int g = 0; g < 4; ++g) {
+            v_on(R.arcs[a], R.c, lo + hw * (GL_X[g] + 1.0), v);
+            for (int j = 0; j < m_; ++j) acc[j] += GL_W[g] * hw * v[j];
+        }
+    }
+    for (int j = 0; j < m_; ++j) u[j] = acc[j] / (t1 - t0);
+    return true;
 }
 
 int Solver::switch_times(const Result& R, double* out, int maxout) const {
@@ -708,7 +832,11 @@ void Solver::row_polys(uint16_t S, const double* c, double phi[2 * MAXM][4],
                        bool has[2 * MAXM]) const {
     double Wc[MAXM][4], P[MAXM][MAXM], q[MAXM], V[MAXM][4];
     for (int j = 0; j < m_; ++j)
-        for (int p = 0; p < 4; ++p) Wc[j][p] = (p < p_.orders[j]) ? c[off_[j] + p] : 0.0;
+        for (int p = 0; p < 4; ++p) {
+            double s = 0.0;
+            for (int k = 0; k <= j; ++k) s += Lci_[j][k] * ((p < p_.orders[k]) ? c[off_[k] + p] : 0.0);
+            Wc[j][p] = s;
+        }
     affine(S, P, q);
     for (int i = 0; i < m_; ++i)
         for (int p = 0; p < 4; ++p) {
@@ -912,9 +1040,10 @@ bool Solver::walk_box(const double* c, Eval& e) {
     return build_arcs(ew_.wseq, ns, ew_.wtau, e.arcs);
 }
 
-double Solver::dual(const Arc* arcs, int narcs, const double* c) const {
+double Solver::dual(const Arc* arcs, int narcs, const double* c, const double* mu) const {
     double val = 0.0;
-    for (int i = 0; i < n_; ++i) {
+    for (int i = 0; i < n_ && qf_; ++i) val += mu[i] * (g_[i] - 0.5 * mu[i]);
+    for (int i = 0; i < n_ && !qf_; ++i) {
         double nu = 0.0;
         for (int j = 0; j < n_; ++j) nu += Linv_[i * MAXN + j] * c[j];
         val += nu * (p_.xf[i] - free_[i]);
@@ -927,14 +1056,14 @@ double Solver::dual(const Arc* arcs, int narcs, const double* c) const {
             w_of(c, t, w);
             v_on(arcs[a], c, t, v);
             double s = 0.0;
-            for (int j = 0; j < m_; ++j) s += 0.5 * v[j] * v[j] - w[j] * v[j];
+            for (int j = 0; j < m_; ++j) s += 0.5 * v[j] * (rI_ ? v[j] : vR(j, v)) - w[j] * v[j];
             val += GL_W[g] * hw * s;
         }
     }
     return val;
 }
 
-bool Solver::evaluate(const double* c, Eval& e) {
+bool Solver::evaluate(const double* c, const double* mu, Eval& e) {
     if (!walk(c, e)) return false;
     double h[MAXN];
     assemble(e.arcs, e.narcs, e.G, h);
@@ -947,8 +1076,19 @@ bool Solver::evaluate(const double* c, Eval& e) {
         sc = fmax(sc, fabs(free_[i]));
         sc = fmax(sc, s + fabs(h[i] - free_[i]));
     }
+    if (qf_) {                                       // transversality: F = Cf (s(T) - xf) + mu
+        double r[MAXN], sq = 0.0;
+        for (int i = 0; i < n_; ++i) r[i] = e.F[i];
+        for (int i = 0; i < n_; ++i) {
+            double f = mu[i], a = fabs(mu[i]);
+            for (int j = i; j < n_; ++j) { f += Cf_[i * MAXN + j] * r[j]; a += fabs(Cf_[i * MAXN + j]) * sc; }
+            e.F[i] = f;
+            sq = fmax(sq, a);
+        }
+        sc = fmax(1.0, sq);
+    }
     e.scale = sc;
-    e.D = dual(e.arcs, e.narcs, c);
+    e.D = dual(e.arcs, e.narcs, c, mu);
     return true;
 }
 
@@ -971,7 +1111,8 @@ double Solver::verify(const Arc* arcs, int narcs, const double* c) const {
     return worst;
 }
 
-bool Solver::solve_newton(Result& R) {
+// warm_its < 0: cold start (unconstrained solution; mu = 0 with Qf), else from R.c / R.mu.
+bool Solver::solve_newton(Result& R, int warm_its) {
     R.iterations = R.newton_iterations = R.outer_iterations = 0;
     R.residual = HUGE_VAL;
     R.pmp_violation = HUGE_VAL;
@@ -981,12 +1122,29 @@ bool Solver::solve_newton(Result& R) {
     ew_.nseq = 1;
     ew_.seq[0] = 0;
     if (!build_arcs(ew_.seq, 1, ew_.tau, ew_.arcs)) return false;
-    double c[MAXN], cn[MAXN];
-    if (!solve_c(ew_.arcs, 1, c)) return false;
+    double c[MAXN], cn[MAXN], mu[MAXN], mun[MAXN];
+    const int max_its = warm_its < 0 ? MAX_NEWTON : warm_its;
+    for (int i = 0; i < n_; ++i) mu[i] = (warm_its >= 0 && qf_) ? R.mu[i] : 0.0;
+    if (qf_) {                                      // c = Lm Cf^T mu
+        for (int i = 0; i < n_; ++i) {
+            double s = 0.0;
+            for (int j = 0; j <= i; ++j) s += Cf_[j * MAXN + i] * mu[j];
+            mun[i] = s;
+        }
+        for (int i = 0; i < n_; ++i) {
+            double s = 0.0;
+            for (int j = 0; j < n_; ++j) s += Lm_[i * MAXN + j] * mun[j];
+            c[i] = s;
+        }
+    } else if (warm_its >= 0) {
+        for (int i = 0; i < n_; ++i) c[i] = R.c[i];
+    } else if (!solve_c(ew_.arcs, 1, c)) {
+        return false;
+    }
     double c_start[MAXN];
     for (int i = 0; i < n_; ++i) c_start[i] = c[i];
     int cur = 0;
-    bool ok = evaluate(c, ew_.ev[cur]);
+    bool ok = evaluate(c, mu, ew_.ev[cur]);
     bool conv = false;
     const double rtol = 1e-12;
     int its = 0;
@@ -995,8 +1153,8 @@ bool Solver::solve_newton(Result& R) {
         double Fn = 0.0, F2 = 0.0;
         for (int i = 0; i < n_; ++i) { Fn = fmax(Fn, fabs(E.F[i])); F2 += E.F[i] * E.F[i]; }
         if (Fn <= rtol * E.scale) { conv = true; break; }
-        if (its >= MAX_NEWTON) break;
-        {   // dual unbounded (infeasible problem): the iterates c diverge
+        if (its >= max_its) break;
+        if (!qf_) {   // dual unbounded (infeasible problem): the iterates c diverge
             double cn = 0.0, c0 = 1.0;
             for (int i = 0; i < n_; ++i) { cn = fmax(cn, fabs(c[i])); c0 = fmax(c0, 1.0 + fabs(c_start[i])); }
             if (cn > 1e6 * c0) break;
@@ -1015,6 +1173,21 @@ bool Solver::solve_newton(Result& R) {
                 const double s = 0.5 * (H[i * MAXN + j] + H[j * MAXN + i]);
                 H[i * MAXN + j] = H[j * MAXN + i] = s;
             }
+        if (qf_) {   // -Hess D(mu) = Cf H Cf^T + I (uniformly positive definite)
+            double X[MAXN * MAXN];
+            for (int i = 0; i < n_; ++i)
+                for (int j = 0; j < n_; ++j) {
+                    double s = 0.0;
+                    for (int k = i; k < n_; ++k) s += Cf_[i * MAXN + k] * H[k * MAXN + j];
+                    X[i * MAXN + j] = s;
+                }
+            for (int i = 0; i < n_; ++i)
+                for (int j = i; j < n_; ++j) {
+                    double s = (i == j) ? 1.0 : 0.0;
+                    for (int k = j; k < n_; ++k) s += X[i * MAXN + k] * Cf_[j * MAXN + k];
+                    H[i * MAXN + j] = H[j * MAXN + i] = s;
+                }
+        }
         double hmax = 0.0;
         for (int i = 0; i < n_ * MAXN; ++i) hmax = fmax(hmax, fabs(H[i]));
         double rho = 0.0;
@@ -1027,19 +1200,28 @@ bool Solver::solve_newton(Result& R) {
             rho = (rho == 0.0) ? 1e-12 * hmax : 10.0 * rho;
         }
         if (!solved) break;
-        double slope = 0.0;
+        double slope = 0.0, dmu[MAXN];
+        for (int i = 0; i < n_; ++i) slope -= E.F[i] * dnu[i];
+        if (qf_) {                                  // solved for d_mu; d_nu = Cf^T d_mu
+            for (int i = 0; i < n_; ++i) dmu[i] = dnu[i];
+            for (int i = 0; i < n_; ++i) {
+                double s = 0.0;
+                for (int j = 0; j <= i; ++j) s += Cf_[j * MAXN + i] * dmu[j];
+                dnu[i] = s;
+            }
+        }
         for (int i = 0; i < n_; ++i) {
             double s = 0.0;
             for (int j = 0; j < n_; ++j) s += Lm_[i * MAXN + j] * dnu[j];
             d[i] = s;
-            slope -= E.F[i] * dnu[i];
         }
         double alpha = 1.0;
         bool accepted = false;
         const int nxt = 1 - cur;
         while (alpha >= 1e-10) {
             for (int i = 0; i < n_; ++i) cn[i] = c[i] + alpha * d[i];
-            if (evaluate(cn, ew_.ev[nxt])) {
+            for (int i = 0; i < n_ && qf_; ++i) mun[i] = mu[i] + alpha * dmu[i];
+            if (evaluate(cn, mun, ew_.ev[nxt])) {
                 const Eval& N = ew_.ev[nxt];
                 if (N.D >= E.D + 1e-4 * alpha * slope) { accepted = true; break; }
                 double nF2 = 0.0;
@@ -1050,7 +1232,7 @@ bool Solver::solve_newton(Result& R) {
             ++R.backtracks;
         }
         if (!accepted) break;
-        for (int i = 0; i < n_; ++i) c[i] = cn[i];
+        for (int i = 0; i < n_; ++i) { c[i] = cn[i]; if (qf_) mu[i] = mun[i]; }
         cur = nxt;
     }
     R.iterations = R.newton_iterations = its;
@@ -1058,7 +1240,7 @@ bool Solver::solve_newton(Result& R) {
     const Eval& E = ew_.ev[cur];
     R.narcs = E.narcs;
     for (int i = 0; i < E.narcs; ++i) R.arcs[i] = E.arcs[i];
-    for (int i = 0; i < n_; ++i) R.c[i] = c[i];
+    for (int i = 0; i < n_; ++i) { R.c[i] = c[i]; R.mu[i] = mu[i]; }
     double Fn = 0.0;
     for (int i = 0; i < n_; ++i) Fn = fmax(Fn, fabs(E.F[i]));
     R.residual = Fn;
