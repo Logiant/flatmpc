@@ -131,7 +131,7 @@ int main(int argc, char** argv) {
         return 3;
     }
     if (meth == lqocp::METHOD_TAU && general) {
-        std::fprintf(stderr, "method 'tau' supports only the energy cost (Q=0, R=I, fixed endpoint)\n");
+        std::fprintf(stderr, "method 'tau' supports only the energy cost (Q = 0)\n");
         return 3;
     }
     bool ok;
@@ -158,7 +158,7 @@ int main(int argc, char** argv) {
     for (int j = 0; j < m; ++j) std::fprintf(f, ",u%d", j);
     std::fprintf(f, "\n");
     const int K = 1001;
-    double x[lqocp::MAXN], u[lqocp::MAXM];
+    double x[lqocp::MAXN], u[lqocp::MAXM] = {0.0, 0.0, 0.0, 0.0};   // (a failed eval_u leaves u)
     for (int k = 0; k < K; ++k) {
         const double t = (k == K - 1) ? p.T : p.T * k / (K - 1);
         if (general) {
@@ -181,14 +181,14 @@ int main(int argc, char** argv) {
     const double cost = general ? g_gresult.cost : g_result.cost;
     const int its = general ? g_gresult.iterations : g_result.iterations;
     const bool conv = ok && (general ? g_gresult.converged : g_result.converged);
-    // JSON has no inf/nan: print null for a non-finite cost (failed or infeasible solve)
-    if (std::isfinite(cost)) std::printf("{\"cost\": %.17g, \"switch_times\": [", cost);
+    // a failed solve has no valid cost (and JSON has no inf/nan): print null
+    if (conv && std::isfinite(cost)) std::printf("{\"cost\": %.17g, \"switch_times\": [", cost);
     else std::printf("{\"cost\": null, \"switch_times\": [");
     for (int i = 0; i < ns; ++i) std::printf("%s%.17g", i ? ", " : "", st[i]);
     std::printf("], \"iterations\": %d, \"solve_time_us\": %.3f, \"converged\": %s, \"method\": \"%s\"",
                 its, us, conv ? "true" : "false", method.c_str());
     if (!conv) {
-        const char* why = general ? g_gresult.failure : "not converged";
+        const char* why = general ? g_gresult.failure : g_result.failure;
         std::printf(", \"failure\": \"%s\"", why ? why : "not converged");
     }
     std::printf("}\n");

@@ -14,11 +14,11 @@ $(BUILD):
 case_data:
 	python3 gen_case_data.py case_data.h
 
-# Flash table of TINY's stable bases + the A/B/TINY problems for teensy/lqocp_bench (add ALL=all
-# to tabulate every valid active set instead of those a host solve of TINY touches).
+# Flash table of TINY's stable bases (one per set of active rows) + the A/B/TINY problems for
+# teensy/lqocp_bench.
 teensy_table: gen_basis_table.cpp lqocp.cpp lqocp_basis.cpp lqocp.hpp case_data.h | $(BUILD)
-	$(CXX) $(CXXFLAGS) -o $(BUILD)/gen_basis_table gen_basis_table.cpp lqocp.cpp lqocp_basis.cpp
-	$(BUILD)/gen_basis_table ../../teensy/lqocp_bench/src/bench_data.h $(ALL)
+	$(CXX) $(CXXFLAGS) -DLQOCP_NSD=4 -o $(BUILD)/gen_basis_table gen_basis_table.cpp lqocp.cpp lqocp_basis.cpp
+	$(BUILD)/gen_basis_table ../../teensy/lqocp_bench/src/bench_data.h
 
 clean:
 	rm -rf $(BUILD)
