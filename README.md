@@ -19,3 +19,6 @@ Work in progress.
 | `compare/` | Benchmark against TinyMPC and OSQP on the same problem; `audit/` checks the formulation |
 | `sidebar/` | Search for cases where greedy arc selection fails |
 | `teensy/` | PlatformIO projects for the Teensy 4.1 |
+
+## License
+This repository is licensed under [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) (see `LICENSE`). Vendored third-party code, such as TinyMPC and Eigen under `compare/third_party/` and the Teensy bench `lib/` folders, keeps its own license.
