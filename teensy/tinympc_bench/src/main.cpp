@@ -6,7 +6,7 @@
 static TinySolver *make(int max_iter) {
     TinySolver *s = quad_setup();
     // rho fix: rebuild the cache from the ORIGINAL Q, R (tiny_setup passes Q+rho, R+rho, so rho is added twice).
-    tinyMatrix Q = Map<const tinyVector>(Q_d, NX).asDiagonal();
+    tinyMatrix Q = Map<const tinyVector>(Q_stage, NX).asDiagonal();
     tinyMatrix R = tinytype(4) * tinyMatrix::Identity(NU, NU);
     tiny_precompute_and_set_cache(s->cache, s->work->Adyn, s->work->Bdyn, s->work->fdyn, Q, R, NX, NU, 5.0, 0);
     s->settings->max_iter = max_iter;
@@ -38,6 +38,7 @@ static void closed_loop(int max_iter) {
     const int STEPS = 100;
     TinySolver *s = make(max_iter);
     tinyVector x = Map<const tinyVector>(X0, NX);
+    double J = 0, Jq = 0, umax = 0;  // J_cl = sum 1/2 (x'Qx + u'Ru) dt with the stage Q, and with TINY's Q; max |u| applied
     float t[STEPS]; long total = 0; int nconv = 0, itmax = 0; double tsum = 0, itus = 0;
     for (int k = 0; k < STEPS; k++) {
         tiny_set_x0(s, x);
@@ -47,13 +48,18 @@ static void closed_loop(int max_iter) {
         int it = s->solution->iter;
         total += it; nconv += s->solution->solved; itmax = std::max(itmax, it); tsum += t[k];
         if (it) itus += t[k] / it;
+        tinyVector u0 = s->work->u.col(0);
+        double ur = 4.0 * (double)u0.squaredNorm(), sq = 0, sqt = 0;
+        for (int i = 0; i < NX; i++) { sq += Q_stage[i] * x(i) * x(i); sqt += Q_d[i] * x(i) * x(i); }
+        J += 0.5 * (sq + ur) * 0.05; Jq += 0.5 * (sqt + ur) * 0.05;
+        umax = std::max(umax, (double)u0.cwiseAbs().maxCoeff());
         x = s->work->Adyn * x + s->work->Bdyn * s->work->u.col(0);
     }
     std::sort(t, t + STEPS);
     Serial.printf("loop maxit=%d total_iter=%ld mean_iter=%.2f max_iter_seen=%d converged=%d/%d "
-                  "t_us mean=%.1f median=%.1f max=%.1f min=%.1f total_ms=%.2f us_per_iter=%.2f final|x|=%.3g\n",
+                  "t_us mean=%.1f median=%.1f max=%.1f min=%.1f total_ms=%.2f us_per_iter=%.2f final|x|=%.3g J_cl=%.9f J_cl_tinyQ=%.9f max|u|=%.6f\n",
                   max_iter, total, total / (double)STEPS, itmax, nconv, STEPS,
-                  tsum / STEPS, (t[49] + t[50]) / 2, t[STEPS - 1], t[0], tsum / 1000, tsum / total, (double)x.norm());
+                  tsum / STEPS, (t[49] + t[50]) / 2, t[STEPS - 1], t[0], tsum / 1000, tsum / total, (double)x.norm(), J, Jq, umax);
     destroy(s);
 }
 
@@ -64,9 +70,9 @@ void setup() {
 }
 
 void loop() {
-    Serial.printf("=== TinyMPC 0.0.8 %s, F_CPU=%lu ===\n", sizeof(tinytype) == 8 ? "double" : "float", (unsigned long)F_CPU_ACTUAL);
+    Serial.printf("=== TinyMPC 0.0.8 %s Q%s, F_CPU=%lu ===\n", sizeof(tinytype) == 8 ? "double" : "float", Q_stage == Q_d ? "=TINY" : "=0", (unsigned long)F_CPU_ACTUAL);
     cold(10000);
-    cold(100);
+    closed_loop(1000);
     closed_loop(100);
     closed_loop(5);
     Serial.println("=== done ===");
