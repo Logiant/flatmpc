@@ -32,6 +32,7 @@ const double SGW[4] = {0.34785484513745385737, 0.65214515486254614263,
 const double EPS_ = 2.220446049250313e-16;
 const double TOL_X = 1e-9;           // state violation, relative to 1 + |b|
 const double TOL_SIGN = 1e-7;        // eta >= 0 on a boundary arc, relative
+const double RND_F = 30.0 * EPS_ / 1e-12;    // inner tolerance is 1e-12 scale: scale gets 30x the rounding of F / 1e-12
 const char CH[4] = {'x', 'y', 'z', 'p'};
 const int ZC = 2 * MAXSA;            // columns of Z_: one per free junction time
 
@@ -120,7 +121,7 @@ void StateSolver::wpoly(const double* c, const double* y, const StateArc* sa, in
 // v = Pv w + q, Vv = v's coefficients, phi/has the row functions of Solver::row_polys,
 // sig[j] the pin multiplier of chain j in w units (R v = w - sig_j e_j - ...). false: singular.
 bool StateSolver::kkt(uint16_t S, const double Wc[MAXM][4], double Pv[MAXM][MAXM], double Vv[MAXM][4],
-                      double phi[2 * MAXM][4], bool has[2 * MAXM], double sig[MAXM][4]) const {
+                      double phi[2 * MAXM][4], bool has[2 * MAXM], double sig[MAXM][4], double* amp) const {
     const Solver& B = base_;
     const int m = B.m_;
     double rw[MAXM][MAXM], rh[MAXM];
@@ -194,31 +195,54 @@ bool StateSolver::kkt(uint16_t S, const double Wc[MAXM][4], double Pv[MAXM][MAXM
             if (key[a] >= 0) phi[key[a]][p] = -X[a * ld + m + p] * B.rownorm2_[key[a]];
             else sig[-1 - key[a]][p] = X[a * ld + m + p];
         }
+    if (amp)                                         // |d mult / d v-space error|: large for nearly dependent rows
+        for (int a = 0; a < na; ++a)
+            if (key[a] >= 0) {
+                double s = 0.0;
+                for (int i = 0; i < m; ++i) s += X[a * ld + i] * X[a * ld + i];
+                amp[key[a]] = sqrt(s) * B.rownorm2_[key[a]];
+            }
     return true;
 }
 
 // Pv..sig: the caller's kkt buffers (clobbered), so they are not on the stack twice
 bool StateSolver::lex(const double Wc[MAXM][4], uint16_t pin, double t, double T, uint16_t guess, uint16_t* out,
                       double Pv[MAXM][MAXM], double Vv[MAXM][4], double phi[2 * MAXM][4], bool has[2 * MAXM],
-                      double sig[MAXM][4]) const {
+                      double sig[MAXM][4], uint16_t ev) const {
     const Solver& B = base_;
     double b[4];
     for (int i = -1; i < B.nsets_; ++i) {
         const uint16_t cand = (i < 0) ? guess : B.sets_[i];
         if (i < 0 && !B.valid_set(cand)) continue;
         const uint16_t S = (uint16_t)(cand | (pin << 8));
-        if (!kkt(S, Wc, Pv, Vv, phi, has, sig)) continue;
+        double amp[2 * MAXM];
+        if (!kkt(S, Wc, Pv, Vv, phi, has, sig, amp)) continue;
+        rtol(S, Wc, phi, t, amp);
         bool ok = true;
         for (int key = 0; key < 2 * B.m_ && ok; ++key) {
             if (!has[key]) continue;
             shift(phi[key], 4, t, b);
-            const double tol = 1e-12 * (pscale(b, 4, T) + B.R_);
-            for (int q = 0; q < 4; ++q)
+            const double tol = 1e-12 * (pscale(b, 4, T) + B.R_) + amp[key];
+            // ev: rows at an event of the walk, zero at t by construction: their sign is that of the derivatives,
+            // unless the value exceeds what the root's time error (1e-9 T) explains
+            const int q0 = ((ev >> key) & 1u) && fabs(b[0]) <= 1e-9 * T * fabs(b[1]);
+            for (int q = q0; q < 4; ++q)
                 if (fabs(b[q]) * ipow(T, q) > tol) { if (b[q] > 0) ok = false; break; }
         }
         if (ok) { *out = S; return true; }
     }
     return false;
+}
+
+// Rounding of the row functions at t (amp in: kkt's amplification per active row; out: absolute tolerance per row).
+// kkt cancels terms of size cs (|Lc^-1 w| plus the active rows times their multipliers); nearly dependent active
+// rows amplify that into their multipliers (B: the motor pairs nearly span the z direction).
+void StateSolver::rtol(uint16_t S, const double Wc[MAXM][4], const double phi[2 * MAXM][4], double t, double* amp) const {
+    const Solver& B = base_;
+    double cs = 0.0;
+    for (int i = 0; i < B.m_; ++i) cs += fabs(peval(Wc[i], t));
+    for (int k = 0; k < 2 * B.m_; ++k) if (S & (1u << k)) cs += fabs(peval(phi[k], t)) / sqrt(B.rownorm2_[k]);
+    for (int k = 0; k < 2 * B.m_; ++k) amp[k] = 100.0 * EPS_ * cs * ((S & (1u << k)) ? amp[k] : sqrt(B.rownorm2_[k]));
 }
 
 // Event walk (Solver::walk) on each piece between boundary-arc junctions
@@ -253,9 +277,12 @@ bool StateSolver::walk(const double* c, const double* y, Ev& e) const {
         e.S[ns++] = S;
         double t = ta;
         int stall = 0;
+        uint16_t zev = 0;                                // rows of the last event: zero at t by construction
         for (;;) {
             const double L = tb - t;
-            if (!kkt(S, Wc, Pv, Vv, phi, has, sig)) return false;
+            double amp[2 * MAXM];
+            if (!kkt(S, Wc, Pv, Vv, phi, has, sig, amp)) return false;
+            rtol(S, Wc, phi, t, amp);
             double rootk[2 * MAXM], s1 = HUGE_VAL;
             bool simplek[2 * MAXM], evk[2 * MAXM];
             for (int key = 0; key < 2 * B.m_; ++key) {
@@ -264,7 +291,8 @@ bool StateSolver::walk(const double* c, const double* y, Ev& e) const {
                 double b[4], red[4];
                 int kk;
                 shift(phi[key], 4, t, b);
-                const double tol = 1e-12 * (pscale(b, 4, T) + B.R_);   // as the tier-1 walk (energy-float 71b3166): no stall on a tiny last arc
+                if ((zev >> key) & 1u) b[0] = 0.0;      // else a new multiplier's root error, amplified by nearly dependent rows, stalls
+                const double tol = 1e-12 * (pscale(b, 4, T) + B.R_) + amp[key];   // as the tier-1 walk (energy-float 71b3166) + rounding
                 const int rl = strip(b, 4, L, tol, red, &kk);
                 if (rl == 0) continue;
                 if (red[0] > 0) { evk[key] = true; rootk[key] = 0.0; simplek[key] = false; s1 = 0.0; continue; }
@@ -284,6 +312,7 @@ bool StateSolver::walk(const double* c, const double* y, Ev& e) const {
                     ++ngroup; gkey = key; gsimple = simplek[key]; gmask |= (uint16_t)(1u << key);
                 }
             t += s1;
+            zev = gmask;
             uint16_t Snew = 0xFFFFu;
             if (ngroup == 1 && gsimple) {
                 const uint16_t cand = (uint16_t)(S ^ (1u << gkey));
@@ -291,7 +320,7 @@ bool StateSolver::walk(const double* c, const double* y, Ev& e) const {
             }
             if (Snew == 0xFFFFu) {
                 const uint16_t guess = (uint16_t)((S ^ gmask) & 0xFF);
-                if (!lex(Wc, pin, t, tb - t, B.valid_set(guess) ? guess : 0xFFFFu, &Snew, Pv, Vv, phi, has, sig)) return false;
+                if (!lex(Wc, pin, t, tb - t, B.valid_set(guess) ? guess : 0xFFFFu, &Snew, Pv, Vv, phi, has, sig, gmask)) return false;
             }
             if (Snew != S) {
                 if (ns >= MAXARC_E) return false;
@@ -362,10 +391,20 @@ __attribute__((noinline)) bool StateSolver::integrate(const double* c, const dou
                 for (int r = 0; r < p.orders[l]; ++r)
                     ci[B.off_[l] + r] = ipow(T - t, p.orders[l] - 1 - r) / fact(p.orders[l] - 1 - r);
             for (int q = 0; q < nsa_; ++q) ci[n + q] = (!sa_[q].fix1 && tm < sa_[q].t1) ? 1.0 : 0.0;
+            // v = Lc^-T (Lc^-1 w - active rows x multipliers): the size of the terms that cancel, for the rounding of F
+            double rw[MAXM], rv[MAXM];
+            for (int i = 0; i < B.m_; ++i) {
+                rw[i] = fabs(peval(Wc[i], t));
+                for (int k = 0; k < 2 * B.m_; ++k)
+                    if (e.S[a] & (1u << k)) rw[i] += fabs(B.rows_[k][i] * peval(phi[k], t)) / B.rownorm2_[k];
+                for (int l = 0; l < B.m_; ++l)
+                    if (e.S[a] & (1u << (8 + l))) rw[i] += fabs(B.Lci_[i][l] * peval(sig[l], t));
+            }
+            for (int j = 0; j < B.m_; ++j) { rv[j] = 0.0; for (int i = j; i < B.m_; ++i) rv[j] += fabs(B.Lci_[i][j]) * rw[i]; }
             for (int i = 0; i < ny; ++i) {
                 const double f = wg * ci[i] * v[li[i]];
                 e.F[i] += f;
-                ab[i] += fabs(f);
+                ab[i] += fabs(f) + RND_F * wg * fabs(ci[i]) * rv[li[i]];   // tolerance >= 30x the rounding of F
             }
             if (wantH)
                 for (int i = 0; i < ny; ++i) {
@@ -771,10 +810,16 @@ double StateSolver::check(const double* y, int* wc, int* ws, double* ta, double*
         const double L = t1 - t0, tm = 0.5 * (t0 + t1);
         if (!(L > 0)) continue;
         wpoly(c, y, sa_, nsa_, tm, Wc);
-        if (!kkt(e.S[a], Wc, Pv, Vv, phi, has, sig)) { pp = HUGE_VAL; continue; }
+        double am[2 * MAXM], a1[2 * MAXM];
+        if (!kkt(e.S[a], Wc, Pv, Vv, phi, has, sig, am)) { pp = HUGE_VAL; continue; }
+        for (int k = 0; k < 2 * B.m_; ++k) a1[k] = am[k];
+        rtol(e.S[a], Wc, phi, t0, am);                   // rounding of the row functions (as the walk)
+        rtol(e.S[a], Wc, phi, t1, a1);
         for (int key = 0; key < 2 * B.m_; ++key) {
             if (!has[key]) continue;
             shift(phi[key], 4, t0, bb);
+            bb[0] -= fmax(am[key], a1[key]);
+            if (a && ((e.S[a] ^ e.S[a - 1]) >> key & 1u)) bb[0] = fmin(bb[0], 0.0);   // row of the event at t0: zero there
             pp = fmax(pp, fmax(bb[0], pval(bb, 4, L)));
             for (int i = 1; i < 4; ++i) d[i - 1] = i * bb[i];
             const int nc = roots_le2(d, 3, cr);

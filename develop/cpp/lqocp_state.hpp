@@ -101,10 +101,11 @@ private:
     bool cold(StateResult& r);
     void wpoly(const double* c, const double* y, const StateArc* sa, int nsa, double tm, double Wc[MAXM][4]) const;
     bool kkt(uint16_t S, const double Wc[MAXM][4], double Pv[MAXM][MAXM], double Vv[MAXM][4],
-             double phi[2 * MAXM][4], bool has[2 * MAXM], double sig[MAXM][4]) const;
+             double phi[2 * MAXM][4], bool has[2 * MAXM], double sig[MAXM][4], double* amp = nullptr) const;
     bool lex(const double Wc[MAXM][4], uint16_t pin, double t, double L, uint16_t guess, uint16_t* out,
              double Pv[MAXM][MAXM], double Vv[MAXM][4], double phi[2 * MAXM][4], bool has[2 * MAXM],
-             double sig[MAXM][4]) const;
+             double sig[MAXM][4], uint16_t ev = 0) const;
+    void rtol(uint16_t S, const double Wc[MAXM][4], const double phi[2 * MAXM][4], double t, double* amp) const;
     bool walk(const double* c, const double* y, Ev& e) const;
     void cvec(const double* y, double* c) const;
     bool evaluate(const double* y, Ev& e, bool wantH);
