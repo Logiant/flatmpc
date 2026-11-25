@@ -23,7 +23,6 @@ struct StateArc {
     int8_t chain, side;              // side +1: upper bound, -1: lower bound
     bool fix1, fix2;                 // t1 = 0 (x0 already at the bound) / t2 = T (rides to the end)
                                      // fix2 with t1 = T: terminal touch, D_top(T) = b only
-    bool jump;                       // jump entry (NOTES 14.9): v_j jumps at t1, Delta held, t1 from D_top(t1) = b
     double b, t1, t2;
 };
 
@@ -116,8 +115,6 @@ private:
     bool gres(const double* y, double* g, int* ng, double* vs, double* J = nullptr, const double* zs = nullptr,
               double* dgs = nullptr);
     bool tangent(const double* y, double* dth, double* dy);
-    bool held(int i) const { return i >= base_.n_ && sa_[i - base_.n_].jump; }
-    void hold() const;
     bool touch(const StateArc& s) const { return s.fix2 && s.t1 >= base_.p_->T; }
     double tgt(int j, int side) const { const int i = base_.off_[j] + base_.p_->orders[j] - 1; return side > 0 ? xhi_[i] : xlo_[i]; }
     double bnd(int j, int side) const {             // bound at the current s
@@ -130,10 +127,6 @@ private:
     void stalled(StateResult& r, double s);
     void drop(int q, double* y, unsigned* gone);
     bool junctions(double* y, int max_its, int* outer);
-    double release(int q, const double* y) const;
-    double ramp(const double* y, int j, double t) const;
-    bool jumpdelta(double* y, int max_its, int* outer);
-    bool tojump(const double* y);
     double scan(const double* c, const double* y, int j, int side, double tw, double* twout, double* ta, double* tb) const;
     double check(const double* y, int* wc, int* ws, double* ta, double* tb, double* tw, double* psign, double* ppmp) const;
     void fill(StateResult& r) const;
