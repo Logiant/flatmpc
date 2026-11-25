@@ -32,8 +32,8 @@ const double SGW[4] = {0.34785484513745385737, 0.65214515486254614263,
 const double EPS_ = 2.220446049250313e-16;
 const double TOL_X = 1e-9;           // state violation, relative to 1 + |b|
 const double TOL_SIGN = 1e-7;        // eta >= 0 on a boundary arc, relative
-const double RND_F = 30.0 * EPS_ / 1e-12;    // inner tolerance is 1e-12 scale: scale gets 30x the rounding of F / 1e-12
 const char CH[4] = {'x', 'y', 'z', 'p'};
+const double DEP = 1e-9;            // rows closer than this (relative) to the span of others count as dependent
 const int ZC = 2 * MAXSA;            // columns of Z_: one per free junction time
 
 void span_(const double* tau, int n, int a, double T, double* t0, double* t1) {
@@ -100,15 +100,16 @@ void StateSolver::cvec(const double* y, double* c) const {
     }
 }
 
-// w~ = Lc^-1 w on the piece containing tm: w_j = poly(c) + sum of Delta_q (chain j, tm < t1_q)
+// w~ = Lc^-1 w on the piece containing tm: w_j = poly(c) + sum of Delta_q (chain j, tm < t1_q).
+// zero: chains whose w is left out (pinned: v does not depend on their w, which can be huge)
 void StateSolver::wpoly(const double* c, const double* y, const StateArc* sa, int nsa, double tm,
-                        double Wc[MAXM][4]) const {
+                        double Wc[MAXM][4], uint16_t zero) const {
     const Solver& B = base_;
     double wp[MAXM][4];
     for (int l = 0; l < B.m_; ++l)
-        for (int p = 0; p < 4; ++p) wp[l][p] = (p < B.p_->orders[l]) ? c[B.off_[l] + p] : 0.0;
+        for (int p = 0; p < 4; ++p) wp[l][p] = (p < B.p_->orders[l] && !(zero >> l & 1u)) ? c[B.off_[l] + p] : 0.0;
     for (int q = 0; q < nsa; ++q)
-        if (!sa[q].fix1 && tm < sa[q].t1) wp[sa[q].chain][0] += y[B.n_ + q];
+        if (!sa[q].fix1 && tm < sa[q].t1 && !(zero >> sa[q].chain & 1u)) wp[sa[q].chain][0] += y[B.n_ + q];
     for (int j = 0; j < B.m_; ++j)
         for (int p = 0; p < 4; ++p) {
             double s = 0.0;
@@ -117,11 +118,110 @@ void StateSolver::wpoly(const double* c, const double* y, const StateArc* sa, in
         }
 }
 
+namespace {
+double dot(int m, const double* a, const double* b) { double s = 0.0; for (int i = 0; i < m; ++i) s += a[i] * b[i]; return s; }
+
+// v -= its components on the orthonormal rows Q[0..n) (Gram-Schmidt twice), c = those components
+void orth(int m, const double Q[MAXM][MAXM], int n, double* v, double* c) {
+    for (int i = 0; i < n; ++i) c[i] = 0.0;
+    for (int pass = 0; pass < 2; ++pass)
+        for (int i = 0; i < n; ++i) {
+            const double d = dot(m, Q[i], v);
+            c[i] += d;
+            for (int l = 0; l < m; ++l) v[l] -= d * Q[i][l];
+        }
+}
+
+// QR of the rows rp[0..n) (Gram-Schmidt twice): rp[j] = sum_{i<=j} Rt[j][i] Q[i]; false if they are dependent
+bool qr(int m, const double* const* rp, int n, double Q[MAXM][MAXM], double Rt[MAXM][MAXM]) {
+    for (int j = 0; j < n; ++j) {
+        for (int l = 0; l < m; ++l) Q[j][l] = rp[j][l];
+        orth(m, Q, j, Q[j], Rt[j]);
+        const double nz = sqrt(dot(m, Q[j], Q[j]));
+        if (!(nz > DEP * sqrt(dot(m, rp[j], rp[j])))) return false;
+        Rt[j][j] = nz;
+        for (int l = 0; l < m; ++l) Q[j][l] /= nz;
+    }
+    return true;
+}
+
+// r = R^-1 c (R = Rt^T upper triangular)
+void rsolve(int n, const double Rt[MAXM][MAXM], const double* c, double* r) {
+    for (int j = n - 1; j >= 0; --j) {
+        double s = c[j];
+        for (int k = j + 1; k < n; ++k) s -= Rt[k][j] * r[k];
+        r[j] = s / Rt[j][j];
+    }
+}
+
+// a_p = sum_j r_j a_W[j] + z with z orthogonal to the rows of W; false if those are dependent
+bool split(int m, const double (*a)[MAXM], const int* W, int n, const double* ap, double* z, double* r) {
+    double Q[MAXM][MAXM], Rt[MAXM][MAXM], c[MAXM];
+    const double* rp[MAXM] = {};
+    for (int j = 0; j < n; ++j) rp[j] = a[W[j]];
+    if (!qr(m, rp, n, Q, Rt)) return false;
+    for (int l = 0; l < m; ++l) z[l] = ap[l];
+    orth(m, Q, n, z, c);
+    rsolve(n, Rt, c, r);
+    return true;
+}
+
+// Projection of w onto {a_k x = 0 (k < ne), a_k x <= b_k (ne <= k < nc)}: the dual active-set method of
+// Goldfarb and Idnani with H = I (finite and exact; x stays the projection onto the working face).
+// Out: x, the working set W (n independent rows) with multipliers u: w - x = sum u_j a_W[j], u >= 0 on
+// inequalities. tol: the violation below which a row counts as satisfied. false: infeasible.
+bool proj(int m, const double (*a)[MAXM], const double* b, int ne, int nc, const double* tol, const double* w,
+          double* x, int* W, double* u, int* nw) {
+    double z[MAXM], r[MAXM];
+    int n = 0;
+    for (int i = 0; i < m; ++i) x[i] = w[i];
+    for (int k = 0; k < ne; ++k) {                   // equalities; a dependent one is implied by the others
+        if (!split(m, a, W, n, a[k], z, r)) return false;
+        const double z2 = dot(m, z, z);
+        if (!(z2 > DEP * DEP * dot(m, a[k], a[k]))) continue;
+        const double s = dot(m, a[k], x) / z2;
+        for (int i = 0; i < m; ++i) x[i] -= s * z[i];
+        for (int j = 0; j < n; ++j) u[j] -= s * r[j];
+        u[n] = s; W[n++] = k;
+    }
+    for (int guard = 0; guard < 8 * nc; ++guard) {   // termination guard only (the method is finite)
+        int p = -1;
+        double worst = 0.0;
+        for (int k = ne; k < nc; ++k) {
+            bool in = false;
+            for (int j = 0; j < n; ++j) in = in || W[j] == k;
+            const double v = dot(m, a[k], x) - b[k] - tol[k];
+            if (!in && v > worst) { worst = v; p = k; }
+        }
+        if (p < 0) { *nw = n; return true; }
+        double up = 0.0;
+        for (;;) {                                   // add p: a full step, or partial steps that drop rows
+            if (!split(m, a, W, n, a[p], z, r)) return false;
+            const double z2 = dot(m, z, z);
+            const double t1 = (z2 > DEP * DEP * dot(m, a[p], a[p])) ? (dot(m, a[p], x) - b[p]) / z2 : HUGE_VAL;
+            double t2 = HUGE_VAL;
+            int jd = -1;
+            for (int j = 0; j < n; ++j)
+                if (W[j] >= ne && r[j] > 0.0 && u[j] / r[j] < t2) { t2 = u[j] / r[j]; jd = j; }
+            if (t1 == HUGE_VAL && jd < 0) return false;
+            const double st = fmin(t1, t2);
+            if (t1 < HUGE_VAL) for (int i = 0; i < m; ++i) x[i] -= st * z[i];
+            for (int j = 0; j < n; ++j) u[j] -= st * r[j];
+            up += st;
+            if (t1 <= t2) { u[n] = up; W[n++] = p; break; }
+            for (int j = jd; j + 1 < n; ++j) { W[j] = W[j + 1]; u[j] = u[j + 1]; }
+            --n;
+        }
+    }
+    return false;
+}
+}  // namespace
+
 // Pointwise KKT on thrust set S (bits 0..7) with chains pinned (bits 8+j: v_j = 0):
 // v = Pv w + q, Vv = v's coefficients, phi/has the row functions of Solver::row_polys,
 // sig[j] the pin multiplier of chain j in w units (R v = w - sig_j e_j - ...). false: singular.
 bool StateSolver::kkt(uint16_t S, const double Wc[MAXM][4], double Pv[MAXM][MAXM], double Vv[MAXM][4],
-                      double phi[2 * MAXM][4], bool has[2 * MAXM], double sig[MAXM][4], double* amp) const {
+                      double phi[2 * MAXM][4], bool has[2 * MAXM], double sig[MAXM][4]) const {
     const Solver& B = base_;
     const int m = B.m_;
     double rw[MAXM][MAXM], rh[MAXM];
@@ -138,35 +238,36 @@ bool StateSolver::kkt(uint16_t S, const double Wc[MAXM][4], double Pv[MAXM][MAXM
             for (int i = 0; i < m; ++i) rw[na][i] = B.Lci_[i][j];
             rh[na] = 0.0; key[na++] = -1 - j;
         }
-    const int ld = MAXM + 4;
-    double G[MAXM * MAXM], X[MAXM * (MAXM + 4)];
-    for (int a = 0; a < na; ++a) {
-        for (int b = 0; b < na; ++b) {
-            double s = 0.0;
-            for (int i = 0; i < m; ++i) s += rw[a][i] * rw[b][i];
-            G[a * MAXM + b] = s;
-        }
-        for (int i = 0; i < m; ++i) X[a * ld + i] = rw[a][i];
-        for (int p = 0; p < 4; ++p) {
-            double s = (p == 0) ? -rh[a] : 0.0;
-            for (int i = 0; i < m; ++i) s += rw[a][i] * Wc[i][p];
-            X[a * ld + m + p] = s;
-        }
+    // v and its projector come from the QR of the active rows alone (no multipliers), so nearly dependent rows
+    // blur only the multipliers X = R^-1 c
+    double Q[MAXM][MAXM], Rt[MAXM][MAXM], e[MAXM], c[MAXM], X[4][MAXM], Pt[MAXM][MAXM], Vt[MAXM][4];
+    const double* rp[MAXM] = {};
+    for (int a = 0; a < na; ++a) rp[a] = rw[a];
+    if (!qr(m, rp, na, Q, Rt)) return false;
+    for (int a = 0; a < na; ++a) {                   // e = R^-T rh
+        double s = rh[a];
+        for (int i = 0; i < a; ++i) s -= Rt[a][i] * e[i];
+        e[a] = s / Rt[a][a];
     }
-    if (na > 0 && !lu_solve(G, na, MAXM, X, m + 4, ld)) return false;
-    double Pt[MAXM][MAXM], Vt[MAXM][4];
-    for (int i = 0; i < m; ++i) {
-        for (int j = 0; j < m; ++j) {
-            double s = (i == j) ? 1.0 : 0.0;
-            for (int a = 0; a < na; ++a) s -= rw[a][i] * X[a * ld + j];
-            Pt[i][j] = s;
+    for (int p = 0; p < 4; ++p) {                    // c = Q w - e, vt = w - Q^T c
+        for (int a = 0; a < na; ++a) {
+            double s = (p == 0) ? -e[a] : 0.0;
+            for (int i = 0; i < m; ++i) s += Q[a][i] * Wc[i][p];
+            c[a] = s;
         }
-        for (int p = 0; p < 4; ++p) {
+        for (int i = 0; i < m; ++i) {
             double s = Wc[i][p];
-            for (int a = 0; a < na; ++a) s -= rw[a][i] * X[a * ld + m + p];
+            for (int a = 0; a < na; ++a) s -= Q[a][i] * c[a];
             Vt[i][p] = s;
         }
+        rsolve(na, Rt, c, X[p]);
     }
+    for (int i = 0; i < m; ++i)
+        for (int j = 0; j < m; ++j) {
+            double s = (i == j) ? 1.0 : 0.0;
+            for (int a = 0; a < na; ++a) s -= Q[a][i] * Q[a][j];
+            Pt[i][j] = s;
+        }
     for (int i = 0; i < m; ++i) {                    // v = Lc^-T vt, Pv = Lci^T Pt Lci
         for (int p = 0; p < 4; ++p) {
             double s = 0.0;
@@ -192,57 +293,66 @@ bool StateSolver::kkt(uint16_t S, const double Wc[MAXM][4], double Pv[MAXM][MAXM
     }
     for (int a = 0; a < na; ++a)
         for (int p = 0; p < 4; ++p) {
-            if (key[a] >= 0) phi[key[a]][p] = -X[a * ld + m + p] * B.rownorm2_[key[a]];
-            else sig[-1 - key[a]][p] = X[a * ld + m + p];
+            if (key[a] >= 0) phi[key[a]][p] = -X[p][a] * B.rownorm2_[key[a]];
+            else sig[-1 - key[a]][p] = X[p][a];
         }
-    if (amp)                                         // |d mult / d v-space error|: large for nearly dependent rows
-        for (int a = 0; a < na; ++a)
-            if (key[a] >= 0) {
-                double s = 0.0;
-                for (int i = 0; i < m; ++i) s += X[a * ld + i] * X[a * ld + i];
-                amp[key[a]] = sqrt(s) * B.rownorm2_[key[a]];
-            }
     return true;
 }
 
-// Pv..sig: the caller's kkt buffers (clobbered), so they are not on the stack twice
-bool StateSolver::lex(const double Wc[MAXM][4], uint16_t pin, double t, double T, uint16_t guess, uint16_t* out,
-                      double Pv[MAXM][MAXM], double Vv[MAXM][4], double phi[2 * MAXM][4], bool has[2 * MAXM],
-                      double sig[MAXM][4], uint16_t ev) const {
-    const Solver& B = base_;
-    double b[4];
-    for (int i = -1; i < B.nsets_; ++i) {
-        const uint16_t cand = (i < 0) ? guess : B.sets_[i];
-        if (i < 0 && !B.valid_set(cand)) continue;
-        const uint16_t S = (uint16_t)(cand | (pin << 8));
-        double amp[2 * MAXM];
-        if (!kkt(S, Wc, Pv, Vv, phi, has, sig, amp)) continue;
-        rtol(S, Wc, phi, t, amp);
-        bool ok = true;
-        for (int key = 0; key < 2 * B.m_ && ok; ++key) {
-            if (!has[key]) continue;
-            shift(phi[key], 4, t, b);
-            const double tol = 1e-12 * (pscale(b, 4, T) + B.R_) + amp[key];
-            // ev: rows at an event of the walk, zero at t by construction: their sign is that of the derivatives,
-            // unless the value exceeds what the root's time error (1e-9 T) explains
-            const int q0 = ((ev >> key) & 1u) && fabs(b[0]) <= 1e-9 * T * fabs(b[1]);
-            for (int q = q0; q < 4; ++q)
-                if (fabs(b[q]) * ipow(T, q) > tol) { if (b[q] > 0) ok = false; break; }
-        }
-        if (ok) { *out = S; return true; }
-    }
-    return false;
-}
 
-// Rounding of the row functions at t (amp in: kkt's amplification per active row; out: absolute tolerance per row).
-// kkt cancels terms of size cs (|Lc^-1 w| plus the active rows times their multipliers); nearly dependent active
-// rows amplify that into their multipliers (B: the motor pairs nearly span the z direction).
-void StateSolver::rtol(uint16_t S, const double Wc[MAXM][4], const double phi[2 * MAXM][4], double t, double* amp) const {
+// Thrust set of the walk just after t: the projection of w~(t + s) onto the thrust box (in vt = Lc^T v) for small
+// s > 0, solved order by order in s (lexicographic). Order q projects the s^q coefficient of w~ onto the critical
+// cone of order q-1: rows with a positive multiplier stay at their bound (equalities), rows touching with zero
+// multiplier stay inequalities (bound 0), the others leave. The primal solution is unique even where nearly
+// dependent rows leave the multipliers ill-determined (B with a pinned chain), so every test is made in v: a row
+// touches if its residual is below the walk's tolerance, and its multiplier counts as positive if dropping the
+// row would move v by more than that (multiplier x distance of the row from the span of the others).
+// ev: rows of a walk event, zero at t by construction: judged from order 1 on.
+bool StateSolver::pset(const double Wc[MAXM][4], uint16_t pin, double t, double L, uint16_t ev, uint16_t* out) const {
     const Solver& B = base_;
-    double cs = 0.0;
-    for (int i = 0; i < B.m_; ++i) cs += fabs(peval(Wc[i], t));
-    for (int k = 0; k < 2 * B.m_; ++k) if (S & (1u << k)) cs += fabs(peval(phi[k], t)) / sqrt(B.rownorm2_[k]);
-    for (int k = 0; k < 2 * B.m_; ++k) amp[k] = 100.0 * EPS_ * cs * ((S & (1u << k)) ? amp[k] : sqrt(B.rownorm2_[k]));
+    const int m = B.m_;
+    double wq[4][MAXM], sh[4], sc = 0.0;
+    for (int i = 0; i < m; ++i) { shift(Wc[i], 4, t, sh); for (int q = 0; q < 4; ++q) wq[q][i] = sh[q]; }
+    for (int q = 0; q < 4; ++q) sc += sqrt(dot(m, wq[q], wq[q])) * ipow(L, q);
+    uint16_t eq = 0, in = 0, last = 0;
+    for (int k = 0; k < 2 * m; ++k) if (B.finite_[k]) in |= (uint16_t)(1u << k);
+    for (int q = 0; q < 4 && in; ++q) {
+        double a[3 * MAXM][MAXM], b[3 * MAXM], tol[3 * MAXM], x[MAXM], u[MAXM], z[MAXM], r[MAXM];
+        int key[3 * MAXM], W[MAXM], nc = 0, nw;
+        for (int j = 0; j < m; ++j)
+            if (pin >> j & 1u) { for (int i = 0; i < m; ++i) a[nc][i] = B.Lci_[i][j]; b[nc] = 0.0; key[nc++] = -1; }
+        int ne = 0;
+        for (int pass = 0; pass < 2; ++pass) {        // equalities first
+            if (pass) ne = nc;
+            for (int k = 0; k < 2 * m; ++k)
+                if (((pass ? in : eq) >> k) & 1u) {
+                    for (int i = 0; i < m; ++i) a[nc][i] = B.rows_[k][i];
+                    b[nc] = q ? 0.0 : B.rhs_[k];
+                    tol[nc] = 1e-12 * (sqrt(B.rownorm2_[k]) * sc + B.R_) / ipow(L, q);   // the walk's tolerance
+                    key[nc++] = k;
+                }
+        }
+        if (!proj(m, a, b, ne, nc, tol, wq[q], x, W, u, &nw)) return false;
+        uint16_t nin = 0;
+        last = 0;
+        for (int c = ne; c < nc; ++c) {
+            const int k = key[c];
+            const bool evq = q == 0 && ((ev >> k) & 1u);
+            int jw = -1;
+            for (int j = 0; j < nw; ++j) if (W[j] == c) jw = j;
+            if (jw >= 0 && !evq) {                   // the multiplier's effect in v (in row units, as tol)
+                int Wo[MAXM], no = 0;
+                for (int j = 0; j < nw; ++j) if (j != jw) Wo[no++] = W[j];
+                if (!split(m, a, Wo, no, a[c], z, r)) return false;
+                if (u[jw] * sqrt(dot(m, z, z) * B.rownorm2_[k]) > tol[c]) { eq |= (uint16_t)(1u << k); continue; }
+            }
+            if (jw >= 0) last |= (uint16_t)(1u << k);
+            if (jw >= 0 || evq || fabs(dot(m, a[c], x) - b[c]) <= tol[c]) nin |= (uint16_t)(1u << k);
+        }
+        in = nin;
+    }
+    *out = (uint16_t)(eq | (in ? last : 0) | (pin << 8));
+    return true;
 }
 
 // Event walk (Solver::walk) on each piece between boundary-arc junctions
@@ -270,8 +380,8 @@ bool StateSolver::walk(const double* c, const double* y, Ev& e) const {
         uint16_t pin = 0;
         for (int q = 0; q < nsa_; ++q)
             if (sa_[q].t1 <= tm && tm < sa_[q].t2) pin |= (uint16_t)(1u << sa_[q].chain);
-        wpoly(c, y, sa_, nsa_, tm, Wc);
-        if (!lex(Wc, pin, ta, tb - ta, (uint16_t)(S & 0xFF), &S, Pv, Vv, phi, has, sig)) return false;
+        wpoly(c, y, sa_, nsa_, tm, Wc, pin);
+        if (!pset(Wc, pin, ta, tb - ta, 0, &S)) return false;
         if (ns >= MAXARC_E) return false;
         if (ns) e.tau[ns - 1] = ta;
         e.S[ns++] = S;
@@ -280,22 +390,21 @@ bool StateSolver::walk(const double* c, const double* y, Ev& e) const {
         uint16_t zev = 0;                                // rows of the last event: zero at t by construction
         for (;;) {
             const double L = tb - t;
-            double amp[2 * MAXM];
-            if (!kkt(S, Wc, Pv, Vv, phi, has, sig, amp)) return false;
-            rtol(S, Wc, phi, t, amp);
+            if (!kkt(S, Wc, Pv, Vv, phi, has, sig)) return false;
             double rootk[2 * MAXM], s1 = HUGE_VAL;
             bool simplek[2 * MAXM], evk[2 * MAXM];
+            uint16_t imm = 0;                            // rows already beyond tolerance at t: not zero there
             for (int key = 0; key < 2 * B.m_; ++key) {
                 evk[key] = false;
                 if (!has[key]) continue;
                 double b[4], red[4];
                 int kk;
                 shift(phi[key], 4, t, b);
-                if ((zev >> key) & 1u) b[0] = 0.0;      // else a new multiplier's root error, amplified by nearly dependent rows, stalls
-                const double tol = 1e-12 * (pscale(b, 4, T) + B.R_) + amp[key];   // as the tier-1 walk (energy-float 71b3166) + rounding
+                if ((zev >> key) & 1u) b[0] = 0.0;      // else a new multiplier's root error (amplified by nearly dependent rows) stalls
+                const double tol = 1e-12 * (pscale(b, 4, T) + B.R_);   // as the tier-1 walk (energy-float 71b3166)
                 const int rl = strip(b, 4, L, tol, red, &kk);
                 if (rl == 0) continue;
-                if (red[0] > 0) { evk[key] = true; rootk[key] = 0.0; simplek[key] = false; s1 = 0.0; continue; }
+                if (red[0] > 0) { evk[key] = true; rootk[key] = 0.0; simplek[key] = false; s1 = 0.0; if (!kk) imm |= (uint16_t)(1u << key); continue; }
                 Cross cr;
                 crossings(red, rl, kk, L, tol, cr);
                 if (cr.n) {
@@ -312,15 +421,14 @@ bool StateSolver::walk(const double* c, const double* y, Ev& e) const {
                     ++ngroup; gkey = key; gsimple = simplek[key]; gmask |= (uint16_t)(1u << key);
                 }
             t += s1;
-            zev = gmask;
+            zev = (uint16_t)(gmask & ~imm);
             uint16_t Snew = 0xFFFFu;
             if (ngroup == 1 && gsimple) {
                 const uint16_t cand = (uint16_t)(S ^ (1u << gkey));
                 if (B.valid_set(cand) && kkt(cand, Wc, Pv, Vv, phi, has, sig)) Snew = cand;
             }
             if (Snew == 0xFFFFu) {
-                const uint16_t guess = (uint16_t)((S ^ gmask) & 0xFF);
-                if (!lex(Wc, pin, t, tb - t, B.valid_set(guess) ? guess : 0xFFFFu, &Snew, Pv, Vv, phi, has, sig, gmask)) return false;
+                if (!pset(Wc, pin, t, tb - t, zev, &Snew)) return false;
             }
             if (Snew != S) {
                 if (ns >= MAXARC_E) return false;
@@ -342,7 +450,7 @@ void StateSolver::vpoly(const uint16_t* S, const double* tau, int n, int a, cons
     double t0, t1, Wc[MAXM][4], Pv[MAXM][MAXM], phi[2 * MAXM][4], sig[MAXM][4];
     bool has[2 * MAXM];
     span_(tau, n, a, base_.p_->T, &t0, &t1);
-    wpoly(c, y, sa, nsa, 0.5 * (t0 + t1), Wc);
+    wpoly(c, y, sa, nsa, 0.5 * (t0 + t1), Wc, S[a] >> 8);
     if (!kkt(S[a], Wc, Pv, V, phi, has, sig))
         for (int j = 0; j < MAXM; ++j) for (int p = 0; p < 4; ++p) V[j][p] = 0.0;
 }
@@ -374,7 +482,7 @@ __attribute__((noinline)) bool StateSolver::integrate(const double* c, const dou
         span_(e.tau, e.narcs, a, T, &t0, &t1);
         if (!(t1 > t0)) continue;
         const double tm = 0.5 * (t0 + t1);
-        wpoly(c, y, sa_, nsa_, tm, Wc);
+        wpoly(c, y, sa_, nsa_, tm, Wc, e.S[a] >> 8);
         if (!kkt(e.S[a], Wc, Pv, Vv, phi, has, sig)) return false;
         const double hw = 0.5 * (t1 - t0);
         for (int g = 0; g < 4; ++g) {
@@ -391,20 +499,10 @@ __attribute__((noinline)) bool StateSolver::integrate(const double* c, const dou
                 for (int r = 0; r < p.orders[l]; ++r)
                     ci[B.off_[l] + r] = ipow(T - t, p.orders[l] - 1 - r) / fact(p.orders[l] - 1 - r);
             for (int q = 0; q < nsa_; ++q) ci[n + q] = (!sa_[q].fix1 && tm < sa_[q].t1) ? 1.0 : 0.0;
-            // v = Lc^-T (Lc^-1 w - active rows x multipliers): the size of the terms that cancel, for the rounding of F
-            double rw[MAXM], rv[MAXM];
-            for (int i = 0; i < B.m_; ++i) {
-                rw[i] = fabs(peval(Wc[i], t));
-                for (int k = 0; k < 2 * B.m_; ++k)
-                    if (e.S[a] & (1u << k)) rw[i] += fabs(B.rows_[k][i] * peval(phi[k], t)) / B.rownorm2_[k];
-                for (int l = 0; l < B.m_; ++l)
-                    if (e.S[a] & (1u << (8 + l))) rw[i] += fabs(B.Lci_[i][l] * peval(sig[l], t));
-            }
-            for (int j = 0; j < B.m_; ++j) { rv[j] = 0.0; for (int i = j; i < B.m_; ++i) rv[j] += fabs(B.Lci_[i][j]) * rw[i]; }
             for (int i = 0; i < ny; ++i) {
                 const double f = wg * ci[i] * v[li[i]];
                 e.F[i] += f;
-                ab[i] += fabs(f) + RND_F * wg * fabs(ci[i]) * rv[li[i]];   // tolerance >= 30x the rounding of F
+                ab[i] += fabs(f);
             }
             if (wantH)
                 for (int i = 0; i < ny; ++i) {
@@ -539,7 +637,7 @@ bool StateSolver::gres(const double* y, double* g, int* ng, double* vs, double* 
     cvec(y, c);
     auto arc = [&](int a) {                              // Vv, Pv of arc a (as vpoly)
         span_(e.tau, e.narcs, a, T, &t0, &t1);
-        wpoly(c, y, sa_, nsa_, 0.5 * (t0 + t1), Wc);
+        wpoly(c, y, sa_, nsa_, 0.5 * (t0 + t1), Wc, e.S[a] >> 8);
         return kkt(e.S[a], Wc, Pv, Vv, phi, has, sig);
     };
     int k = 0;
@@ -809,21 +907,20 @@ double StateSolver::check(const double* y, int* wc, int* ws, double* ta, double*
         span_(e.tau, e.narcs, a, T, &t0, &t1);
         const double L = t1 - t0, tm = 0.5 * (t0 + t1);
         if (!(L > 0)) continue;
-        wpoly(c, y, sa_, nsa_, tm, Wc);
-        double am[2 * MAXM], a1[2 * MAXM];
-        if (!kkt(e.S[a], Wc, Pv, Vv, phi, has, sig, am)) { pp = HUGE_VAL; continue; }
-        for (int k = 0; k < 2 * B.m_; ++k) a1[k] = am[k];
-        rtol(e.S[a], Wc, phi, t0, am);                   // rounding of the row functions (as the walk)
-        rtol(e.S[a], Wc, phi, t1, a1);
+        wpoly(c, y, sa_, nsa_, tm, Wc, e.S[a] >> 8);   // thrust rows: without the pinned w (exact, less rounding)
+        if (!kkt(e.S[a], Wc, Pv, Vv, phi, has, sig)) { pp = HUGE_VAL; continue; }
         for (int key = 0; key < 2 * B.m_; ++key) {
             if (!has[key]) continue;
             shift(phi[key], 4, t0, bb);
-            bb[0] -= fmax(am[key], a1[key]);
             if (a && ((e.S[a] ^ e.S[a - 1]) >> key & 1u)) bb[0] = fmin(bb[0], 0.0);   // row of the event at t0: zero there
             pp = fmax(pp, fmax(bb[0], pval(bb, 4, L)));
             for (int i = 1; i < 4; ++i) d[i - 1] = i * bb[i];
             const int nc = roots_le2(d, 3, cr);
             for (int i = 0; i < nc; ++i) if (cr[i] > 0.0 && cr[i] < L) pp = fmax(pp, pval(bb, 4, cr[i]));
+        }
+        if (e.S[a] >> 8) {                               // pin multipliers need the whole w
+            wpoly(c, y, sa_, nsa_, tm, Wc);
+            kkt(e.S[a], Wc, Pv, Vv, phi, has, sig);
         }
         for (int q = 0; q < nsa_; ++q) {
             const int j = sa_[q].chain;
