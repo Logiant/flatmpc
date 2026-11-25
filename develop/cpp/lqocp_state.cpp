@@ -35,6 +35,8 @@ const double TOL_SIGN = 1e-7;        // eta >= 0 on a boundary arc, relative
 const double RND_F = 30.0 * EPS_ / 1e-12;    // inner tolerance is 1e-12 scale: scale gets 30x the rounding of F / 1e-12
 const char CH[4] = {'x', 'y', 'z', 'p'};
 const int ZC = 2 * MAXSA;            // columns of Z_: one per free junction time
+const double JUMP_L = 1e-4;          // jump entry when the predicted ramp is shorter than JUMP_L T (NOTES 14.9)
+const int MAXJUMP = 2;               // jump entries at once (gres stack); shortcut: raise if a case needs more
 
 void span_(const double* tau, int n, int a, double T, double* t0, double* t1) {
     *t0 = a ? tau[a - 1] : 0.0;
@@ -470,18 +472,29 @@ __attribute__((noinline)) bool StateSolver::integrate(const double* c, const dou
 }
 
 // Newton on the concave dual for fixed junction times (NOTES.md 7.2 / 13.1, plus the arcs' Delta)
+// Jump entries hold their Delta: identity row and column in H_ (F is masked by the caller)
+void StateSolver::hold() const {
+    const int n = base_.n_, ny = n + nsa_;
+    for (int i = n; i < ny; ++i)
+        if (held(i)) {
+            for (int k = 0; k < ny; ++k) H_[i * NY + k] = H_[k * NY + i] = 0.0;
+            H_[i * NY + i] = 1.0;
+        }
+}
+
 bool StateSolver::inner(double* y, int max_its) {
     const int ny = base_.n_ + nsa_;
     int cur = 0;
     if (!evaluate(y, ev_[cur], true)) { strcpy(why_, "event walk failed"); return false; }
     for (int it = 0;; ++it) {
         const Ev& E = ev_[cur];
-        double Fn = 0.0;
-        for (int i = 0; i < ny; ++i) Fn = fmax(Fn, fabs(E.F[i]));
+        double Fn = 0.0, f[NY];                          // f: F without the rows of held Delta (jump entries)
+        for (int i = 0; i < ny; ++i) { f[i] = held(i) ? 0.0 : E.F[i]; Fn = fmax(Fn, fabs(f[i])); }
         if (Fn <= 1e-12 * E.scale) { if (cur) ev_[0] = ev_[1]; return true; }
         if (it >= max_its || its_ >= cap_) { if (cur) ev_[0] = ev_[1]; strcpy(why_, "iteration cap"); return false; }
         ++its_;
         double d[NY], yn[NY], hmax = 0.0;
+        hold();
         for (int i = 0; i < NY * NY; ++i) hmax = fmax(hmax, fabs(H_[i]));
         bool solved = false;
         double rho = 0.0;
@@ -489,13 +502,13 @@ bool StateSolver::inner(double* y, int max_its) {
         for (int i = 0, q = 0; i < ny; ++i) for (int k = i; k < ny; ++k) Hs[q++] = H_[i * NY + k];
         for (int att = 0; att < 20 && !solved; ++att) {
             if (att) for (int i = 0, q = 0; i < ny; ++i) for (int k = i; k < ny; ++k, ++q) H_[i * NY + k] = H_[k * NY + i] = Hs[q];
-            for (int i = 0; i < ny; ++i) { H_[i * NY + i] += rho; d[i] = -E.F[i]; }
+            for (int i = 0; i < ny; ++i) { H_[i * NY + i] += rho; d[i] = -f[i]; }
             solved = lu_solve(H_, ny, NY, d, 1, 1);
             rho = (rho == 0.0) ? 1e-12 * hmax : 10.0 * rho;
         }
         if (!solved) { strcpy(why_, "singular Newton matrix"); return false; }
         double slope = 0.0, F2 = 0.0;
-        for (int i = 0; i < ny; ++i) { slope -= E.F[i] * d[i]; F2 += E.F[i] * E.F[i]; }
+        for (int i = 0; i < ny; ++i) { slope -= f[i] * d[i]; F2 += f[i] * f[i]; }
         const int nxt = 1 - cur;
         bool acc = false;
         for (double al = 1.0; al >= 1e-3; al *= 0.5) {
@@ -504,7 +517,7 @@ bool StateSolver::inner(double* y, int max_its) {
             const Ev& N = ev_[nxt];
             if (N.D >= E.D + 1e-4 * al * slope) { acc = true; break; }
             double nF2 = 0.0;
-            for (int i = 0; i < ny; ++i) nF2 += N.F[i] * N.F[i];
+            for (int i = 0; i < ny; ++i) if (!held(i)) nF2 += N.F[i] * N.F[i];
             if (al * slope <= 1e3 * EPS_ * (1.0 + fabs(E.D)) && nF2 < F2) { acc = true; break; }
         }
         if (!acc) { strcpy(why_, "line search failed"); if (cur) ev_[0] = ev_[1]; return false; }
@@ -537,10 +550,10 @@ bool StateSolver::gres(const double* y, double* g, int* ng, double* vs, double* 
     double c[MAXN], t0, t1, Wc[MAXM][4], Pv[MAXM][MAXM], Vv[MAXM][4], phi[2 * MAXM][4], sig[MAXM][4];
     bool has[2 * MAXM];
     cvec(y, c);
-    auto arc = [&](int a) {                              // Vv, Pv of arc a (as vpoly)
+    auto arc = [&](int a, uint16_t drop = 0) {           // Vv, Pv of arc a (as vpoly), set without the bits drop
         span_(e.tau, e.narcs, a, T, &t0, &t1);
         wpoly(c, y, sa_, nsa_, 0.5 * (t0 + t1), Wc);
-        return kkt(e.S[a], Wc, Pv, Vv, phi, has, sig);
+        return kkt((uint16_t)(e.S[a] & ~drop), Wc, Pv, Vv, phi, has, sig);
     };
     int k = 0;
     *vs = 1.0;
@@ -550,7 +563,8 @@ bool StateSolver::gres(const double* y, double* g, int* ng, double* vs, double* 
     }
     double* const Fth = Z_;                      // becomes Z = H^-1 F_th (dy/dth = -Z)
     double pg[2 * MAXSA][MAXM], tjk[2 * MAXSA], tmk[2 * MAXSA], gtk[2 * MAXSA];   // g_y row k, compact
-    int li[NY];
+    double gy2[MAXJUMP][NY], gth[MAXJUMP][2 * MAXSA];    // jump rows: dG/dy (row n+q of H), dG/dth (row n+q of F_th)
+    int li[NY], jq[2 * MAXSA], nj = 0;
     for (int l = 0; l < B.m_; ++l)
         for (int r = 0; r < p.orders[l]; ++r) li[B.off_[l] + r] = l;
     for (int q = 0; q < nsa_; ++q) li[n + q] = sa_[q].chain;
@@ -568,8 +582,17 @@ bool StateSolver::gres(const double* y, double* g, int* ng, double* vs, double* 
             if (ab < 0 || bd > 1e-12 * T) return false;
             // control continuity: v_j(t1-) = 0, v_j(t2+) = 0 (v_j = 0 on the arc). This is dJ/dtj = 0
             // when the thrust rows active at the junction do not change (NOTES.md 14.2).
+            // jump entry: G = D_top(t1) - b, the Delta row of the inner residual (held there, NOTES 14.9)
+            // jump exit: v_j(t2) on the arc's own set without the pin (smooth in t2; the walk's set right of t2
+            // switches from a steep ramp to a flat bang within the ramp length)
+            jq[k] = (side == 0 && sa_[q].jump) ? q : -1;
+            // G in units of the junction test (|g| <= 1e-10 vs): converged G is 0.1 TOL_X, the state check's
+            const double kg = 1e-9 * *vs / (TOL_X * (1.0 + fabs(sa_[q].b)));
+            const bool vx = side == 1 && sa_[q].jump;
+            const uint16_t pin = (uint16_t)(1u << (8 + j));
             if (!J) {
-                g[k++] = arc(side == 0 ? ab : ab + 1) ? peval(Vv[j], tj) : 0.0;
+                g[k] = jq[k] >= 0 ? kg * e.F[n + q] : (vx ? arc(ab, pin) : arc(side == 0 ? ab : ab + 1)) ? peval(Vv[j], tj) : 0.0;
+                ++k;
                 continue;
             }
             double vv[2][MAXM], tm[2];
@@ -577,20 +600,37 @@ bool StateSolver::gres(const double* y, double* g, int* ng, double* vs, double* 
                 if (!arc(ab + s)) return false;
                 tm[s] = 0.5 * (t0 + t1);
                 for (int l = 0; l < B.m_; ++l) vv[s][l] = peval(Vv[l], tj);
-                if (s == side) {
+                if (s == side && !vx) {
                     for (int l = 0; l < B.m_; ++l) pg[k][l] = Pv[j][l];
                     gtk[k] = (3 * Vv[j][3] * tj + 2 * Vv[j][2]) * tj + Vv[j][1];
                 }
             }
-            g[k] = vv[side][j];
+            double gv = vv[side][j];
+            if (vx) {
+                if (!arc(ab, pin)) return false;
+                for (int l = 0; l < B.m_; ++l) pg[k][l] = Pv[j][l];
+                gtk[k] = (3 * Vv[j][3] * tj + 2 * Vv[j][2]) * tj + Vv[j][1];
+                gv = peval(Vv[j], tj);
+            }
+            g[k] = jq[k] >= 0 ? kg * e.F[n + q] : gv;
+            if (jq[k] >= 0) gtk[k] = kg;                 // gtk is unused on a jump row: its scale
             tjk[k] = tj;
-            tmk[k] = tm[side];
+            tmk[k] = vx ? tm[0] : tm[side];
             for (int i = 0; i < ny; ++i)                 // F_th (column k), raw nu coordinates
                 Fth[i * ZC + k] = wbasis(i, tj, tm[0]) * vv[0][li[i]] - wbasis(i, tj, tm[1]) * vv[1][li[i]];
             ++k;
         }
     }
     if (J && k) {
+        for (int a = 0; a < k; ++a) {                    // jump rows: save, then the Delta they hold drops out
+            if (jq[a] < 0) continue;
+            if (nj == MAXJUMP) return false;
+            const int i0 = n + jq[a];
+            for (int i = 0; i < ny; ++i) gy2[nj][i] = H_[i0 * NY + i];
+            for (int b = 0; b < k; ++b) { gth[nj][b] = Fth[i0 * ZC + b]; Fth[i0 * ZC + b] = 0.0; }
+            jq[a] = nj++;
+        }
+        hold();
         if (B.qf_)                                       // y = mu: F_i = mu_i + (Cf F_raw)_i, nu = Cf^T mu
             for (int i = 0; i < n; ++i)                  // row i only reads rows >= i: in place, ascending
                 for (int a = 0; a < k; ++a) {
@@ -600,6 +640,15 @@ bool StateSolver::gres(const double* y, double* g, int* ng, double* vs, double* 
                 }
         if (!lu_solve(H_, ny, NY, Fth, k, ZC)) return false;   // H_ is rebuilt by the next evaluate
         for (int a = 0; a < k; ++a) {
+            if (jq[a] >= 0) {                            // dG/dth = G_th - G_y Z
+                for (int b = 0; b < k; ++b) {
+                    double s = gth[jq[a]][b];
+                    for (int i = 0; i < ny; ++i) s -= gy2[jq[a]][i] * Fth[i * ZC + b];
+                    J[a * k + b] = gtk[a] * s;
+                }
+                if (dgs) dgs[a] = 0.0;
+                continue;
+            }
             double gy[NY];                               // dv_j/dy at the junction: Pv[j][l] times the w basis
             for (int i = 0; i < ny; ++i) gy[i] = pg[a][li[i]] * wbasis(i, tjk[a], tmk[a]);
             if (B.qf_)
@@ -648,6 +697,7 @@ static bool lsq(const double* J, const double* g, int ng, int nu, double* N, dou
 // (F(y, th, s) = 0) and the junction conditions (g(y, th) = 0): J dth = -dg/ds|th, dy = -H^-1 (F_s + F_th dth).
 bool StateSolver::tangent(const double* y, double* dth, double* dy) {
     const int n = base_.n_, ny = n + nsa_;
+    for (int q = 0; q < nsa_; ++q) if (sa_[q].jump) return false;   // no predictor through a held Delta
     double g[2 * MAXSA], dgs[2 * MAXSA], vs;
     int ng;
     // dy (first) = zs = H^-1 F_s; F_s: only the rows D_top(t1) - b(s) depend on s. gres factors H_ in place,
@@ -732,6 +782,97 @@ bool StateSolver::junctions(double* y, int max_its, int* outer) {
     }
     strcpy(why_, "junction Newton iteration cap");
     return false;
+}
+
+// Jump entry of arc q (plan in ev_[0]): the row function at t1- of the active thrust row closest to release
+// (0: the bang row releases exactly at t1; < 0: still saturated). HUGE_VAL: no active thrust row left of t1.
+double StateSolver::release(int q, const double* y) const {
+    const Ev& e = ev_[0];
+    const double T = base_.p_->T, t1 = sa_[q].t1;
+    int ab = -1;
+    for (int a = 0; a + 1 < e.narcs; ++a) if (fabs(e.tau[a] - t1) <= 1e-12 * T) ab = a;
+    if (ab < 0 || !(e.S[ab] & 0xFF)) return HUGE_VAL;
+    double c[MAXN], t0, ta, Wc[MAXM][4], Pv[MAXM][MAXM], Vv[MAXM][4], phi[2 * MAXM][4], sig[MAXM][4];
+    bool has[2 * MAXM];
+    cvec(y, c);
+    span_(e.tau, e.narcs, ab, T, &t0, &ta);
+    wpoly(c, y, sa_, nsa_, 0.5 * (t0 + ta), Wc);
+    if (!kkt(e.S[ab], Wc, Pv, Vv, phi, has, sig)) return HUGE_VAL;
+    double m = -HUGE_VAL;
+    for (int k = 0; k < 2 * base_.m_; ++k) if (e.S[ab] & (1u << k)) m = fmax(m, peval(phi[k], t1) / base_.rownorm2_[k]);
+    return m;
+}
+
+// Predicted ramp length at an entry at t on chain j of the plan in ev_[0]: the time the control without its thrust
+// rows (the ramp's set) needs to bring v_j(t) to 0, |v_j| / |d v_j^free / dt|. NOTES 14.9.
+double StateSolver::ramp(const double* y, int j, double t) const {
+    const Ev& e = ev_[0];
+    const double T = base_.p_->T;
+    int a = 0;
+    while (a + 1 < e.narcs && t >= e.tau[a]) ++a;
+    double c[MAXN], t0, t1, Wc[MAXM][4], Pv[MAXM][MAXM], Vv[MAXM][4], phi[2 * MAXM][4], sig[MAXM][4], V[MAXM][4];
+    bool has[2 * MAXM];
+    cvec(y, c);
+    span_(e.tau, e.narcs, a, T, &t0, &t1);
+    wpoly(c, y, sa_, nsa_, 0.5 * (t0 + t1), Wc);
+    if (!kkt(e.S[a], Wc, Pv, V, phi, has, sig) || !kkt((uint16_t)(e.S[a] & 0xFF00u), Wc, Pv, Vv, phi, has, sig)) return HUGE_VAL;
+    const double sl = (3 * Vv[j][3] * t + 2 * Vv[j][2]) * t + Vv[j][1];
+    return fabs(peval(V[j], t)) / fabs(sl);
+}
+
+// Junction Newton failed: entries whose ramp (the arc left of t1, plan in ev_[0]) is shorter than JUMP_L T become
+// jump entries (ill-conditioned: v_j(t1-) moves |jump| / ramp per unit t1). false: none.
+bool StateSolver::tojump(const double* y) {
+    const Ev& e = ev_[0];
+    const double T = base_.p_->T;
+    int nj = 0;
+    bool any = false;
+    for (int q = 0; q < nsa_; ++q) nj += sa_[q].jump;
+    for (int q = 0; q < nsa_ && nj < MAXJUMP; ++q) {
+        StateArc& s = sa_[q];
+        if (s.jump || s.fix1 || touch(s)) continue;
+        int ab = -1;
+        for (int a = 0; a + 1 < e.narcs; ++a) if (fabs(e.tau[a] - s.t1) <= 1e-12 * T) ab = a;
+        if (ab < 0) continue;
+        const double tr = ab ? e.tau[ab - 1] : 0.0;
+        if (ramp(y, s.chain, tr) < JUMP_L * T) { s.jump = true; ++nj; any = true; }
+    }
+    return any;
+}
+
+// Jump entries: Delta from the thrust-row condition release(q) = 0 (the bang row releases exactly at t1), by a
+// scalar secant outside the junction Newton. Each trial re-solves the inner dual and the junction times; a trial
+// whose plan loses the bang row before t1 (release = HUGE_VAL) or fails is halved back. NOTES 14.9.
+bool StateSolver::jumpdelta(double* y, int max_its, int* outer) {
+    const int n = base_.n_;
+    StateArc sa0[MAXSA];
+    double y0[NY];
+    for (int q = 0; q < nsa_; ++q) {
+        if (!sa_[q].jump) continue;
+        double d0 = y[n + q], m0 = release(q, y), h = -sa_[q].side * 1e-3 * (1.0 + fabs(d0));
+        if (m0 == HUGE_VAL) { strcpy(why_, "jump entry: no saturated thrust row before t1"); return false; }
+        for (int it = 0; it < 40; ++it) {
+            if (fabs(h) <= 1e-12 * (1.0 + fabs(d0))) break;   // Delta resolved to rounding
+            const int ny = n + nsa_;
+            for (int i = 0; i < ny; ++i) y0[i] = y[i];
+            for (int o = 0; o < nsa_; ++o) sa0[o] = sa_[o];
+            y[n + q] = d0 + h;
+            collapsed_ = -1;
+            const double m1 = (inner(y, max_its) && junctions(y, max_its, outer)) ? release(q, y) : HUGE_VAL;
+            if (m1 == HUGE_VAL || nsa_ != ny - n) {
+                for (int o = 0; o < nsa_; ++o) sa_[o] = sa0[o];
+                for (int i = 0; i < ny; ++i) y[i] = y0[i];
+                h *= 0.5;
+                continue;
+            }
+            const double s = (m1 - m0) / h;
+            d0 += h;
+            m0 = m1;
+            h = (s != 0.0) ? -m0 / s : 0.0;
+        }
+        if (!inner(y, max_its) || !junctions(y, max_its, outer)) return false;   // ev_[0], H_ of the accepted Delta
+    }
+    return true;
 }
 
 // Worst violation s*(D_top_j - b) on the non-pinned arcs of ev_[0] (exact: endpoints and the roots
@@ -974,7 +1115,9 @@ bool StateSolver::run(StateResult& r) {
     for (int pass = 0; !why && pass < 3 * MAXSA + 3; ++pass) {
         if (nsa_) {
             collapsed_ = -1;
-            if (!junctions(y, cap, &r.outer)) {
+            bool ok = junctions(y, cap, &r.outer);
+            if (!ok && collapsed_ < 0 && tojump(y)) ok = inner(y, cap) && junctions(y, cap, &r.outer);
+            if (!ok || !jumpdelta(y, cap, &r.outer)) {
                 if (collapsed_ >= 0) {                       // collapsed arc: q = 1 touch = drop it
                     sequence(ev_[0].S, ev_[0].narcs, sa_, nsa_, ev_[0].tau, seq, sizeof seq);
                     if (sa_[collapsed_].fix2) sa_[collapsed_].t1 = T;   // rode to T: becomes the terminal touch
@@ -1043,6 +1186,7 @@ bool StateSolver::run(StateResult& r) {
             if (why) break;
             // initial boundary arc: the violation interval [ta, tb]
             StateArc& s = sa_[k];
+            if (k == nsa_) s.jump = false;               // an extended arc keeps its entry type
             s.chain = (int8_t)wc; s.side = (int8_t)ws; s.b = bnd(wc, ws);
             s.fix1 = ta <= 0.0; s.fix2 = tb >= T;
             s.t1 = s.fix1 ? 0.0 : ta;
