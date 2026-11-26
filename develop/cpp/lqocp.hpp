@@ -168,7 +168,11 @@ private:
     // scratch sizes in doubles: tier-1 solve; tier 2 (lqocp_state.hpp: H (NY x NY) and Z (NY x 2 MAXSA))
     static constexpr int XS_T1 = (sizeof(EnergyWork) + 2 * MAXN * MAXN * sizeof(real)) / sizeof(double);
     static constexpr int XS_NY = MAXN + LQOCP_MAXSA;
+#ifdef LQOCP_NO_STATE                // tier-1-only build: no tier-2 scratch (lqocp_state.hpp's static_assert then fails)
+    static constexpr int XS_T2 = 0;
+#else
     static constexpr int XS_T2 = XS_NY * XS_NY + (XS_NY * (XS_NY + 1) / 2 > XS_NY * 2 * LQOCP_MAXSA ? XS_NY * (XS_NY + 1) / 2 : XS_NY * 2 * LQOCP_MAXSA);
+#endif
     union {                          // tier-1 solve scratch; StateSolver reuses it as xs_ after the tier-1 solve
         struct {
             EnergyWork ew_;
