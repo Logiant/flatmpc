@@ -114,8 +114,12 @@ const char* Solver::check_problem(const Problem& p) {
                 if (!isfinite(p.Q[i][j])) return "Q not finite";
         if (p.has_Qf)
             for (int i = 0; i < n; ++i)
-                for (int j = 0; j < n; ++j)
+                for (int j = 0; j < n; ++j) {
                     if (!isfinite(p.Qf[i][j])) return "Qf not finite";
+                    if (fabs(p.Qf[i][j] - p.Qf[j][i]) > 1e-12 * (fabs(p.Qf[i][j]) + fabs(p.Qf[j][i]) +
+                                                                  sqrt(fabs(p.Qf[i][i] * p.Qf[j][j]))))
+                        return "Qf not symmetric";   // relative to |Qf_ij| <= sqrt(Qf_ii Qf_jj) of a PSD Qf
+                }
     }
     return nullptr;
 }
@@ -170,23 +174,35 @@ bool Solver::setup_(const Problem& p) {
             for (int k = 0; k < m_; ++k) s += p.M[r][k] * Lci_[j][k];
             Mrow[r][j] = rI_ ? p.M[r][j] : s;
         }
-    // Qf = Cf^T Cf (Cf = L^T, semidefinite Cholesky: a zero pivot leaves a zero row)
+    // Qf = Cf^T Cf (Cf = L^T D^-1, semidefinite Cholesky of the unit-diagonal Qs = D Qf D, D = diag(Qf)^-1/2:
+    // pivots are scale-free; a zero pivot leaves a zero row and needs a zero column, else Qf is indefinite)
     for (int i = 0; i < MAXN * MAXN; ++i) Cf_[i] = 0.0;
     if (qf_) {
-        real qmax = 0.0;
-        for (int i = 0; i < n_; ++i) qmax = fmax(qmax, fabs(p.Qf[i][i]));
+        real D[MAXN];
+        for (int i = 0; i < n_; ++i) {
+            for (int k = 0; k < n_; ++k)          // a zero diagonal needs a zero row (else indefinite)
+                if (p.Qf[i][i] < 0.0 || (p.Qf[i][i] == 0.0 && p.Qf[i][k] != 0.0)) { sfail_ = "Qf not PSD"; return false; }
+            D[i] = p.Qf[i][i] > 0.0 ? 1.0 / sqrt((real)p.Qf[i][i]) : 0.0;
+        }
+        const real tol = 1e-14 * TS;
         for (int j = 0; j < n_; ++j) {
-            real d = p.Qf[j][j];
+            real d = D[j] > 0.0 ? 1.0 : 0.0;
             for (int k = 0; k < j; ++k) d -= Cf_[k * MAXN + j] * Cf_[k * MAXN + j];
-            if (d < -1e-12 * TS * qmax) { sfail_ = "Qf not PSD"; return false; }
-            if (d <= 1e-14 * TS * qmax) continue;
-            Cf_[j * MAXN + j] = sqrt(d);
+            if (d < -1e2 * tol) { sfail_ = "Qf not PSD"; return false; }
+            const bool zero = d <= tol;
+            if (!zero) Cf_[j * MAXN + j] = sqrt(d);
             for (int i = j + 1; i < n_; ++i) {
-                real s = p.Qf[i][j];
+                real s = p.Qf[i][j] * D[i] * D[j];
                 for (int k = 0; k < j; ++k) s -= Cf_[k * MAXN + i] * Cf_[k * MAXN + j];
-                Cf_[j * MAXN + i] = s / Cf_[j * MAXN + j];
+                if (zero) {   // PSD: s^2 <= d * Qs_ii <= tol
+                    if (s * s > tol) { sfail_ = "Qf not PSD"; return false; }
+                } else {
+                    Cf_[j * MAXN + i] = s / Cf_[j * MAXN + j];
+                }
             }
         }
+        for (int j = 0; j < n_; ++j)                  // undo the scaling: Cf = Cs D^-1 (columns)
+            for (int i = 0; i <= j; ++i) Cf_[i * MAXN + j] = D[j] > 0.0 ? Cf_[i * MAXN + j] / D[j] : 0.0;
     }
     rhs_scale_ = 1.0;
     for (int r = 0; r < m_; ++r) {
@@ -198,9 +214,26 @@ bool Solver::setup_(const Problem& p) {
         rhs_[2 * r + 1] = -p.lo[r];
         finite_[2 * r] = p.has_bounds && isfinite(p.hi[r]);
         finite_[2 * r + 1] = p.has_bounds && isfinite(p.lo[r]);
-        if (finite_[2 * r]) rhs_scale_ = fmax(rhs_scale_, 1.0 + fabs(p.hi[r]));
-        if (finite_[2 * r + 1]) rhs_scale_ = fmax(rhs_scale_, 1.0 + fabs(p.lo[r]));
     }
+    // parallel rows (duplicate, opposing, multiple: row r = a row q) make the active-row Gram singular:
+    // row r's bounds tighten row q's, row r is dropped
+    for (int r = 1; r < m_; ++r)
+        for (int q = 0; q < r && (finite_[2 * r] || finite_[2 * r + 1]); ++q) {
+            real dot = 0.0, n2 = 0.0, dev = 0.0, rm = 0.0;
+            for (int j = 0; j < m_; ++j) { dot += Mrow[q][j] * Mrow[r][j]; n2 += Mrow[q][j] * Mrow[q][j]; }
+            if (!(n2 > 0.0)) continue;
+            const real a = dot / n2;
+            for (int j = 0; j < m_; ++j) { dev = fmax(dev, fabs(Mrow[r][j] - a * Mrow[q][j])); rm = fmax(rm, fabs(Mrow[r][j])); }
+            if (!(dev <= 1e-12 * TS * rm) || a == 0.0) continue;
+            const real hi = finite_[a > 0.0 ? 2 * r : 2 * r + 1] ? (a > 0.0 ? rhs_[2 * r] : -rhs_[2 * r + 1]) / a : HUGE_VAL;
+            const real lo = finite_[a > 0.0 ? 2 * r + 1 : 2 * r] ? (a > 0.0 ? -rhs_[2 * r + 1] : rhs_[2 * r]) / a : -HUGE_VAL;
+            if (isfinite(hi) && (!finite_[2 * q] || hi < rhs_[2 * q])) { rhs_[2 * q] = hi; finite_[2 * q] = true; }
+            if (isfinite(lo) && (!finite_[2 * q + 1] || -lo < rhs_[2 * q + 1])) { rhs_[2 * q + 1] = -lo; finite_[2 * q + 1] = true; }
+            if (finite_[2 * q] && finite_[2 * q + 1] && rhs_[2 * q] < -rhs_[2 * q + 1]) { sfail_ = "bounds: lo > hi"; return false; }
+            finite_[2 * r] = finite_[2 * r + 1] = false;
+        }
+    for (int k = 0; k < 2 * m_; ++k)
+        if (finite_[k]) rhs_scale_ = fmax(rhs_scale_, 1.0 + fabs(rhs_[k]));
     // candidate active sets, sorted by size
     nsets_ = 0;
     int total = 1;
@@ -1092,25 +1125,27 @@ bool Solver::evaluate(const real* c, const real* mu, Eval& e) {
     if (!walk(c, e)) return false;
     real h[MAXN];
     assemble(e.S, e.tau, e.narcs, G_, h);
-    real sc = 1.0;
+    real sc = 1.0, si[MAXN];
     for (int i = 0; i < n_; ++i) {
         real gc = 0.0, s = 0.0;
         for (int j = 0; j < n_; ++j) { gc += G_[i * MAXN + j] * c[j]; s += fabs(G_[i * MAXN + j] * c[j]); }
         e.F[i] = gc + h[i] - (real)p_->xf[i];
-        sc = fmax(sc, fabs((real)p_->xf[i]));
-        sc = fmax(sc, fabs(free_[i]));
-        sc = fmax(sc, s + fabs(h[i] - free_[i]));
+        si[i] = fmax(fabs((real)p_->xf[i]), fmax(fabs(free_[i]), s + fabs(h[i] - free_[i])));
+        sc = fmax(sc, si[i]);
     }
     if (qf_) {                                       // transversality: F = Cf (s(T) - xf) + mu
-        real r[MAXN], sq = 0.0;
+        // stop per row, |F_i| <= rtol a_i with a_i its own terms (state i's scale): a global max would let rows in
+        // small units (per-chain scaling) stop early. e.scale = Fn / max_i |F_i| / a_i makes solve_newton's test that
+        real r[MAXN], Fn = 0.0, rel = 0.0;
         for (int i = 0; i < n_; ++i) r[i] = e.F[i];
         for (int i = 0; i < n_; ++i) {
             real f = mu[i], a = fabs(mu[i]);
-            for (int j = i; j < n_; ++j) { f += Cf_[i * MAXN + j] * r[j]; a += fabs(Cf_[i * MAXN + j]) * sc; }
+            for (int j = i; j < n_; ++j) { f += Cf_[i * MAXN + j] * r[j]; a += fabs(Cf_[i * MAXN + j]) * si[j]; }
             e.F[i] = f;
-            sq = fmax(sq, a);
+            Fn = fmax(Fn, fabs(f));
+            if (a > 0.0) rel = fmax(rel, fabs(f) / a);
         }
-        sc = fmax(1.0, sq);
+        sc = rel > 0.0 ? Fn / rel : 1.0;
     }
     e.scale = sc;
     e.D = dual(e.S, e.tau, e.narcs, c, mu);
@@ -1118,7 +1153,7 @@ bool Solver::evaluate(const real* c, const real* mu, Eval& e) {
 }
 
 real Solver::verify(const uint16_t* S, const real* tau, int n, const real* c, real* amp) const {
-    real worst = 0.0, a_max = 0.0, phi[2 * MAXM][4], b[4], d[3], cr[2];
+    real worst = 0.0, box = 0.0, a_max = 0.0, phi[2 * MAXM][4], b[4], d[3], cr[2];
     bool has[2 * MAXM];
     for (int a = 0; a < n; ++a) {
         real t0, t1;
@@ -1129,15 +1164,19 @@ real Solver::verify(const uint16_t* S, const real* tau, int n, const real* c, re
             if (!has[key]) continue;
             a_max = fmax(a_max, pscale(phi[key], 4, (real)p_->T));
             shift(phi[key], 4, t0, b);
-            worst = fmax(worst, fmax(b[0], pval(b, 4, L)));
+            real w = fmax(b[0], pval(b, 4, L));
             for (int i = 1; i < 4; ++i) d[i - 1] = i * b[i];
             const int nc = roots_le2(d, 3, cr);
             for (int i = 0; i < nc; ++i)
-                if (cr[i] > 0.0 && cr[i] < L) worst = fmax(worst, pval(b, 4, cr[i]));
+                if (cr[i] > 0.0 && cr[i] < L) w = fmax(w, pval(b, 4, cr[i]));
+            worst = fmax(worst, w);
+            if (!(S[a] & (1u << key))) box = fmax(box, w);
         }
     }
     if (amp) *amp = a_max;
-    return worst;
+    // a box row's value is in input units: its violation may not grow with amp (cancelling huge polynomial terms,
+    // e.g. tiny R: 1e-5 accepted); above 1e-7 R_ (float 1e-4 R_) the plan is rejected whatever vtol(amp) is
+    return box > (sizeof(real) == 4 ? 1e-4 : 1e-7) * R_ ? HUGE_VAL : worst;
 }
 
 // c(t) -> c(t + dt) per chain (exact Taylor shift); y = Lm^-1 c (nu), with Qf the mu of nu = Cf^T mu (Cf upper

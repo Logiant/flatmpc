@@ -1336,7 +1336,11 @@ bool StateSolver::run(StateResult& r) {
         r.state_violation = viol; r.sign_violation = ps; r.pmp_violation = pp;
         if (jump_) {
             jump_ = false;
-            if (!(viol <= TOL_X && ps <= TOL_SIGN && pp <= 1e-9 && release_ < 0)) break;
+            // the endpoint and entry rows of F are not in check(): the inner solve must be at its 1e-12 stop, not at
+            // the 1e-9 rounding floor it may reach next to the jump (re-sim endpoint 1e-7, state on the arc 3e-8)
+            double Fn = 0.0;
+            for (int i = 0; i < n + nsa_; ++i) Fn = fmax(Fn, fabs(ev_[0].F[i]));
+            if (!(viol <= TOL_X && ps <= TOL_SIGN && pp <= 1e-9 && release_ < 0 && Fn <= 1e-12 * ev_[0].scale)) break;
             why = nullptr;
         }
         if (release_ >= 0 && touch(sa_[release_])) {         // touch with the wrong sign: the bound is not active
