@@ -1295,8 +1295,8 @@ bool Solver::solve_newton(Result& R, int warm_its) {
     return conv;
 }
 
-// float: the walk's own event tolerance (round-off of the monomial row polynomials)
-real Solver::vtol(real amp) const { return sizeof(real) == 4 ? 1e-12 * TS * (amp + R_) : 1e-9 * R_; }
+// the walk's own event tolerance: round-off of the monomial row polynomials, relative to their amplitude
+real Solver::vtol(real amp) const { return 1e-12 * TS * (amp + R_); }
 
 // Switch between arcs SL and SR (one row toggles): the row's gap on the side where it is
 // inactive, g(t) = e^T w(t) + g0. Control continuity at the switch <=> g = 0. gd = dg/dt,
