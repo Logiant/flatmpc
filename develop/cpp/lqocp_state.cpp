@@ -571,12 +571,18 @@ __attribute__((noinline)) bool StateSolver::integrate(const double* c, const dou
 bool StateSolver::inner(double* y, int max_its) {
     const int ny = base_.n_ + nsa_;
     int cur = 0;
+    double y0 = 1.0, Fp = HUGE_VAL;
+    for (int i = 0; i < ny; ++i) y0 = fmax(y0, 1.0 + fabs(y[i]));
     if (!evaluate(y, ev_[cur], true)) { strcpy(why_, "event walk failed"); return false; }
     for (int it = 0;; ++it) {
         const Ev& E = ev_[cur];
-        double Fn = 0.0;
-        for (int i = 0; i < ny; ++i) Fn = fmax(Fn, fabs(E.F[i]));
-        if (Fn <= 1e-12 * E.scale) { if (cur) ev_[0] = ev_[1]; return true; }
+        double Fn = 0.0, ym = 0.0;
+        for (int i = 0; i < ny; ++i) { Fn = fmax(Fn, fabs(E.F[i])); ym = fmax(ym, fabs(y[i])); }
+        // dual unbounded (infeasible): y diverges and scale (the size of F's terms) with it; tested before the stop
+        if (ym > 1e6 * y0) { strcpy(why_, "dual diverges (infeasible)"); return false; }
+        // stop at 1e-12 scale, or at the rounding floor above it: an acceptable |F| a full step no longer halves
+        const bool ok = Fn <= 1e-9 * E.scale;
+        if (ok && (Fn <= 1e-12 * E.scale || !(Fn < 0.5 * Fp))) { if (cur) ev_[0] = ev_[1]; return true; }
         if (it >= max_its || its_ >= cap_) { if (cur) ev_[0] = ev_[1]; strcpy(why_, "iteration cap"); return false; }
         ++its_;
         double d[NY], yn[NY], hmax = 0.0;
@@ -596,18 +602,21 @@ bool StateSolver::inner(double* y, int max_its) {
         for (int i = 0; i < ny; ++i) { slope -= E.F[i] * d[i]; F2 += E.F[i] * E.F[i]; }
         const int nxt = 1 - cur;
         bool acc = false;
-        for (double al = 1.0; al >= 1e-3; al *= 0.5) {
+        for (double al = 1.0; al >= (ok ? 1.0 : 1e-3); al *= 0.5) {
             for (int i = 0; i < ny; ++i) yn[i] = y[i] + al * d[i];
             if (!evaluate(yn, ev_[nxt], true)) continue;
+            if (ok) { acc = true; break; }               // acceptable: the full step (does |F| still fall?)
             const Ev& N = ev_[nxt];
             if (N.D >= E.D + 1e-4 * al * slope) { acc = true; break; }
             double nF2 = 0.0;
             for (int i = 0; i < ny; ++i) nF2 += N.F[i] * N.F[i];
             if (al * slope <= 1e3 * EPS_ * (1.0 + fabs(E.D)) && nF2 < F2) { acc = true; break; }
         }
+        if (!acc && ok) { evaluate(y, ev_[cur], true); if (cur) ev_[0] = ev_[1]; return true; }   // rebuilds H_ of y
         if (!acc) { strcpy(why_, "line search failed"); if (cur) ev_[0] = ev_[1]; return false; }
         for (int i = 0; i < ny; ++i) y[i] = yn[i];
         cur = nxt;
+        Fp = ok ? Fn : HUGE_VAL;
     }
 }
 
@@ -823,7 +832,8 @@ bool StateSolver::junctions(double* y, int max_its, int* outer) {
             for (int q = 0; q < nsa_; ++q) sa_[q].fix2 = fix2s[q];
             for (int k = 0; k < nu; ++k) *tv[k] = tau0[k];
             for (int i = 0; i < ny; ++i) y[i] = y0[i];
-            inner(y, max_its);
+            // no step lowers |g|: its rounding floor (inner y at its floor, amplified); accept if small
+            if (inner(y, max_its) && gn <= 1e-6 * vs) return true;
             strcpy(why_, "junction Newton stalled");
             return false;
         }
