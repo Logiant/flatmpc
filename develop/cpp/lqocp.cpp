@@ -1183,13 +1183,15 @@ bool Solver::solve_newton(Result& R, int warm_its) {
         Eval& E = ew_.ev[cur];
         real Fn = 0.0, F2 = 0.0;
         for (int i = 0; i < n_; ++i) { Fn = fmax(Fn, fabs(E.F[i])); F2 += E.F[i] * E.F[i]; }
-        if (Fn <= rtol * E.scale) { conv = true; break; }
-        if (its >= max_its) { why = "iteration cap"; break; }
-        if (!qf_) {   // dual unbounded (infeasible problem): the iterates c diverge
+        // dual unbounded (infeasible problem): the iterates c diverge. Tested before the stop: E.scale
+        // grows with |c|, so a diverging iterate can meet the relative stop with an O(1) endpoint miss.
+        if (!qf_) {
             real cm = 0.0;
             for (int i = 0; i < n_; ++i) cm = fmax(cm, fabs(c[i]));
             if (cm > 1e6 * c0) { why = INFEAS; break; }
         }
+        if (Fn <= rtol * E.scale) { conv = true; break; }
+        if (its >= max_its) { why = "iteration cap"; break; }
         ++its;
         // (J Lm) d_nu = -F, J Lm = int K P K^T dt symmetric PSD; d_c = Lm d_nu
         // workspace: E's ds(T)/dc in G_ -> H in W_; X and A reuse G_ (evaluate refills it)
@@ -1296,7 +1298,8 @@ bool Solver::solve_newton(Result& R, int warm_its) {
 }
 
 // the walk's own event tolerance: round-off of the monomial row polynomials, relative to their amplitude
-real Solver::vtol(real amp) const { return 1e-12 * TS * (amp + R_); }
+// (bounded through |c| <= 1e6 c0 by the divergence test); never tighter than the old absolute 1e-9 R_
+real Solver::vtol(real amp) const { return fmax(1e-9 * R_, 1e-12 * TS * (amp + R_)); }
 
 // Switch between arcs SL and SR (one row toggles): the row's gap on the side where it is
 // inactive, g(t) = e^T w(t) + g0. Control continuity at the switch <=> g = 0. gd = dg/dt,
@@ -1333,6 +1336,11 @@ real Solver::gapk(uint16_t SL, uint16_t SR, real t, const real* c, real* e, real
 // (then R is the solution); else R.iterations = the reduced iterations spent, R otherwise unchanged.
 bool Solver::try_reduced(Result& R, int max_its) {
     if (!solve_reduced(R, max_its, &R.iterations)) return false;
+    if (!qf_) {                                   // diverging dual (infeasible): as solve_newton's test
+        real c0 = 1.0, cm = 0.0;
+        for (int i = 0; i < n_; ++i) { c0 = fmax(c0, 1.0 + fabs(R.c[i])); cm = fmax(cm, fabs(ew_.ev[1].F[i])); }
+        if (cm > 1e6 * c0) return false;
+    }
     real amp;
     const real viol = verify(R.S, ew_.ev[1].tau, R.narcs, ew_.ev[1].F, &amp);
     if (!(viol <= vtol(amp))) return false;
