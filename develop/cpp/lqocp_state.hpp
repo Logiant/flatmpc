@@ -60,6 +60,7 @@ public:
     // dropped); the dual polynomial is Taylor-shifted exactly (as Solver::solve_warm; the Deltas move with
     // their entries). Update x0 with set_x0 first. MPC policy: see MpcPlan (lqocp.hpp).
     bool solve_warm(StateResult& r, int max_its, double dt);
+    bool solve_warm(StateResult&, double, double) = delete;   // the old (r, dt, max_its) order: a compile error
     bool set_x0(const double* x0) { return base_.set_x0(x0); }
     double horizon() const { return base_.horizon(); }
     bool mean_u(const StateResult& r, double t0, double t1, double u[MAXM]) const;

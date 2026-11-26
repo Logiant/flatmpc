@@ -120,6 +120,7 @@ public:
     // else the dual Newton from the shifted r.c / r.mu with at most max_its iterations (then r is the
     // current iterate; its v = Proj(w) is feasible). dt = 0: no shift. MPC policy: see MpcPlan.
     bool solve_warm(Result& r, int max_its, double dt);
+    bool solve_warm(Result&, double, double) = delete;   // the old (r, dt, max_its) order: a compile error
     bool set_x0(const double* x0);   // false if x0 is not finite
     // mean u on [t0, t1] (what a zero-order hold should apply); false: no plan
     bool mean_u(const Result& r, double t0, double t1, double u[MAXM]) const;
@@ -313,6 +314,7 @@ public:
     // set_x0): junction times -dt, ended arcs dropped, the last arc stretched to T (the BVP recomputes the
     // costate); at most max_its Newton iterations (then r is the current iterate). MPC policy: see MpcPlan.
     bool solve_warm(GResult& r, int max_its, double dt);
+    bool solve_warm(GResult&, double, double) = delete;   // the old (r, dt, max_its) order: a compile error
     // (setup copies p.x0) false if x0 is not finite: the next solve then fails
     bool set_x0(const double* x0);
     // eval_u and mean_u (mean u on [t0, t1], what a zero-order hold should apply) saturate u to the

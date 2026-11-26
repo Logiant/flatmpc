@@ -265,26 +265,42 @@ bool Solver::setup_(const Problem& p) {
     // jmax_: 1/2 v^T R v is convex, so its max over the box {lo <= M v <= hi} is at a vertex v = M^-1 u
     jmax_ = HUGE_VAL;
     for (int i = 0; i < n_; ++i) sig_[i] = fabs((real)p.xf[i]);
-    bool bounded = p.has_bounds != 0;
-    for (int r = 0; r < m_; ++r) bounded = bounded && isfinite(p.lo[r]) && isfinite(p.hi[r]);
+    // on the merged rows: a dropped (parallel) row leaves the box unbounded along M's null direction
+    bool bounded = true;
+    for (int k = 0; k < 2 * m_; ++k) bounded = bounded && finite_[k];
     if (bounded) {
-        real A[MAXM * MAXM], V[MAXM * (1 << MAXM)];
-        const int nv = 1 << m_;
+        // the m_ extra columns give M^-1: M singular to rounding (kappa_inf(M) m EPS >= 1, LU's relative forward
+        // error bound reaches 1) leaves the vertices undetermined: the box counts as unbounded (as an exactly singular M)
+        real A[MAXM * MAXM], V[MAXM * ((1 << MAXM) + MAXM)];
+        const int nv = 1 << m_, ld = nv + m_;
+        real mn = 0.0, mi = 0.0;
         for (int r = 0; r < m_; ++r) {
-            for (int j = 0; j < m_; ++j) A[r * MAXM + j] = p.M[r][j];
-            for (int k = 0; k < nv; ++k) V[r * nv + k] = (k >> r & 1) ? p.hi[r] : p.lo[r];
+            real s = 0.0;
+            for (int j = 0; j < m_; ++j) {
+                A[r * MAXM + j] = p.M[r][j];
+                s += fabs(A[r * MAXM + j]);
+                V[r * ld + nv + j] = r == j ? 1.0 : 0.0;
+            }
+            mn = fmax(mn, s);
+            for (int k = 0; k < nv; ++k) V[r * ld + k] = (k >> r & 1) ? rhs_[2 * r] : -rhs_[2 * r + 1];
         }
-        if (lu_solve(A, m_, MAXM, V, nv, nv)) {
+        bool ok = lu_solve(A, m_, MAXM, V, ld, ld);
+        for (int r = 0; r < m_ && ok; ++r) {
+            real s = 0.0;
+            for (int j = 0; j < m_; ++j) s += fabs(V[r * ld + nv + j]);
+            mi = fmax(mi, s);
+        }
+        if (ok && mn * mi * m_ * EPS < 1.0) {
             jmax_ = 0.0;
             for (int k = 0; k < nv; ++k) {
                 real v[MAXM], q = 0.0;
-                for (int j = 0; j < m_; ++j) v[j] = V[j * nv + k];
+                for (int j = 0; j < m_; ++j) v[j] = V[j * ld + k];
                 for (int j = 0; j < m_; ++j) q += 0.5 * v[j] * (rI_ ? v[j] : vR(j, v));
                 jmax_ = fmax(jmax_, q);
             }
             for (int j = 0; j < m_; ++j) {   // sig_ = max(|xf_i|, reach umax_j T^e/e!), e = order - derivative index
                 real um = 0.0;
-                for (int k = 0; k < nv; ++k) um = fmax(um, fabs(V[j * nv + k]));
+                for (int k = 0; k < nv; ++k) um = fmax(um, fabs(V[j * ld + k]));
                 for (int q = 0; q < p.orders[j]; ++q) {
                     const int e = p.orders[j] - q;
                     sig_[off_[j] + q] = fmax(sig_[off_[j] + q], um * ipow(p.T, e) / fact(e));
@@ -511,8 +527,11 @@ real Solver::cost(const uint16_t* S, const real* tau, int n, const real* c) cons
             e[i] = h[i] - (real)p_->xf[i];
             for (int j = 0; j < n_; ++j) e[i] += G_[i * MAXN + j] * c[j];
         }
-        for (int i = 0; i < n_; ++i)
-            for (int j = 0; j < n_; ++j) J += 0.5 * e[i] * (real)p_->Qf[i][j] * e[j];
+        for (int i = 0; i < n_; ++i) {   // 1/2 |Cf e|^2: e^T Qf e cancels to below 0 for an ill-conditioned Qf
+            real s = 0.0;
+            for (int j = i; j < n_; ++j) s += Cf_[i * MAXN + j] * e[j];
+            J += 0.5 * s * s;
+        }
     }
     return J;
 }
@@ -621,6 +640,7 @@ static const char* const INFEAS = "infeasible endpoint (no feasible input)";
 
 bool Solver::solve(Result& R, int method) { return start(R, method, -1); }
 bool Solver::solve_warm(Result& R, int max_its, double dt) {
+    if (!isfinite(dt)) { R.converged = false; R.failure = "dt not finite"; return false; }
     if (dt != 0.0 && !general_) shift_warm(R, (real)dt);
     return start(R, METHOD_NEWTON, max_its);
 }
@@ -1216,14 +1236,17 @@ real Solver::verify(const uint16_t* S, const real* tau, int n, const real* c, re
             if (!has[key]) continue;
             a_max = fmax(a_max, pscale(phi[key], 4, (real)p_->T));
             shift(phi[key], 4, t0, b);
-            if (a && ((S[a] ^ S[a - 1]) >> key & 1u)) b[0] = fmin(b[0], (real)0.0);   // row of the event at t0: zero there
+            // row of the event at t0: zero there for the PMP test (its value is the root's rounding, taken off the
+            // arc), but a box row's value is the plan's input: the box limit sees it back (off)
+            const real off = a && ((S[a] ^ S[a - 1]) >> key & 1u) ? fmax(b[0], (real)0.0) : 0.0;
+            b[0] -= off;
             real w = fmax(b[0], pval(b, 4, L));
             for (int i = 1; i < 4; ++i) d[i - 1] = i * b[i];
             const int nc = roots_le2(d, 3, cr);
             for (int i = 0; i < nc; ++i)
                 if (cr[i] > 0.0 && cr[i] < L) w = fmax(w, pval(b, 4, cr[i]));
             worst = fmax(worst, w);
-            if (!(S[a] & (1u << key))) box = fmax(box, w);
+            if (!(S[a] & (1u << key))) box = fmax(box, w + off);
         }
     }
     if (amp) *amp = a_max;
@@ -1309,6 +1332,7 @@ bool Solver::solve_newton(Result& R, int warm_its) {
     // float: stop at the round-off level of F's terms (scale); double keeps 1e-12
     const real rtol = sizeof(real) == 4 ? EPS : 1e-12;
     int its = 0;
+    real pv = HUGE_VAL, amp = 0.0, Fst = HUGE_VAL;
     while (ok) {
         Eval& E = ew_.ev[cur];
         real Fn = 0.0, F2 = 0.0;
@@ -1316,17 +1340,21 @@ bool Solver::solve_newton(Result& R, int warm_its) {
         // dual unbounded (infeasible problem): the iterates c diverge. Tested before the stop: E.scale
         // grows with |c|, so a diverging iterate can meet the relative stop with an O(1) endpoint miss.
         if (!qf_ && infeasible(E.D, E.Dabs, E.narcs)) { why = INFEAS; break; }
+        bool st = true;
         if (sizeof(real) == 4 || qf_) {
-            if (Fn <= rtol * E.scale) { conv = true; break; }
+            st = Fn <= rtol * E.scale;
         } else {   // double, fixed endpoint: per state, relative to its scale sigma_i or its rounding floor
-            bool st = true;
             for (int i = 0; i < n_ && st; ++i) {
                 real gc = 0.0, a = 0.0;   // a = sum |terms of F_i| (G c, the constant part, xf): F_i's rounding is (n+2) EPS a
                 for (int j = 0; j < n_; ++j) { gc += G_[i * MAXN + j] * c[j]; a += fabs(G_[i * MAXN + j] * c[j]); }
                 a += fabs(E.F[i] - gc + (real)p_->xf[i]) + fabs((real)p_->xf[i]);
                 st = fabs(E.F[i]) <= fmax(rtol * fmax(sig_[i], fabs(free_[i])), (n_ + 2) * EPS * a);
             }
-            if (st) { conv = true; break; }
+        }
+        if (st) {   // verify's box limit can need a plan beyond the stop: Newton goes on while |F| still falls
+            pv = verify(E.S, E.tau, E.narcs, c, &amp);
+            if (pv <= vtol(amp) || !(Fn < Fst) || its >= max_its) { conv = true; break; }
+            Fst = Fn;
         }
         if (its >= max_its) { why = "iteration cap"; break; }
         ++its;
@@ -1422,9 +1450,8 @@ bool Solver::solve_newton(Result& R, int warm_its) {
     for (int i = 0; i < n_; ++i) Fn = fmax(Fn, fabs(E.F[i]));
     R.residual = Fn;
     R.degenerate_events = E.ndeg;
-    real amp;
-    R.pmp_violation = verify(R.S, R.tau, R.narcs, R.c, &amp);
-    if (conv && R.pmp_violation > vtol(amp)) { conv = false; why = "PMP verification failed"; }
+    R.pmp_violation = conv ? pv : verify(R.S, R.tau, R.narcs, R.c, &amp);   // conv: verified at the stop
+    if (conv && !(R.pmp_violation <= vtol(amp))) { conv = false; why = "PMP verification failed"; }   // NaN fails
     R.cost = cost(R.S, R.tau, R.narcs, R.c);
     R.converged = conv;
     R.failure = conv ? nullptr : capfail_ ? CAPFAIL : why;
@@ -3861,6 +3888,7 @@ bool GSolver::cold(GResult& R, int max_its) {
 // converged = false. A previous plan that is not converged and violates PMP by more than WRESET*R
 // (a stale active set asking for inputs far outside the box) is not reused: cold restart.
 bool GSolver::solve_warm(GResult& R, int max_its, double dt) {
+    if (!isfinite(dt)) { R.converged = false; R.failure = "dt not finite"; return false; }
     if (R.narcs < 1 || R.narcs > NA || !x0ok_ || (!R.converged && !(R.pmp_violation <= WRESET * R_)))
         return cold(R, max_its);
     const double T = p_->T;
