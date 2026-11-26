@@ -137,6 +137,20 @@ static void closed_loop(int cap) {
 }
 #endif
 
+// measured peak stack (DTCM painted from above the 32-byte MPU guard at _ebss to the stack top) and heap (bytes malloc got from sbrk)
+#include <malloc.h>
+extern "C" char _ebss, _estack;
+static void stack_paint() {
+    char* sp = (char*)__builtin_frame_address(0) - 256;
+    for (uint32_t* p = (uint32_t*)((uintptr_t)&_ebss + 32); (char*)p < sp; ++p) *p = 0xA5A5A5A5u;
+}
+static void mem_report() {
+    const uint32_t* p = (const uint32_t*)((uintptr_t)&_ebss + 32);
+    while (*p == 0xA5A5A5A5u) ++p;
+    Serial.printf("mem stack_peak=%u heap_arena=%u heap_inuse=%u\n", (unsigned)(&_estack - (const char*)p),
+                  (unsigned)mallinfo().arena, (unsigned)mallinfo().uordblks);
+}
+
 static void report(const char* name, double J, int its, uint32_t us, int conv, int nsw) {
     Serial.printf("%s J=%.12f its=%d t=%lu us conv=%d switches=%d\n", name, J, its, (unsigned long)us, conv, nsw);
 }
@@ -146,6 +160,7 @@ void setup() {
     ARM_DEMCR |= ARM_DEMCR_TRCENA;                     // DWT cycle counter
     ARM_DWT_CTRL |= ARM_DWT_CTRL_CYCCNTENA;
     while (!Serial && millis() < 3000) {}
+    stack_paint();
 }
 
 void loop() {
@@ -190,5 +205,6 @@ void loop() {
     const uint32_t t1 = micros();
     report("none", 0.0, 0, t1 - t0, 0, 0);
 #endif
+    mem_report();
     delay(2000);
 }

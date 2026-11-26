@@ -2,6 +2,20 @@
 #include "quad.h"  // before Arduino.h: its F() macro breaks Eigen
 #include <Arduino.h>
 #include <algorithm>
+#include <malloc.h>
+
+// measured peak stack (DTCM painted from above the 32-byte MPU guard at _ebss to the stack top) and heap (bytes malloc got from sbrk)
+extern "C" char _ebss, _estack;
+static void stack_paint() {
+    char *sp = (char *)__builtin_frame_address(0) - 256;
+    for (uint32_t *p = (uint32_t *)((uintptr_t)&_ebss + 32); (char *)p < sp; ++p) *p = 0xA5A5A5A5u;
+}
+static void mem_report() {
+    const uint32_t *p = (const uint32_t *)((uintptr_t)&_ebss + 32);
+    while (*p == 0xA5A5A5A5u) ++p;
+    Serial.printf("mem stack_peak=%u heap_arena=%u heap_inuse=%u\n", (unsigned)(&_estack - (const char *)p),
+                  (unsigned)mallinfo().arena, (unsigned)mallinfo().uordblks);
+}
 
 static TinySolver *make(int max_iter) {
     TinySolver *s = quad_setup();
@@ -67,6 +81,7 @@ void setup() {
     Serial.begin(115200);
     while (!Serial && millis() < 5000) {}
     delay(500);
+    stack_paint();
 }
 
 void loop() {
@@ -75,6 +90,7 @@ void loop() {
     closed_loop(1000);
     closed_loop(100);
     closed_loop(5);
+    mem_report();
     Serial.println("=== done ===");
     delay(3000);
 }
