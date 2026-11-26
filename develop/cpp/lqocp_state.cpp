@@ -35,6 +35,7 @@ const double TOL_SIGN = 1e-7;        // eta >= 0 on a boundary arc, relative
 const char CH[4] = {'x', 'y', 'z', 'p'};
 const double DEP = 1e-9;            // rows closer than this (relative) to the span of others count as dependent
 const int ZC = 2 * MAXSA;            // columns of Z_: one per free junction time
+static_assert(MAXARC_E <= 32, "check: dependent pieces are a 32-bit mask");
 
 void span_(const double* tau, int n, int a, double T, double* t0, double* t1) {
     *t0 = a ? tau[a - 1] : 0.0;
@@ -833,7 +834,9 @@ bool StateSolver::junctions(double* y, int max_its, int* outer) {
             for (int k = 0; k < nu; ++k) *tv[k] = tau0[k];
             for (int i = 0; i < ny; ++i) y[i] = y0[i];
             // no step lowers |g|: its rounding floor (inner y at its floor, amplified); accept if small
-            if (inner(y, max_its) && gn <= 1e-6 * vs) return true;
+            const bool ok = inner(y, max_its);
+            if (ok && gn <= 1e-6 * vs) return true;
+            if (ok) collapsed_ = -2;                    // a solved plan, its junction residual not zero
             strcpy(why_, "junction Newton stalled");
             return false;
         }
@@ -890,7 +893,7 @@ double StateSolver::scan(const double* c, const double* y, int j, int side, doub
 }
 
 double StateSolver::check(const double* y, int* wc, int* ws, double* ta, double* tb, double* twout,
-                          double* psign, double* ppmp) const {
+                          double* psign, double* ppmp, int* sq, double* st) const {
     const Solver& B = base_;
     const Ev& e = ev_[0];
     const double T = B.p_->T;
@@ -909,8 +912,15 @@ double StateSolver::check(const double* y, int* wc, int* ws, double* ta, double*
         }
     if (*wc >= 0) scan(c, y, *wc, *ws, tw, &xx, ta, tb);
     *twout = tw;
-    // eta = -side * sig' >= 0 on boundary arcs; thrust rows feasible with mu >= 0 (Solver::verify)
-    double ps = 0.0, pp = 0.0;
+    // eta = -side * sig' >= 0 on boundary arcs; thrust rows feasible with mu >= 0 (Solver::verify).
+    // Pinned pieces whose active rows are dependent (multipliers not unique): their multiplier signs go to psd / ppd /
+    // reld, and lpsign tests the whole multiplier set instead
+    double ps = 0.0, pp = 0.0, psd = 0.0, ppd = 0.0;
+    struct Worst { double v, t; int q; } wps = {0.0, 0.0, -1}, wpd = wps;   // where eta < 0 is worst (the cut)
+    auto up = [](Worst& w, const Worst& o) { if (o.v > w.v) w = o; };
+    uint32_t dall = 0, dbad = 0;                         // dependent pinned pieces; those whose computed signs fail
+    uint16_t tchs[MAXARC_E];                             // per dependent piece: its touching rows
+    int reld = -1;
     for (int a = 0; a < e.narcs; ++a) {
         double t0, t1, Wc[MAXM][4], Pv[MAXM][MAXM], Vv[MAXM][4], phi[2 * MAXM][4], sig[MAXM][4], bb[4], d[3], cr[2];
         bool has[2 * MAXM];
@@ -919,19 +929,29 @@ double StateSolver::check(const double* y, int* wc, int* ws, double* ta, double*
         if (!(L > 0)) continue;
         wpoly(c, y, sa_, nsa_, tm, Wc, e.S[a] >> 8);   // thrust rows: without the pinned w (exact, less rounding)
         if (!kkt(e.S[a], Wc, Pv, Vv, phi, has, sig)) { pp = HUGE_VAL; continue; }
+        double ppa = 0.0;                                // the multipliers of S (gaps of the other rows go to pp)
+        uint16_t tch = 0;                                // rows outside S at their bound on the whole piece
         for (int key = 0; key < 2 * B.m_; ++key) {
             if (!has[key]) continue;
             shift(phi[key], 4, t0, bb);
             if (a && ((e.S[a] ^ e.S[a - 1]) >> key & 1u)) bb[0] = fmin(bb[0], 0.0);   // row of the event at t0: zero there
-            pp = fmax(pp, fmax(bb[0], pval(bb, 4, L)));
+            double& pk = (e.S[a] >> key & 1u) ? ppa : pp;
+            pk = fmax(pk, fmax(bb[0], pval(bb, 4, L)));
             for (int i = 1; i < 4; ++i) d[i - 1] = i * bb[i];
             const int nc = roots_le2(d, 3, cr);
-            for (int i = 0; i < nc; ++i) if (cr[i] > 0.0 && cr[i] < L) pp = fmax(pp, pval(bb, 4, cr[i]));
+            for (int i = 0; i < nc; ++i) if (cr[i] > 0.0 && cr[i] < L) pk = fmax(pk, pval(bb, 4, cr[i]));
+            if (!(e.S[a] >> key & 1u) && pscale(bb, 4, L) <= 1e-9 * B.R_) tch |= (uint16_t)(1u << key);
         }
+        // rank check: S plus the touching rows independent = unique multipliers (the common case: no LP)
+        const bool dp = (e.S[a] >> 8) && tch && !kkt((uint16_t)(e.S[a] | tch), Wc, Pv, Vv, phi, has, sig);
+        if (!dp) pp = fmax(pp, ppa);
         if (e.S[a] >> 8) {                               // pin multipliers need the whole w
             wpoly(c, y, sa_, nsa_, tm, Wc);
             kkt(e.S[a], Wc, Pv, Vv, phi, has, sig);
         }
+        double pz = 0.0;                                 // dp: this piece's sign test and release
+        Worst wpz = {0.0, 0.0, -1};
+        int rq = -1;
         for (int q = 0; q < nsa_; ++q) {
             const int j = sa_[q].chain;
             if (!(e.S[a] & (1u << (8 + j))) || !(sa_[q].t1 <= tm && tm < sa_[q].t2)) continue;
@@ -939,21 +959,49 @@ double StateSolver::check(const double* y, int* wc, int* ws, double* ta, double*
             const double nrm = (1.0 + fmax(fabs(bb[0]), fabs(pval(bb, 4, L)))) / T;
             const double dd[3] = {bb[1], 2 * bb[2], 3 * bb[3]};
             double mx = fmax(pval(dd, 3, 0.0), pval(dd, 3, L)), mn = fmin(pval(dd, 3, 0.0), pval(dd, 3, L));
+            double tx = pval(dd, 3, 0.0) >= pval(dd, 3, L) ? 0.0 : L, tn = L - tx;
             if (dd[2] != 0.0) {
                 const double xv = -dd[1] / (2 * dd[2]);
-                if (xv > 0 && xv < L) { mx = fmax(mx, pval(dd, 3, xv)); mn = fmin(mn, pval(dd, 3, xv)); }
+                if (xv > 0 && xv < L) {
+                    if (pval(dd, 3, xv) > mx) tx = xv;
+                    if (pval(dd, 3, xv) < mn) tn = xv;
+                    mx = fmax(mx, pval(dd, 3, xv)); mn = fmin(mn, pval(dd, 3, xv));
+                }
             }
-            ps = fmax(ps, (sa_[q].side > 0 ? mx : -mn) / nrm);
+            double& pq = dp ? pz : ps;
+            const double pv = (sa_[q].side > 0 ? mx : -mn) / nrm;
+            pq = fmax(pq, pv);
+            up(dp ? wpz : wps, Worst{pv, t0 + (sa_[q].side > 0 ? tx : tn), q});
             // arc riding to T: sigma_j(T) is the terminal atom of the multiplier, side * sigma_j(T) >= 0;
             // otherwise the arc must leave the bound before T
-            if (sa_[q].fix2 && t1 >= T && sa_[q].side * pval(bb, 4, L) < -TOL_SIGN * nrm * T) release_ = q;
+            if (sa_[q].fix2 && t1 >= T && sa_[q].side * pval(bb, 4, L) < -TOL_SIGN * nrm * T) (dp ? rq : release_) = q;
         }
+        if (dp) { dall |= 1u << a; tchs[a] = tch; }
+        // a dependent piece whose computed multipliers fail: lpsign looks for others
+        if (dp && (pz > TOL_SIGN || ppa > 1e-9 * B.R_ || rq >= 0)) {
+            dbad |= 1u << a;
+            psd = fmax(psd, pz); ppd = fmax(ppd, ppa);
+            up(wpd, wpz);
+            if (rq >= 0) reld = rq;
+        } else if (dp) {
+            ps = fmax(ps, pz); pp = fmax(pp, ppa);
+            up(wps, wpz);
+        }
+    }
+    if ((dbad || jump_) && !lpsign(c, y, dall, dbad, tchs)) {   // no valid multiplier set: the computed one decides
+        ps = fmax(ps, psd);
+        pp = fmax(pp, ppd);
+        up(wps, wpd);
+        if (reld >= 0) release_ = reld;
+        if (jump_) ps = HUGE_VAL;
     }
     // terminal touch: its multiplier is the whole jump Delta, side * Delta <= 0 (as on every entry)
     for (int q = 0; q < nsa_; ++q)
         if (touch(sa_[q]) && sa_[q].side * y[B.n_ + q] > 1e-12) release_ = q;
     *psign = ps;
     *ppmp = pp / B.R_;
+    *sq = wps.q;
+    *st = wps.t;
     // states of relative degree > 1 are not enforced, only verified (exact extrema per arc)
     double x[MAXN], V[MAXM][4], av[4];
     for (int i = 0; i < B.n_; ++i) x[i] = B.x0_[i];
@@ -986,6 +1034,184 @@ double StateSolver::check(const double* y, int* wc, int* ws, double* ta, double*
         }
     }
     return worst;
+}
+
+// 0, L and the critical points of the cubic b in (0, L)
+static int crit3(const double* b, double L, double* pts) {
+    double d[3] = {b[1], 2 * b[2], 3 * b[3]}, cr[2];
+    int n = 0;
+    pts[n++] = 0.0;
+    pts[n++] = L;
+    const int nr = roots_le2(d, 3, cr);
+    for (int i = 0; i < nr; ++i) if (cr[i] > 0.0 && cr[i] < L) pts[n++] = cr[i];
+    return n;
+}
+
+// Sign check over the whole multiplier set (NOTES.md 14.12). dall: pinned pieces of ev_[0] whose active rows are
+// dependent, dbad: those where the computed multipliers fail; tch[a]: the rows at their bound outside S.
+// With eta the state multiplier (a measure), side * sigma(t) = eta([t, T]) along each arc: nonincreasing, atoms >= 0 at
+// the entry -side (Delta + sigma(t1+)) (a costate jump; zero at a regular junction), between pieces, at the exit
+// side * sigma(t2-) (or at T). On a dependent piece the pins lie in the span of the active thrust rows K, so their
+// multipliers are free; K's are then mu_K(t) - sum_j alpha_j sigma_j(t) >= 0 (mu_K: without pins, alpha_j: pin j in the
+// rows of K). The unknowns: one pin on the piece: sigma(t0+), sigma(t1-) (row k binds at the end where side alpha_k
+// says; a monotone sigma between the bands mu_k / alpha_k exists iff every lower band at tau is below every upper band
+// at t <= tau: exact maximum over that triangle); several pins: one constant each. Each bound uses the exact extremum of
+// a cubic. Arcs with a piece in dbad take part (every arc for a jump junction, jump_), and every arc pinned on a
+// dependent piece of theirs; their unique pieces keep check's density test and add fixed values. proj finds a point of
+// these linear inequalities or proves them empty (Goldfarb-Idnani is exact). true: valid multipliers exist.
+// shortcut: at most MAXM unknowns, K independent and spanning the pins; else false (the computed multipliers decide).
+__attribute__((noinline)) bool StateSolver::lpsign(const double* c, const double* y, uint32_t dall, uint32_t dbad,
+                                                   const uint16_t* tch) const {
+    const Solver& B = base_;
+    const Ev& e = ev_[0];
+    const int m = B.m_, n = B.n_;
+    const double T = B.p_->T;
+    constexpr int NC = 6 * MAXM;                     // the LP rows G c <= h (tolerance tl) in H_ (dead after junctions)
+    static_assert(NC * (MAXM + 2) <= NY * NY, "lpsign: H_ too small");
+    double (*const G)[MAXM] = reinterpret_cast<double (*)[MAXM]>(H_);
+    double* const h = H_ + NC * MAXM;
+    double* const tl = h + NC;
+    double g[MAXM], Wc[MAXM][4], Pv[MAXM][MAXM], Vv[MAXM][4], phi[2 * MAXM][4], sig[MAXM][4], bb[4];
+    bool has[2 * MAXM];
+    int8_t vix[MAXARC_E][MAXM], vie[MAXARC_E][MAXM]; // unknowns sigma_j(t0+), sigma_j(t1-) of piece a (or -1)
+    int nc = 0, nv = 0;
+    // the lambdas are out of line (code size)
+    auto on = [&](int q, int a) __attribute__((noinline)) {   // arc q pinned on piece a
+        const double tm = 0.5 * ((a ? e.tau[a - 1] : 0.0) + (a + 1 < e.narcs ? e.tau[a] : T));
+        return (e.S[a] >> (8 + sa_[q].chain) & 1u) && sa_[q].t1 <= tm && tm < sa_[q].t2;
+    };
+    unsigned arcs = jump_ ? (1u << nsa_) - 1 : 0u;   // jump junction: every arc (its atoms decide)
+    uint32_t P = 0;                                  // pieces with unknowns
+    for (int a = 0; a < e.narcs; ++a)
+        for (int q = 0; q < nsa_; ++q) if ((dbad >> a & 1u) && on(q, a)) arcs |= 1u << q;
+    for (unsigned old = ~0u; old != arcs;) {         // closure: the arcs' dependent pieces, and the arcs pinned there
+        old = arcs;
+        for (int a = 0; a < e.narcs; ++a)
+            for (int q = 0; q < nsa_; ++q) if ((dall >> a & 1u) && (arcs >> q & 1u) && on(q, a)) P |= 1u << a;
+        for (int a = 0; a < e.narcs; ++a)
+            for (int q = 0; q < nsa_; ++q) if ((P >> a & 1u) && on(q, a)) arcs |= 1u << q;
+    }
+    for (int a = 0; a < e.narcs; ++a) {              // one pin: start and end; several: one constant each
+        const uint16_t pins = (uint16_t)(e.S[a] >> 8);
+        const bool one = !(pins & (pins - 1));
+        for (int j = 0; j < m; ++j) {
+            vix[a][j] = vie[a][j] = -1;
+            if (!(P >> a & 1u) || !(pins >> j & 1u)) continue;
+            if (nv + one >= MAXM) return false;
+            vix[a][j] = (int8_t)nv++;
+            vie[a][j] = one ? (int8_t)nv++ : vix[a][j];
+        }
+    }
+    auto sa_side = [&](int a, int j) __attribute__((noinline)) {   // side of the arc pinning chain j on piece a
+        const double tm = 0.5 * ((a ? e.tau[a - 1] : 0.0) + (a + 1 < e.narcs ? e.tau[a] : T));
+        for (int q = 0; q < nsa_; ++q) if (sa_[q].chain == j && sa_[q].t1 <= tm && tm < sa_[q].t2) return (int)sa_[q].side;
+        return 1;
+    };
+    auto row = [&](double k0, double tol) __attribute__((noinline)) {   // sum_i g_i c_i + k0 <= tol
+        bool any = false;
+        for (int i = 0; i < nv; ++i) any = any || g[i] != 0.0;
+        if (!any) return k0 <= tol;
+        if (nc == NC) return false;
+        for (int i = 0; i < nv; ++i) G[nc][i] = g[i];
+        h[nc] = -k0; tl[nc++] = tol;
+        return true;
+    };
+    for (int a = 0; a < e.narcs; ++a) {              // mu >= 0 on the pieces with unknowns
+        if (!(P >> a & 1u)) continue;
+        double t0, t1, ar[MAXM][MAXM], z[MAXM], r[MAXM], al[MAXM][MAXM], d[3], cr[2];
+        int W[MAXM], key[MAXM], nk = 0;
+        span_(e.tau, e.narcs, a, T, &t0, &t1);
+        const double L = t1 - t0;
+        const uint16_t K = (uint16_t)((e.S[a] | tch[a]) & 0xFFu);
+        wpoly(c, y, sa_, nsa_, 0.5 * (t0 + t1), Wc);
+        if (!kkt(K, Wc, Pv, Vv, phi, has, sig)) return false;
+        for (int k = 0; k < 2 * m; ++k)
+            if (K >> k & 1u) { for (int i = 0; i < m; ++i) ar[nk][i] = B.rows_[k][i]; W[nk] = nk; key[nk++] = k; }
+        for (int j = 0; j < m; ++j) {
+            if (vix[a][j] < 0) continue;
+            double pr[MAXM];
+            for (int i = 0; i < m; ++i) pr[i] = B.Lci_[i][j];
+            if (!split(m, ar, W, nk, pr, z, r) || dot(m, z, z) > DEP * DEP * dot(m, pr, pr)) return false;
+            for (int i = 0; i < nk; ++i)                 // a row without the pin (rounding): its own mu >= 0
+                al[j][i] = fabs(r[i]) * sqrt(B.rownorm2_[key[i]]) > DEP * sqrt(dot(m, pr, pr)) ? r[i] : 0.0;
+        }
+        double band[MAXM][4];                            // one pin: mu_k / (side alpha_k), a bound on side * sigma
+        for (int i = 0; i < nk; ++i) {
+            const int k = key[i];
+            shift(phi[k], 4, t0, bb);                    // phi = -mu_K |row|^2: its maximum
+            for (int j = 0; j < m; ++j)
+                if (vix[a][j] >= 0 && vix[a][j] != vie[a][j] && al[j][i] != 0.0)
+                    for (int p = 0; p < 4; ++p) band[i][p] = -bb[p] / (B.rownorm2_[k] * sa_side(a, j) * al[j][i]);
+            double mx = fmax(bb[0], pval(bb, 4, L));
+            for (int p = 1; p < 4; ++p) d[p - 1] = p * bb[p];
+            const int nr = roots_le2(d, 3, cr);
+            for (int p = 0; p < nr; ++p) if (cr[p] > 0.0 && cr[p] < L) mx = fmax(mx, pval(bb, 4, cr[p]));
+            for (int l = 0; l < nv; ++l) g[l] = 0.0;
+            // alpha_j sigma_j <= mu_k: one pin (side * sigma monotone) binds at its end if side * alpha_j > 0, else its start
+            for (int j = 0; j < m; ++j)
+                if (vix[a][j] >= 0) g[sa_side(a, j) * al[j][i] > 0 ? vie[a][j] : vix[a][j]] = al[j][i];
+            if (!row(mx / B.rownorm2_[k], 1e-9 * B.R_ / B.rownorm2_[k])) return false;
+        }
+        for (int j = 0; j < m; ++j) {                // one pin: side * (sigma(t1-) - sigma(t0+)) <= 0
+            if (vix[a][j] < 0 || vix[a][j] == vie[a][j]) continue;
+            for (int l = 0; l < nv; ++l) g[l] = 0.0;
+            g[vie[a][j]] = sa_side(a, j); g[vix[a][j]] = -sa_side(a, j);
+            if (!row(0.0, TOL_SIGN)) return false;
+            // and a nonincreasing f = side * sigma between the lower bands (side alpha_k < 0) and the upper ones exists:
+            // lower_k(tau) <= upper_l(t) for all t <= tau. Exact maximum over the triangle (separable: corners,
+            // critical points of each, and the diagonal)
+            for (int k = 0; k < nk; ++k)
+                for (int l = 0; l < nk; ++l) {
+                    const double sk = sa_side(a, j) * al[j][k], sl = sa_side(a, j) * al[j][l];
+                    if (!(sk < 0.0 && sl > 0.0)) continue;
+                    double pk[4], pl[4], df[4], pd[4], wv = -HUGE_VAL;
+                    const int nk1 = crit3(band[k], L, pk), nl1 = crit3(band[l], L, pl);
+                    for (int u = 0; u < nk1; ++u)
+                        for (int v = 0; v < nl1; ++v)
+                            if (pl[v] <= pk[u]) wv = fmax(wv, pval(band[k], 4, pk[u]) - pval(band[l], 4, pl[v]));
+                    for (int p = 0; p < 4; ++p) df[p] = band[k][p] - band[l][p];
+                    const int nd = crit3(df, L, pd);
+                    for (int u = 0; u < nd; ++u) wv = fmax(wv, pval(df, 4, pd[u]));
+                    if (wv > 1e-9 * B.R_ * (1.0 / (B.rownorm2_[key[k]] * -sk) + 1.0 / (B.rownorm2_[key[l]] * sl))) return false;
+                }
+        }
+    }
+    for (int q = 0; q < nsa_; ++q) {                 // along each arc: monotone, atoms >= 0
+        if (!(arcs >> q & 1u)) continue;
+        const StateArc& s = sa_[q];
+        const int j = s.chain;
+        const double D = s.fix1 ? 0.0 : y[n + q];
+        double pk = 0.0;                                 // previous piece's end: pk (+ unknown pv)
+        int pv = -1;
+        bool first = true;
+        for (int a = 0; a < e.narcs; ++a) {
+            double t0, t1;
+            span_(e.tau, e.narcs, a, T, &t0, &t1);
+            const double L = t1 - t0;
+            if (!(L > 0) || !on(q, a)) continue;
+            const int v = vix[a][j];
+            double ks = 0.0, ke = 0.0;                   // this piece's start / end: ks / ke (+ unknowns v / vie)
+            if (v < 0) {                                 // unique piece: its sigma (whole w)
+                wpoly(c, y, sa_, nsa_, 0.5 * (t0 + t1), Wc);
+                if (!kkt(e.S[a], Wc, Pv, Vv, phi, has, sig)) return false;
+                shift(sig[j], 4, t0, bb);
+                ks = bb[0]; ke = pval(bb, 4, L);
+            }
+            for (int l = 0; l < nv; ++l) g[l] = 0.0;
+            if (v >= 0) g[v] = s.side;
+            double k0 = s.side * ks;
+            if (!first) { if (pv >= 0) g[pv] -= s.side; k0 -= s.side * pk; }
+            else k0 += s.side * D;                       // entry atom -side (Delta + sigma(t1+)) >= 0
+            if (!(first && s.fix1) && !row(k0, TOL_SIGN * (1.0 + fabs(D) + fabs(ks) + fabs(pk)))) return false;
+            first = false; pv = vie[a][j]; pk = ke;
+        }
+        for (int l = 0; l < nv; ++l) g[l] = 0.0;      // exit / terminal atom side * sigma(t2-) >= 0
+        if (pv >= 0) g[pv] = -s.side;
+        if (!row(-s.side * pk, TOL_SIGN * (1.0 + fabs(D) + fabs(pk)))) return false;
+    }
+    double x[MAXM], u[MAXM], z0[MAXM] = {0.0, 0.0, 0.0, 0.0};
+    int W[MAXM], nw;
+    return nc == 0 || proj(nv, G, h, 0, nc, tl, z0, x, W, u, &nw);   // no row with an unknown: the fixed rows passed
 }
 
 const char* StateSolver::sequence(const uint16_t* S, int narcs, const StateArc* sa, int nsa, const double* tau,
@@ -1076,6 +1302,7 @@ bool StateSolver::run(StateResult& r) {
     bool conv = false;
     char seq[160], det[64];
     unsigned gone = 0;                                       // chains whose boundary arc collapsed
+    int cuts = 0;
     seq[0] = 0;
     if (!inner(y, cap)) why = why_;
     for (int pass = 0; !why && pass < 3 * MAXSA + 3; ++pass) {
@@ -1096,13 +1323,22 @@ bool StateSolver::run(StateResult& r) {
                 sequence(ev_[0].S, ev_[0].narcs, sa_, nsa_, ev_[0].tau, seq, sizeof seq);
                 snprintf(why_, sizeof why_, "arc order rejected: %s (%s)", seq, det);
                 why = why_;
-                break;
+                // stalled at a solved plan (collapsed_ == -2): a junction where the control jumps cannot zero its
+                // residual. That plan is still optimal if its multipliers, with atoms at the junctions, have valid
+                // signs (KKT; NOTES.md 14.12): the jump junction. lpsign then takes every arc
+                if (collapsed_ != -2) break;
+                jump_ = true;
             }
         }
-        int wc, ws;
-        double ta, tb, tw, ps, pp;
-        const double viol = check(y, &wc, &ws, &ta, &tb, &tw, &ps, &pp);
+        int wc, ws, sq;
+        double ta, tb, tw, ps, pp, st;
+        const double viol = check(y, &wc, &ws, &ta, &tb, &tw, &ps, &pp, &sq, &st);
         r.state_violation = viol; r.sign_violation = ps; r.pmp_violation = pp;
+        if (jump_) {
+            jump_ = false;
+            if (!(viol <= TOL_X && ps <= TOL_SIGN && pp <= 1e-9 && release_ < 0)) break;
+            why = nullptr;
+        }
         if (release_ >= 0 && touch(sa_[release_])) {         // touch with the wrong sign: the bound is not active
             drop(release_, y, &gone);
             if (!inner(y, cap)) why = why_;
@@ -1115,6 +1351,23 @@ bool StateSolver::run(StateResult& r) {
             if (!inner(y, cap)) {
                 strncpy(det, why_, sizeof det - 1); det[sizeof det - 1] = 0;
                 snprintf(why_, sizeof why_, "arc order rejected: release before T on %c (%s)", CH[s.chain], det);
+                why = why_;
+            }
+            continue;
+        }
+        const bool late = sq >= 0 && st >= 0.5 * (sa_[sq].t1 + sa_[sq].t2);
+        if (cut_ && viol > TOL_X) ps = 0.0;            // fallback: the sign of an infeasible plan waits for the insertion
+        if (cut_ && ps > TOL_SIGN && sq >= 0 && (late ? !sa_[sq].fix2 : !sa_[sq].fix1) && cuts++ < 2 * MAXSA) {
+            // eta < 0 at st (archive/tier2-newton): the arc holds the state on the bound where it would leave it.
+            // Cut it there on that side and solve the junctions again: they have more than one root, and the cut
+            // starts Newton next to the one with eta >= 0
+            StateArc& s = sa_[sq];
+            const double mid = 0.5 * (s.t1 + s.t2), eps = 1e-9 * T;
+            if (late) s.t2 = st < s.t2 - eps ? st : 0.5 * (mid + s.t2);
+            else s.t1 = st > s.t1 + eps ? st : 0.5 * (mid + s.t1);
+            if (!inner(y, cap)) {
+                strncpy(det, why_, sizeof det - 1); det[sizeof det - 1] = 0;
+                snprintf(why_, sizeof why_, "arc order rejected: cut at the multiplier sign (%s)", det);
                 why = why_;
             }
             continue;
@@ -1329,7 +1582,16 @@ struct StateSolver::Hom {
 __attribute__((noinline)) bool StateSolver::homotopy(StateResult& r) {
     Hom h{*this, r, 0};
     for (int i = 0; i < base_.n_; ++i) h.yb[i] = r.y[i];
-    const double s = continuation(h);
+    double y0[MAXN];
+    for (int i = 0; i < base_.n_; ++i) y0[i] = r.y[i];
+    double s = continuation(h);
+    if (s < 1.0 && its_ < cap_) {                       // stalled: once more from s = 0 with the cut at eta < 0
+        h.nb = 0;
+        for (int i = 0; i < base_.n_; ++i) h.yb[i] = y0[i];
+        cut_ = true;
+        s = continuation(h);
+        cut_ = false;
+    }
     if (s < 1.0) {
         stalled(r, s);
         h.back();

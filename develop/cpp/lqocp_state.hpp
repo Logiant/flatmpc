@@ -96,7 +96,9 @@ private:
     double* const Z_ = base_.xs_ + NY * NY;
     static_assert(sizeof(Solver::xs_) >= (NY * NY + (NY * (NY + 1) / 2 > NY * 2 * MAXSA ? NY * (NY + 1) / 2 : NY * 2 * MAXSA)) * sizeof(double), "tier-1 scratch too small");
     char why_[256];
-    int collapsed_;
+    int collapsed_;                  // junctions: arc that collapsed; -2: stalled at a solved plan
+    bool cut_ = false;               // run: cut an arc where eta < 0 (fallback after a stalled continuation)
+    mutable bool jump_ = false;      // check: lpsign takes every arc (a stalled junction Newton: jump junction?)
 
     struct Hom;                      // continuation client (lqocp_cont.hpp)
     bool run(StateResult& r);
@@ -129,7 +131,9 @@ private:
     void drop(int q, double* y, unsigned* gone);
     bool junctions(double* y, int max_its, int* outer);
     double scan(const double* c, const double* y, int j, int side, double tw, double* twout, double* ta, double* tb) const;
-    double check(const double* y, int* wc, int* ws, double* ta, double* tb, double* tw, double* psign, double* ppmp) const;
+    double check(const double* y, int* wc, int* ws, double* ta, double* tb, double* tw, double* psign, double* ppmp,
+                 int* sq, double* st) const;
+    bool lpsign(const double* c, const double* y, uint32_t dall, uint32_t dbad, const uint16_t* tch) const;
     void fill(StateResult& r) const;
     void vpoly(const uint16_t* S, const double* tau, int n, int a, const double* c, const double* y,
                const StateArc* sa, int nsa, double V[MAXM][4]) const;
