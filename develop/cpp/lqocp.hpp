@@ -136,7 +136,7 @@ private:
         uint16_t S[MAXARC_E];
         real tau[MAXJ_E];
         real F[MAXN];
-        real scale, D;
+        real scale, D, Dabs;         // Dabs: the size of D's terms (its rounding)
         int ndeg;
     };
     struct EnergyWork {
@@ -163,6 +163,7 @@ private:
     real free_[MAXN];
     real rhs_scale_;
     real R_;
+    real jmax_;                      // max of 1/2 v^T R v over the thrust box (HUGE_VAL: unbounded): T jmax_ >= any J
     bool identity_;
     bool general_;
     bool rI_, qf_;                   // R = I; terminal cost (else fixed endpoint)
@@ -224,14 +225,15 @@ private:
                                          const real* e, real* d) const;
     real vtol(real amp) const;
     void row_polys(uint16_t S, const real* c, real phi[2 * MAXM][4], bool has[2 * MAXM]) const;
-    bool lex_ok(uint16_t S, const real* c, real t, real phi[2 * MAXM][4], bool has[2 * MAXM]) const;
-    bool lex_set(const real* c, real t, uint16_t guess, uint16_t* out, real phi[2 * MAXM][4],
+    bool lex_ok(uint16_t S, const real* c, real t, uint16_t ev, real phi[2 * MAXM][4], bool has[2 * MAXM]) const;
+    bool lex_set(const real* c, real t, uint16_t ev, uint16_t guess, uint16_t* out, real phi[2 * MAXM][4],
                  bool has[2 * MAXM]) const;
     bool valid_set(uint16_t S) const;
     bool walk(const real* c, Eval& e);
     bool walk_box(const real* c, Eval& e);
     bool evaluate(const real* c, const real* mu, Eval& e);
-    real dual(const uint16_t* S, const real* tau, int n, const real* c, const real* mu) const;
+    real dual(const uint16_t* S, const real* tau, int n, const real* c, const real* mu, real* dabs = nullptr) const;
+    bool infeasible(real D, real Dabs, int narcs) const;
     real verify(const uint16_t* S, const real* tau, int n, const real* c, real* amp = nullptr) const;
 };
 

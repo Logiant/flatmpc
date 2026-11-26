@@ -262,6 +262,27 @@ bool Solver::setup_(const Problem& p) {
         if (finite_[k]) mx = fmax(mx, fabs(rhs_[k]));
     }
     R_ = 1.0 + mx;
+    // jmax_: 1/2 v^T R v is convex, so its max over the box {lo <= M v <= hi} is at a vertex v = M^-1 u
+    jmax_ = HUGE_VAL;
+    bool bounded = p.has_bounds != 0;
+    for (int r = 0; r < m_; ++r) bounded = bounded && isfinite(p.lo[r]) && isfinite(p.hi[r]);
+    if (bounded) {
+        real A[MAXM * MAXM], V[MAXM * (1 << MAXM)];
+        const int nv = 1 << m_;
+        for (int r = 0; r < m_; ++r) {
+            for (int j = 0; j < m_; ++j) A[r * MAXM + j] = p.M[r][j];
+            for (int k = 0; k < nv; ++k) V[r * nv + k] = (k >> r & 1) ? p.hi[r] : p.lo[r];
+        }
+        if (lu_solve(A, m_, MAXM, V, nv, nv)) {
+            jmax_ = 0.0;
+            for (int k = 0; k < nv; ++k) {
+                real v[MAXM], q = 0.0;
+                for (int j = 0; j < m_; ++j) v[j] = V[j * nv + k];
+                for (int j = 0; j < m_; ++j) q += 0.5 * v[j] * (rI_ ? v[j] : vR(j, v));
+                jmax_ = fmax(jmax_, q);
+            }
+        }
+    }
     identity_ = p.has_bounds != 0 && rI_;
     for (int r = 0; r < m_; ++r)
         for (int j = 0; j < m_; ++j)
@@ -943,13 +964,15 @@ void Solver::row_polys(uint16_t S, const real* c, real phi[2 * MAXM][4],
     }
 }
 
-bool Solver::lex_ok(uint16_t S, const real* c, real t, real phi[2 * MAXM][4], bool has[2 * MAXM]) const {
+// ev: rows of a walk event, zero at t by construction (tier-2 walk, 41efa04): their sign is that of the derivatives
+bool Solver::lex_ok(uint16_t S, const real* c, real t, uint16_t ev, real phi[2 * MAXM][4], bool has[2 * MAXM]) const {
     real b[4];
     row_polys(S, c, phi, has);
     const real T = (real)p_->T;
     for (int key = 0; key < 2 * m_; ++key) {
         if (!has[key]) continue;
         shift(phi[key], 4, t, b);
+        if ((ev >> key) & 1u) b[0] = 0.0;
         const real tol = 1e-12 * TS * (pscale(b, 4, T) + R_);
         for (int i = 0; i < 4; ++i) {
             if (fabs(b[i]) * ipow(T, i) > tol) {
@@ -961,11 +984,11 @@ bool Solver::lex_ok(uint16_t S, const real* c, real t, real phi[2 * MAXM][4], bo
     return true;
 }
 
-bool Solver::lex_set(const real* c, real t, uint16_t guess, uint16_t* out, real phi[2 * MAXM][4],
+bool Solver::lex_set(const real* c, real t, uint16_t ev, uint16_t guess, uint16_t* out, real phi[2 * MAXM][4],
                      bool has[2 * MAXM]) const {
-    if (guess != 0xFFFFu && valid_set(guess) && lex_ok(guess, c, t, phi, has)) { *out = guess; return true; }
+    if (guess != 0xFFFFu && valid_set(guess) && lex_ok(guess, c, t, ev, phi, has)) { *out = guess; return true; }
     for (int i = 0; i < nsets_; ++i)
-        if (lex_ok(sets_[i], c, t, phi, has)) { *out = sets_[i]; return true; }
+        if (lex_ok(sets_[i], c, t, ev, phi, has)) { *out = sets_[i]; return true; }
     return false;
 }
 
@@ -977,28 +1000,33 @@ bool Solver::walk(const real* c, Eval& e) {
     real (*const phi)[4] = reinterpret_cast<real (*)[4]>(G_);
     bool has[2 * MAXM];
     uint16_t S;
-    if (!lex_set(c, 0.0, 0, &S, phi, has)) return false;   // (a) initial set: one-sided KKT at 0+
+    if (!lex_set(c, 0.0, 0, 0, &S, phi, has)) return false;   // (a) initial set: one-sided KKT at 0+
     int ns = 0, stall = 0;
     e.S[ns++] = S;
     real t = 0.0;
+    uint16_t zev = 0;                                // rows of the last event: zero at t by construction
     for (;;) {
         const real L = T - t;
         row_polys(S, c, phi, has);
         real rootk[2 * MAXM];
         bool simplek[2 * MAXM], evk[2 * MAXM];
         real s1 = HUGE_VAL;
+        uint16_t imm = 0;                            // rows already beyond tolerance at t: not zero there
         for (int key = 0; key < 2 * m_; ++key) {
             evk[key] = false;
             if (!has[key]) continue;
             real b[4], red[4];
             int k;
             shift(phi[key], 4, t, b);
+            // else a new multiplier's root error, amplified by nearly dependent rows (B near T*), stalls the walk
+            if ((zev >> key) & 1u) b[0] = 0.0;
             const real tol = 1e-12 * TS * (pscale(b, 4, T) + R_);   // as lex_ok: no stall on a tiny last arc
             const int rl = strip(b, 4, L, tol, red, &k);
             if (rl == 0) continue;
             if (red[0] > 0) {                            // inconsistent at t+: degenerate event
                 evk[key] = true; rootk[key] = 0.0; simplek[key] = false;
                 s1 = 0.0;
+                if (!k) imm |= (uint16_t)(1u << key);
                 continue;
             }
             Cross cr;
@@ -1017,6 +1045,7 @@ bool Solver::walk(const real* c, Eval& e) {
                 ++ngroup; gkey = key; gsimple = simplek[key]; gmask |= (uint16_t)(1u << key);
             }
         t += s1;
+        zev = (uint16_t)(gmask & ~imm);
         uint16_t Snew = 0xFFFFu;
         if (ngroup == 1 && gsimple) {
             // control continuity: add the row whose gap hit 0 / drop the row whose mu hit 0
@@ -1026,7 +1055,7 @@ bool Solver::walk(const real* c, Eval& e) {
         if (Snew == 0xFFFFu) {                           // (b) degenerate event
             ++e.ndeg;
             const uint16_t guess = (uint16_t)(S ^ gmask);
-            if (!lex_set(c, t, valid_set(guess) ? guess : 0xFFFFu, &Snew, phi, has)) return false;
+            if (!lex_set(c, t, zev, valid_set(guess) ? guess : 0xFFFFu, &Snew, phi, has)) return false;
         }
         if (Snew != S) {
             if (ns >= MAXARC_E) { capfail_ = true; return false; }
@@ -1095,13 +1124,14 @@ bool Solver::walk_box(const real* c, Eval& e) {
     return sets_ok(e.S, ns);
 }
 
-real Solver::dual(const uint16_t* S, const real* tau, int n, const real* c, const real* mu) const {
-    real val = 0.0;
+real Solver::dual(const uint16_t* S, const real* tau, int n, const real* c, const real* mu, real* dabs) const {
+    real val = 0.0, ab = 0.0;
     for (int i = 0; i < n_ && qf_; ++i) val += mu[i] * (g_[i] - 0.5 * mu[i]);
     for (int i = 0; i < n_ && !qf_; ++i) {
-        real nu = 0.0;
-        for (int j = 0; j < n_; ++j) nu += Linv_[i * MAXN + j] * c[j];
+        real nu = 0.0, na = 0.0;
+        for (int j = 0; j < n_; ++j) { nu += Linv_[i * MAXN + j] * c[j]; na += fabs(Linv_[i * MAXN + j] * c[j]); }
         val += nu * ((real)p_->xf[i] - free_[i]);
+        ab += na * fabs((real)p_->xf[i] - free_[i]);
     }
     real w[MAXM], v[MAXM], P[MAXM][MAXM], q[MAXM];
     for (int a = 0; a < n; ++a) {
@@ -1113,12 +1143,25 @@ real Solver::dual(const uint16_t* S, const real* tau, int n, const real* c, cons
             const real t = t0 + hw * (GL_X[g] + 1.0);
             w_of(c, t, w);
             v_on(P, q, c, t, v);
-            real s = 0.0;
-            for (int j = 0; j < m_; ++j) s += 0.5 * v[j] * (rI_ ? v[j] : vR(j, v)) - w[j] * v[j];
+            real s = 0.0, sa = 0.0;
+            for (int j = 0; j < m_; ++j) {
+                const real e = 0.5 * v[j] * (rI_ ? v[j] : vR(j, v));
+                s += e - w[j] * v[j];
+                sa += fabs(e) + fabs(w[j] * v[j]);
+            }
             val += GL_W[g] * hw * s;
+            ab += GL_W[g] * hw * sa;
         }
     }
+    if (dabs) *dabs = ab;
     return val;
+}
+
+// Weak duality: a feasible problem has D <= J* <= T jmax_. D above that by more than its rounding (a sum of
+// n_ + 4 narcs (2 m_ + 1) terms of total size Dabs) proves that no feasible input exists (exact, no threshold).
+bool Solver::infeasible(real D, real Dabs, int narcs) const {
+    const real J = (real)p_->T * jmax_;
+    return D - J > (n_ + 4 * narcs * (2 * m_ + 1) + 2) * EPS * (Dabs + J);
 }
 
 bool Solver::evaluate(const real* c, const real* mu, Eval& e) {
@@ -1148,7 +1191,7 @@ bool Solver::evaluate(const real* c, const real* mu, Eval& e) {
         sc = rel > 0.0 ? Fn / rel : 1.0;
     }
     e.scale = sc;
-    e.D = dual(e.S, e.tau, e.narcs, c, mu);
+    e.D = dual(e.S, e.tau, e.narcs, c, mu, &e.Dabs);
     return true;
 }
 
@@ -1164,6 +1207,7 @@ real Solver::verify(const uint16_t* S, const real* tau, int n, const real* c, re
             if (!has[key]) continue;
             a_max = fmax(a_max, pscale(phi[key], 4, (real)p_->T));
             shift(phi[key], 4, t0, b);
+            if (a && ((S[a] ^ S[a - 1]) >> key & 1u)) b[0] = fmin(b[0], (real)0.0);   // row of the event at t0: zero there
             real w = fmax(b[0], pval(b, 4, L));
             for (int i = 1; i < 4; ++i) d[i - 1] = i * b[i];
             const int nc = roots_le2(d, 3, cr);
@@ -1175,8 +1219,12 @@ real Solver::verify(const uint16_t* S, const real* tau, int n, const real* c, re
     }
     if (amp) *amp = a_max;
     // a box row's value is in input units: its violation may not grow with amp (cancelling huge polynomial terms,
-    // e.g. tiny R: 1e-5 accepted); above 1e-7 R_ (float 1e-4 R_) the plan is rejected whatever vtol(amp) is
-    return box > (sizeof(real) == 4 ? 1e-4 : 1e-7) * R_ ? HUGE_VAL : worst;
+    // e.g. tiny R: 1e-5 accepted); above 1e-7 R_ (float 1e-4 R_) the plan is rejected whatever vtol(amp) is.
+    // Double: the plan's input is known only to EPS amp (one rounding of its largest term), charged to the box too;
+    // this bounds amp by the box acceptance (the old |c| <= 1e6 c0 role). Float: not charged, its 1e-4 R_ is below
+    // FLT_EPS amp for amp > 840 R_ (would reject 27% of the fscan float accepts): float acceptance needs its own spec
+    const real rnd = sizeof(real) == 4 ? 0.0 : EPS * a_max;
+    return box + rnd > (sizeof(real) == 4 ? 1e-4 : 1e-7) * R_ ? HUGE_VAL : worst;
 }
 
 // c(t) -> c(t + dt) per chain (exact Taylor shift); y = Lm^-1 c (nu), with Qf the mu of nu = Cf^T mu (Cf upper
@@ -1245,8 +1293,6 @@ bool Solver::solve_newton(Result& R, int warm_its) {
         const uint16_t S0 = 0;                      // unconstrained start
         if (!solve_c(&S0, nullptr, 1, c)) return false;
     }
-    real c0 = 1.0;
-    for (int i = 0; i < n_; ++i) c0 = fmax(c0, 1.0 + fabs(c[i]));
     const char* why = "event walk failed";
     int cur = 0;
     bool ok = evaluate(c, mu, ew_.ev[cur]);
@@ -1260,11 +1306,7 @@ bool Solver::solve_newton(Result& R, int warm_its) {
         for (int i = 0; i < n_; ++i) { Fn = fmax(Fn, fabs(E.F[i])); F2 += E.F[i] * E.F[i]; }
         // dual unbounded (infeasible problem): the iterates c diverge. Tested before the stop: E.scale
         // grows with |c|, so a diverging iterate can meet the relative stop with an O(1) endpoint miss.
-        if (!qf_) {
-            real cm = 0.0;
-            for (int i = 0; i < n_; ++i) cm = fmax(cm, fabs(c[i]));
-            if (cm > 1e6 * c0) { why = INFEAS; break; }
-        }
+        if (!qf_ && infeasible(E.D, E.Dabs, E.narcs)) { why = INFEAS; break; }
         if (Fn <= rtol * E.scale) { conv = true; break; }
         if (its >= max_its) { why = "iteration cap"; break; }
         ++its;
@@ -1349,11 +1391,8 @@ bool Solver::solve_newton(Result& R, int warm_its) {
     }
     R.newton_iterations = its;
     R.iterations += its;                          // plus a failed reduced attempt's iterations
-    if (!conv && !qf_ && !capfail_) {               // walk / line search failed on a diverging dual
-        double cm = 0.0;
-        for (int i = 0; i < n_; ++i) cm = fmax(cm, fabs(c[i]));
-        if (cm > 1e6 * c0) why = INFEAS;
-    }
+    if (!conv && !qf_ && !capfail_ && ok && infeasible(ew_.ev[cur].D, ew_.ev[cur].Dabs, ew_.ev[cur].narcs))
+        why = INFEAS;                                 // walk / line search failed on a diverging dual
     if (!ok) { R.failure = capfail_ ? CAPFAIL : why; return false; }
     const Eval& E = ew_.ev[cur];
     R.narcs = E.narcs;
@@ -1372,9 +1411,9 @@ bool Solver::solve_newton(Result& R, int warm_its) {
     return conv;
 }
 
-// the walk's own event tolerance: round-off of the monomial row polynomials, relative to their amplitude
-// (bounded through |c| <= 1e6 c0 by the divergence test); never tighter than the old absolute 1e-9 R_
-real Solver::vtol(real amp) const { return fmax(1e-9 * R_, 1e-12 * TS * (amp + R_)); }
+// the walk's own event tolerance (the Newton stop's relative accuracy times the row amplitude): the walk ignores
+// sign changes below it, so it is the accuracy the plan's rows have. Box rows are also held to 1e-7 R_ in verify.
+real Solver::vtol(real amp) const { return 1e-12 * TS * (amp + R_); }
 
 // Switch between arcs SL and SR (one row toggles): the row's gap on the side where it is
 // inactive, g(t) = e^T w(t) + g0. Control continuity at the switch <=> g = 0. gd = dg/dt,
@@ -1411,14 +1450,14 @@ real Solver::gapk(uint16_t SL, uint16_t SR, real t, const real* c, real* e, real
 // (then R is the solution); else R.iterations = the reduced iterations spent, R otherwise unchanged.
 bool Solver::try_reduced(Result& R, int max_its) {
     if (!solve_reduced(R, max_its, &R.iterations)) return false;
-    if (!qf_) {                                   // diverging dual (infeasible): as solve_newton's test
-        real c0 = 1.0, cm = 0.0;
-        for (int i = 0; i < n_; ++i) { c0 = fmax(c0, 1.0 + fabs(R.c[i])); cm = fmax(cm, fabs(ew_.ev[1].F[i])); }
-        if (cm > 1e6 * c0) return false;
-    }
     real amp;
     const real viol = verify(R.S, ew_.ev[1].tau, R.narcs, ew_.ev[1].F, &amp);
     if (!(viol <= vtol(amp))) return false;
+    if (!qf_) {                                   // verified: the arcs are v(c), so D is the dual value (as solve_newton)
+        real Dabs;
+        const real D = dual(R.S, ew_.ev[1].tau, R.narcs, ew_.ev[1].F, nullptr, &Dabs);
+        if (infeasible(D, Dabs, R.narcs)) return false;
+    }
     for (int i = 0; i < n_; ++i) { R.c[i] = ew_.ev[1].F[i]; if (qf_) R.mu[i] = ew_.ev[0].F[i]; }
     for (int k = 0; k + 1 < R.narcs; ++k) R.tau[k] = ew_.ev[1].tau[k];
     R.newton_iterations = R.outer_iterations = R.degenerate_events = 0;
