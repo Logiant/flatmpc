@@ -1,7 +1,7 @@
 """Indirect (motion-primitive) solver for fixed-time transfers of integrator chains.
 
-Energy cost (Q=0, R=I, fixed endpoint): methods "newton" (default, Newton on the 12 polynomial
-coefficients, exact cubic events) and "tau" (junction-time Newton). General LQ cost
+Energy cost (Q=0, R=I, fixed endpoint): method "newton" (Newton on the 12 polynomial
+coefficients, exact cubic events). General LQ cost
 (Q, R, Qf; spec Revision 3): "newton" (default) = stable-basis motion primitives with Newton on
 the junction times (NOTES.md section 9); "riccati" = the earlier semismooth Newton (PDAS) with a
 Riccati-sweep linear BVP and continuation in the bound scale (NOTES.md section 8). For the energy
@@ -140,37 +140,6 @@ class _Model:
         self._aff[S] = res
         return res
 
-    def project(self, w, guess=None):
-        """argmin_v 1/2|v-w|^2 s.t. lo <= M v <= hi (= pointwise Hamiltonian minimiser).
-        Exact enumeration of the 3^m active sets (KKT check), trying `guess` first."""
-        cands = self.sets if guess is None else [guess] + self.sets
-        tol = 1e-12
-        for S in cands:
-            if len(S) == 0:
-                v = w
-            else:
-                Aa = self.rows[list(S)]
-                G = Aa @ Aa.T
-                try:
-                    mu = np.linalg.solve(G, Aa @ w - self.rhs[list(S)])
-                except np.linalg.LinAlgError:
-                    continue
-                if np.any(mu < -tol * (1 + np.abs(mu).max())):
-                    continue
-                v = w - Aa.T @ mu
-            g = self.rows @ v - self.rhs
-            scale = 1e-10 * (1 + np.abs(self.rhs[np.isfinite(self.rhs)]).max(initial=0))
-            ok = True
-            for kk in range(len(g)):
-                if kk in S or not np.isfinite(self.rhs[kk]):
-                    continue
-                if g[kk] > scale:
-                    ok = False
-                    break
-            if ok:
-                return v, S
-        return w, ()  # unreachable for a nonempty polytope
-
 
 class _Problem:
     def __init__(self, model, x0, xf, T):
@@ -207,88 +176,6 @@ class _Problem:
     def v_on(self, S, c, t):
         P, q = self.md.affine(S)
         return P @ (self.md.W(t) @ c) + q
-
-    def detect(self, c, N=2000):
-        """Active-set sequence and approximate switch times from the projection of w(t)."""
-        md = self.md
-        ts = np.linspace(0.0, self.T, N + 1)
-        seq, tau, S = [], [], None
-        for t in ts:
-            _, Snew = md.project(md.W(t) @ c, S)
-            Snew = tuple(sorted(Snew))
-            if S is None:
-                seq.append(Snew)
-            elif Snew != S:
-                seq.append(Snew)
-                tau.append(t - 0.5 * self.T / N)
-            S = Snew
-        return seq, np.array(tau)
-
-    def junction_res(self, seq, tau, c):
-        md = self.md
-        res = []
-        for k, t in enumerate(tau):
-            L, R = set(seq[k]), set(seq[k + 1])
-            for key in sorted(L ^ R):
-                side = seq[k] if key in R else seq[k + 1]   # side on which `key` is inactive
-                v = self.v_on(side, c, t)
-                res.append(md.rows[key] @ v - md.rhs[key])
-        return np.array(res)
-
-    def residual(self, seq, tau):
-        c = self.solve_c(self.arcs(seq, tau))
-        return self.junction_res(seq, tau, c), c
-
-    def pmp_violation(self, seq, tau, c, N=2000):
-        """max |v_arc(t) - Proj(w(t))| on a grid: zero iff the arc structure minimises H."""
-        md = self.md
-        arcs = self.arcs(seq, tau)
-        err, ai = 0.0, 0
-        for t in np.linspace(0.0, self.T, N + 1):
-            while ai < len(arcs) - 1 and t > arcs[ai][1]:
-                ai += 1
-            v_arc = self.v_on(arcs[ai][2], c, t)
-            v_opt, _ = md.project(md.W(t) @ c, arcs[ai][2])
-            err = max(err, np.abs(v_arc - v_opt).max())
-        return err
-
-    def newton_tau(self, seq, tau, tol=1e-12, maxit=50):
-        """Gauss-Newton on the junction times (sequence fixed), inner linear solve for c."""
-        T = self.T
-        tau = np.array(tau, float)
-        nj = len(tau)
-        r, c = self.residual(seq, tau)
-        it = 0
-        if nj == 0:
-            return tau, c, 0, True, 0.0
-        gap = 1e-9 * T
-        for it in range(1, maxit + 1):
-            if np.abs(r).max() < tol:
-                return tau, c, it - 1, True, np.abs(r).max()
-            J = np.zeros((len(r), nj))
-            for i in range(nj):
-                h = 1e-7 * max(1.0, T)
-                tp = tau.copy()
-                tp[i] += h
-                tm = tau.copy()
-                tm[i] -= h
-                J[:, i] = (self.residual(seq, tp)[0] - self.residual(seq, tm)[0]) / (2 * h)
-            step = np.linalg.lstsq(J, -r, rcond=None)[0]
-            alpha, accepted = 1.0, False
-            nr0 = np.linalg.norm(r)
-            while alpha > 1e-6:
-                tn = tau + alpha * step
-                e = np.concatenate([[0.0], tn, [T]])
-                if np.all(np.diff(e) > gap):
-                    rn, cn = self.residual(seq, tn)
-                    if np.linalg.norm(rn) < (1 - 1e-4 * alpha) * nr0 or np.linalg.norm(rn) < tol:
-                        accepted = True
-                        break
-                alpha *= 0.5
-            if not accepted:
-                return tau, c, it, False, np.abs(r).max()
-            tau, r, c = tn, rn, cn
-        return tau, c, maxit, bool(np.abs(r).max() < tol), np.abs(r).max()
 
 
 class Solution:
@@ -347,80 +234,13 @@ class Solution:
         return np.array([self._x1(ti) for ti in np.ravel(t)])
 
 
-def _solve_tau(prob, max_outer=50, tol=1e-12, time_limit=30.0, max_newton=500):
-    md = prob.md
-    info_fail = None
-    ectx = _NewtonCtx(prob)
-
-    def detect(c):
-        # exact (grid-free) event walk of the newton method; grid only as a fallback
-        wk = ectx.walk(c)
-        if wk is None:
-            return prob.detect(c)
-        return list(wk[0]), np.array(wk[1])
-
-    # 1) unconstrained primitive: one linear BC solve
-    seq, tau = [()], np.zeros(0)
-    c = prob.solve_c(prob.arcs(seq, tau))
-    iters, newton_its, outer, converged, res = 1, 0, 0, True, 0.0
-    if md.has_bounds:
-        converged = False
-        history = set()
-        t_start = time.perf_counter()
-        c0n = 1.0 + np.abs(c).max()
-        for outer in range(1, max_outer + 1):
-            # early exits: wall-clock cap, and a diverging w (dual unbounded = infeasible)
-            if time.perf_counter() - t_start > time_limit or newton_its > max_newton:
-                info_fail = "iteration/time limit"
-                break
-            if np.abs(c).max() > 1e6 * c0n:
-                info_fail = "infeasible (switching polynomial diverges: dual unbounded)"
-                break
-            # 2) read the active-set sequence off the pointwise H-minimiser of the current w(t)
-            seq_d, tau_d = detect(c)
-            if len(seq_d) == 1 and seq_d[0] == () and outer == 1:
-                converged = True       # unconstrained optimum is feasible
-                seq, tau = seq_d, tau_d
-                break
-            # 3) junction-time Newton for this sequence (linear solve for c inside)
-            tau_n, c_n, k, ok, res = prob.newton_tau(seq_d, tau_d, tol=tol)
-            newton_its += k
-            iters += 1 + k
-            if ok:
-                seq, tau, c = seq_d, tau_n, c_n
-                if ectx.verify(prob.arcs(seq, tau), c) <= 1e-9 * ectx.R:
-                    converged = True
-                    break
-            else:
-                # Newton failed for this sequence: take the plain "fix junctions, solve c" step
-                # (fixed-point update of w), then re-detect the sequence from the new w.
-                key = (tuple(seq_d), tuple(np.round(tau_d, 6)))
-                c = prob.solve_c(prob.arcs(seq_d, tau_d))
-                if key in history:
-                    break
-                history.add(key)
-                seq, tau = seq_d, tau_d
-    info = {
-        "iterations": int(iters),
-        "converged": bool(converged),
-        "outer_iterations": int(outer),
-        "newton_iterations": int(newton_its),
-        "junction_residual": float(res),
-        "sequence": [list(S) for S in seq],
-    }
-    if not converged and info_fail:
-        info["failure"] = info_fail
-    return seq, tau, c, info
-
-
 def solve(A, B, x0, xf, T, Umap=None, u_min=None, u_max=None, Q=None, R=None, Qf=None,
-          method="newton", max_outer=50, tol=1e-12):
+          method="newton"):
     """method="newton" (default): Newton with exact, grid-free event detection.
-    method="tau": junction-time Newton with grid-detected sequence (energy cost only).
     Q=None -> 0, R=None -> I, Qf=None -> fixed endpoint s(T) = xf."""
     t_start = time.perf_counter()
-    if method not in ("tau", "newton", "riccati"):
-        raise ValueError("method must be 'newton', 'tau' or 'riccati'")
+    if method not in ("newton", "riccati"):
+        raise ValueError("method must be 'newton' or 'riccati'")
     orders, offs = _detect_chains(A, B)
     m = len(orders)
     n = int(sum(orders))
@@ -434,8 +254,6 @@ def solve(A, B, x0, xf, T, Umap=None, u_min=None, u_max=None, Q=None, R=None, Qf
     Rm = np.eye(m) if R is None else np.asarray(R, float)
     energy = (not np.any(Qm)) and np.array_equal(Rm, np.eye(m)) and Qf is None
     if not energy:
-        if method == "tau":
-            raise NotImplementedError("method='tau' supports only the energy cost (Q=0, R=I, Qf=None)")
         solver = _solve_stable if method == "newton" else _solve_general
         sol = solver(np.asarray(A, float), np.asarray(B, float), x0, xf, T, M, lo, hi,
                              0.5 * (Qm + Qm.T), 0.5 * (Rm + Rm.T),
@@ -447,10 +265,7 @@ def solve(A, B, x0, xf, T, Umap=None, u_min=None, u_max=None, Q=None, R=None, Qf
     prob = _Problem(md, x0, xf, T)
     if method == "riccati":
         method = "newton"            # energy cost: riccati is not used, the polynomial path is
-    if method == "tau":
-        seq, tau, c, info = _solve_tau(prob, max_outer=max_outer, tol=tol)
-    else:
-        seq, tau, c, info = _solve_newton(prob)
+    seq, tau, c, info = _solve_newton(prob)
     info["method"] = method
     info["solve_time_s"] = time.perf_counter() - t_start
     return Solution(prob, seq, tau, c, info)

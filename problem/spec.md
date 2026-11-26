@@ -41,14 +41,13 @@ Umap=None means the identity (bounds directly on the input). Solution attributes
   - prints one JSON line to stdout:
     {"cost": J, "switch_times": [...], "iterations": k, "solve_time_us": s, "converged": true/false}
 
-## Revision 2 (adds a second solver mode and file-based problems)
-Python: `solve(..., method="tau")`. `method` is a keyword argument with default "tau":
-- "tau": the existing junction-time solver.
+## Revision 2 (Newton solver mode and file-based problems)
+Python: `solve(..., method="newton")`, a keyword argument:
 - "newton": Newton's method on the 12 polynomial coefficients c (dual / costate shooting) with
   exact polynomial-root event detection and no time grid.
-Both methods return the same `Solution` interface. `info` must also contain "method".
+`info` must also contain "method".
 
-C++: `lqocp_cli <case> <out.csv> [method]`, where method is `tau` (default) or `newton`.
+C++: `lqocp_cli <case> <out.csv> [method]`, where method is `newton` (default).
 `<case>` may be A, B, or a path to a problem file in this plain-text format
 (whitespace-separated numbers; `#` starts a comment line):
 
@@ -64,8 +63,7 @@ The dynamics are always the flat model (Af, Bf) from quad_problem.py.
 The JSON line must also contain "method".
 
 ## Revision 3 (general LQ cost via the Hamiltonian and Thm 1 / Thm 2; Newton is the default)
-Default method is now "newton" in both Python (`method="newton"`) and the CLI (third argument omitted -> newton).
-"tau" remains available, energy-cost only.
+Default method is "newton" in both Python (`method="newton"`) and the CLI (third argument omitted -> newton).
 
 Generalized problem (flat coordinates, s' = Af s + Bf v):
 
@@ -75,7 +73,7 @@ Generalized problem (flat coordinates, s' = Af s + Bf v):
 
 Python: `solve(A, B, x0, xf, T, Umap=None, u_min=None, u_max=None, Q=None, R=None, Qf=None, method="newton")`.
 Q=None means 0, R=None means I, Qf=None means fixed endpoint. The old energy problem is Q=0, R=I, Qf=None,
-and its results must not change. "tau" may raise NotImplementedError when Q or Qf is given or R != I.
+and its results must not change.
 `cost` is J as defined above.
 
 New shared case `quad_problem.TINY_CASE`: the TinyMPC 20 Hz hover example's Q, R (mapped exactly to flat

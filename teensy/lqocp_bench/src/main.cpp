@@ -177,13 +177,13 @@ void loop() {
 #elif defined(BENCH_ENERGY)
     for (int k = 0; k < 2; ++k) {
         const uint32_t t0 = micros();
-        bool ok = es.setup(BENCH_PROB[k]) && es.solve(er, lqocp::METHOD_NEWTON);
+        bool ok = es.setup(BENCH_PROB[k]) && es.solve(er);
         const uint32_t t1 = micros();
         report(k ? "B" : "A", er.cost, er.iterations, t1 - t0, ok, er.narcs - 1);
     }
     {
         const uint32_t t0 = micros();
-        bool ok = es.setup(TQ0) && es.solve(er, lqocp::METHOD_NEWTON);   // TinyMPC's own Q=0 terminal weight
+        bool ok = es.setup(TQ0) && es.solve(er);   // TinyMPC's own Q=0 terminal weight
         const uint32_t t1 = micros();
         report("TINY_Q0", er.cost, er.iterations, t1 - t0, ok, er.narcs - 1);
         closed_loop(100);

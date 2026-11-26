@@ -1,4 +1,4 @@
-"""Black-box validation of the developer's solver (Python solve() and C++ lqocp_cli), both methods.
+"""Black-box validation of the developer's solver (Python solve() and C++ lqocp_cli).
 
 Cases: A, B (quad_problem), and validator cases S (sliver arc), G (tangential touch),
 M (many switches), I (infeasible) from validate/cases/*.txt.
@@ -33,16 +33,16 @@ TOL_SW_B = 1e-4        # C (Umap=None case): switch times vs QP reference.
 TOL_SW_EXACT = 1e-6    # S, G, M: switch times vs exact reference (ref error ~1e-12 s).
 TOL_PYCPP = 1e-6       # rel. to VS / XS on the CSV grid (allows CSV text rounding).
 TOL_PYCPP_COST = 1e-9  # rel.
-TOL_SW_AGREE = 1e-6    # s; py vs cpp and newton vs tau switch times.
+TOL_SW_AGREE = 1e-6    # s; py vs cpp switch times.
 TIMEOUT_INFEAS = 120   # s; infeasible case must return within this.
 
 IMPLS = ["py", "cpp"]
-METHODS = ["tau", "newton"]
-CASES = ["A", "B", "S", "G", "M", "S_old", "G_old", "M_old"]   # energy cases: both methods
+METHODS = ["newton"]
+CASES = ["A", "B", "S", "G", "M", "S_old", "G_old", "M_old"]   # energy cases
 # Revision 4: S/G/M/I use the corrected Umap; *_old are the earlier cases (pre-fix Umap embedded
 # numerically = a synthetic polytope), kept as hard tests. B now has |u|<=0.5 and its reference is
 # the exact PMP-certified solution (cases.py), cross-checked by the QP study in reference.py.
-LQ_CASES = ["TINY", "L1", "L2"]            # Revision 3 general LQ cost: newton only ('tau' is energy-only)
+LQ_CASES = ["TINY", "L1", "L2"]            # Revision 3 general LQ cost
 TOL_TRAJ_TINY_SAFETY = 3.0                 # TINY: trajectory tol = 3x the QP reference's estimated error
 TOL_SW_TINY_SAFETY = 10.0                  # TINY: switch tol = max(TOL_SW_EXACT, 10x ref switch error est.)
 EXACT = ("A", "S", "G", "M")
@@ -138,53 +138,13 @@ def _sw(sol):
 
 
 # ------------------------------------------------------------------------------------------------
-# switch-time matching with an explicit, narrow exemption for arcs shorter than T/2000
+# switch-time matching
 # ------------------------------------------------------------------------------------------------
-def _match(dev, targets):
-    """targets: list of (lo, hi). One-to-one in order."""
-    if len(dev) != len(targets):
-        return False, np.inf
-    err = 0.0
-    for s, (lo, hi) in zip(dev, targets):
-        err = max(err, max(lo - s, s - hi, 0.0))
-    return err == 0.0, err
-
-
 def compare_switches(dev, r, tol):
-    """Returns (status, info). status: 'match' | 'sliver_miss' | 'mismatch'.
-    'sliver_miss' = dev matches the reference after collapsing every arc shorter than T/2000
-    (both of its switches removed; if the patterns on either side differ, ONE switch anywhere
-    inside the arc is expected instead)."""
+    """Returns (status, info). status: 'match' | 'mismatch' (one-to-one in order, each within tol)."""
     sw = list(r.sw)
-    ok, _ = _match(dev, [(s - tol, s + tol) for s in sw])
-    if ok:
-        return "match", dict(max_err=float(np.max(np.abs(np.array(dev) - np.array(sw)))) if sw else 0.0)
-    if r.arcs is None:
-        err = float(np.max(np.abs(np.array(dev) - np.array(sw)))) if len(dev) == len(sw) and sw else np.inf
-        return "mismatch", dict(max_err=err)
-    thr = r.T / 2000
-    arcs = list(r.arcs)
-    n = len(arcs)
-    # event e (0..n-2) is the switch between arcs[e] and arcs[e+1], at arcs[e][1]
-    removed, fuzzy, slivers = set(), [], []
-    for j, (a_, b_, p_) in enumerate(arcs):
-        if b_ - a_ >= thr or n == 1:
-            continue
-        slivers.append(b_ - a_)
-        if 0 < j < n - 1:
-            removed.update({j - 1, j})
-            if list(arcs[j - 1][2]) != list(arcs[j + 1][2]):
-                fuzzy.append((a_ - tol, b_ + tol))
-        elif j == 0:
-            removed.add(0)
-        else:
-            removed.add(n - 2)
-    targets = sorted([(arcs[e][1] - tol, arcs[e][1] + tol) for e in range(n - 1) if e not in removed] + fuzzy)
-    ok, err = _match(dev, targets)
-    if slivers and ok:
-        return "sliver_miss", dict(slivers=slivers)
-    err = float(np.max(np.abs(np.array(dev) - np.array(sw)))) if len(dev) == len(sw) and sw else np.inf
-    return "mismatch", dict(max_err=err)
+    err = float(np.max(np.abs(np.array(dev) - np.array(sw)))) if len(dev) == len(sw) and sw else (0.0 if dev == sw else np.inf)
+    return ("match" if err <= tol else "mismatch"), dict(max_err=err)
 
 
 # ================================================================================================
@@ -524,15 +484,12 @@ def test_switch_times(impl, method, case, refs, record):
         record(k, v)
     if status == "match":
         return
-    if status == "sliver_miss" and method == "tau":
-        pytest.xfail(f"EXPECTED LIMITATION (tau): missed arc(s) shorter than T/2000 of length "
-                     f"{', '.join(f'{v:.2e}' for v in info['slivers'])} s; other switches match")
     assert False, (f"{len(sw)} switch times {[round(v, 7) for v in sw]} vs ref ({len(r.sw)}) "
-                   f"{[round(v, 7) for v in r.sw]}" + (" [matches only with slivers removed]" if status == "sliver_miss" else ""))
+                   f"{[round(v, 7) for v in r.sw]}")
 
 
 # ---- agreement checks ---------------------------------------------------------------------------
-def _agree(a, b, r, record, allow_sliver=False):
+def _agree(a, b, r, record):
     t = b.t_grid if not b.continuous else (a.t_grid if not a.continuous else r.tgrid)
     ua = a.u(t) if a.continuous else a.U_grid
     ub = b.u(t) if b.continuous else b.U_grid
@@ -562,21 +519,6 @@ def test_py_vs_cpp(method, case, refs, record):
     c_ = get_solution("cpp", case, method)
     msgs, _ = _agree(p, c_, get_ref(refs, case), record)
     assert not msgs, "py vs cpp disagree: " + ", ".join(msgs)
-
-
-@pytest.mark.parametrize("impl,case", [pytest.param(i, c, id=f"{i}-{c}") for i in IMPLS for c in CASES])
-def test_newton_vs_tau(impl, case, refs, record):
-    a = get_solution(impl, case, "tau")
-    b = get_solution(impl, case, "newton")
-    r = get_ref(refs, case)
-    msgs, sw_bad = _agree(a, b, r, record)
-    if msgs == [f for f in msgs if f.startswith("switch")] and sw_bad:
-        # only the switch lists differ: expected limitation iff tau is a sliver-miss and newton matches
-        st_t, _ = compare_switches(_sw(a), r, TOL_SW_EXACT)
-        st_n, _ = compare_switches(_sw(b), r, TOL_SW_EXACT)
-        if st_t == "sliver_miss" and st_n == "match":
-            pytest.xfail("EXPECTED LIMITATION (tau): differs from newton only by missed sliver arc(s)")
-    assert not msgs, "newton vs tau disagree: " + ", ".join(msgs)
 
 
 # ---- infeasible case ----------------------------------------------------------------------------
@@ -648,36 +590,6 @@ def test_py_umap_none_bounds(method, refs, record):
     tol_sw = max(TOL_SW_B, 10.0 * float(refs["C_sw_err"]))
     if not esw <= tol_sw: msgs.append(f"switch times {np.round(sw, 6)} vs ref {np.round(swr, 6)}")
     assert not msgs, "; ".join(msgs)
-
-
-# ---- Revision 3: 'tau' on a general-cost case ------------------------------------------------------
-@pytest.mark.parametrize("impl", IMPLS)
-def test_lq_tau_behaviour(impl, refs, record):
-    """'tau' is energy-only. Python may raise NotImplementedError; any other outcome must be correct.
-    C++: must not crash; if it reports converged=true, its cost must match the TINY reference."""
-    from conftest import rev3_supported
-    if not (harness.py_available() if impl == "py" else harness.cpp_available()):
-        pytest.skip("implementation not found")
-    if not rev3_supported(impl):
-        pytest.skip(f"{impl}: Revision-3 general cost / TINY not available yet")
-    Jr = refs["lq"]["TINY"]["cost"]
-    if impl == "py":
-        try:
-            s = harness.run_python("TINY", "tau")
-        except NotImplementedError as e:
-            record("outcome", "NotImplementedError"); return
-        conv = s.info.get("converged")
-        record("outcome", f"returned converged={conv}")
-        if conv:
-            assert abs(float(s.cost) - Jr) <= TOL_COST_REF * Jr, f"tau returned converged with cost {s.cost} vs ref {Jr}"
-    else:
-        s = harness.run_cpp("TINY", "tau")
-        record("returncode", s.returncode)
-        assert s.returncode >= 0, f"killed by signal {-s.returncode}"
-        j = s.json if isinstance(s.json, dict) else {}
-        record("outcome", f"rc={s.returncode} converged={j.get('converged')}")
-        if j.get("converged") is True:
-            assert abs(float(j["cost"]) - Jr) <= TOL_COST_REF * Jr, f"tau converged with cost {j['cost']} vs ref {Jr}"
 
 
 # ---- option C: riccati vs newton (Python, general cost) and C++ riccati exit code ----------------

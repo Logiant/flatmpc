@@ -49,7 +49,7 @@ def rev3_supported(impl):
 
 
 def get_solution(impl, case, method=None):
-    """method=None: call without the method argument (spec default 'tau')."""
+    """method=None: call without the method argument (spec default 'newton')."""
     key = (impl, case, method)
     if key not in _SOL_CACHE:
         try:

@@ -1,4 +1,4 @@
-// Host CLI: lqocp_cli <A|B|TINY|problem_file> <out.csv> [newton|tau|riccati]. May use the STL; the core does not.
+// Host CLI: lqocp_cli <A|B|TINY|problem_file> <out.csv> [newton|riccati]. May use the STL; the core does not.
 #include <chrono>
 #include <fstream>
 #include <sstream>
@@ -101,12 +101,12 @@ static bool read_problem_file(const char* path, lqocp::Problem& p) {
 
 int main(int argc, char** argv) {
     if (argc != 3 && argc != 4) {
-        std::fprintf(stderr, "usage: %s <A|B|TINY|problem_file> <out.csv> [newton|tau|riccati]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <A|B|TINY|problem_file> <out.csv> [newton|riccati]\n", argv[0]);
         return 2;
     }
     std::string method = (argc == 4) ? argv[3] : "newton";
-    if (method != "tau" && method != "newton" && method != "riccati") {
-        std::fprintf(stderr, "unknown method '%s' (tau|newton|riccati)\n", method.c_str());
+    if (method != "newton" && method != "riccati") {
+        std::fprintf(stderr, "unknown method '%s' (newton|riccati)\n", method.c_str());
         return 2;
     }
     const int n = 12, m = 4;
@@ -136,7 +136,6 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "'%s' is neither a case name (A|B) nor a valid problem file\n", argv[1]);
         return 2;
     }
-    const int meth = (method == "tau") ? lqocp::METHOD_TAU : lqocp::METHOD_NEWTON;
 
     const auto t0 = std::chrono::steady_clock::now();
     if (!g_solver.setup(p)) {
@@ -150,10 +149,6 @@ int main(int argc, char** argv) {
     // solver exists only in Python (method="riccati")
     if (method == "riccati" && general) {
         std::fprintf(stderr, "method 'riccati' with a general cost is Python-only (use newton)\n");
-        return 3;
-    }
-    if (meth == lqocp::METHOD_TAU && general) {
-        std::fprintf(stderr, "method 'tau' supports only the energy cost (Q = 0)\n");
         return 3;
     }
     bool ok;
@@ -215,7 +210,7 @@ int main(int argc, char** argv) {
         g_basis.attach(&g_gsolver);
         ok = g_gsolver.solve(g_gresult);
     } else {
-        ok = g_solver.solve(g_result, meth);
+        ok = g_solver.solve(g_result);
     }
     const auto t1 = std::chrono::steady_clock::now();
     const double us = std::chrono::duration<double, std::micro>(t1 - t0).count();

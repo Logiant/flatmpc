@@ -1,6 +1,5 @@
 """Print the summary table from results/results.json (written by conftest.py).
-One row per (check, impl, case); one column per method (tau, newton); agreement checks in 'both'.
-XFAIL = expected limitation (tau missing an arc shorter than T/2000), reported, not hidden."""
+One row per (check, impl, case); one column per method (newton, riccati); agreement checks in 'both'."""
 import json
 import os
 import re
@@ -25,15 +24,13 @@ KEY = {  # metric shown per test
     "optimality_structure": ["worst", "rel_err_proj"],
     "switch_times": ["n", "max_err"],
     "py_vs_cpp": ["rel_err_u", "max_err_switch"],
-    "newton_vs_tau": ["rel_err_u", "n_switch"],
     "infeasible": ["converged", "wall_s"],
     "py_umap_none_bounds": ["rel_err_cost"],
-    "lq_tau_behaviour": ["outcome"],
     "py_riccati_vs_newton": ["rel_err_cost", "max_err_switch"],
     "cpp_riccati_general_exit": ["returncode"],
 }
 SYM = {"passed": "PASS", "failed": "FAIL", "skipped": "skip", "xfail": "XFAIL*"}
-METHODS = ("tau", "newton", "riccati")
+METHODS = ("newton", "riccati")
 
 
 def fmt(v):
@@ -53,7 +50,7 @@ for nid, r in R.items():
     rest = [p for p in parts if p not in METHODS]
     impl = next((p for p in rest if p in ("py", "cpp")), "py+cpp" if test == "py_vs_cpp" else "")
     case = next((p for p in rest if p not in ("py", "cpp")), "C" if test == "py_umap_none_bounds" else "")
-    if test in ("newton_vs_tau", "py_riccati_vs_newton"):
+    if test == "py_riccati_vs_newton":
         method = "both"
     out = r.get("outcome", "?")
     met = r.get("metrics", {})
@@ -63,12 +60,12 @@ for nid, r in R.items():
         notes.append((SYM[out], f"{test}[{params}]", r.get("msg", "")))
 
 rows = sorted({(t, i, c) for (t, i, c, _) in cells}, key=lambda k: (list(KEY).index(k[0]) if k[0] in KEY else 99, k[2], k[1]))
-hdr = ("check", "impl", "case", "tau", "newton", "riccati", "both")
-W = [24, 6, 6, 26, 26, 26, 30]
+hdr = ("check", "impl", "case", "newton", "riccati", "both")
+W = [24, 6, 6, 26, 26, 30]
 line = "  ".join(f"{h:<{w}}" for h, w in zip(hdr, W))
 print(line); print("-" * len(line))
 for t, i, c in rows:
-    vals = [cells.get((t, i, c, m), "") for m in ("tau", "newton", "riccati", "both")]
+    vals = [cells.get((t, i, c, m), "") for m in ("newton", "riccati", "both")]
     print("  ".join(f"{v:<{w}}"[:w] for v, w in zip((t, i, c, *vals), W)))
 print("-" * len(line))
 n = {}
@@ -80,8 +77,6 @@ print("Cases: A,B = quad_problem; S sliver arc, G tangential touch, M many switc
       "(validate/cases/*.txt); C = Umap=None contract case.\n"
       "Revision 3 (general LQ cost, newton only): TINY = quad_problem.TINY_CASE, L1 = Qf case with inactive bounds, "
       "L2 = fixed endpoint with Q != 0.")
-print("XFAIL* = expected limitation of the grid-based 'tau' method (arc shorter than T/2000 missed); "
-      "not counted as pass.")
 if notes:
     print("\nFailures and expected limitations:")
     for s, k, msg in notes:

@@ -536,117 +536,17 @@ real Solver::cost(const uint16_t* S, const real* tau, int n, const real* c) cons
     return J;
 }
 
-#ifndef LQOCP_NO_TAU
-bool Solver::residual(const uint16_t* S, int nseq, const real* tau, real* res, int* nres,
-                      real* c) const {
-    if (!solve_c(S, tau, nseq, c)) return false;
-    int nr = 0;
-    real v[MAXM], P[MAXM][MAXM], q[MAXM];
-    for (int k = 0; k + 1 < nseq; ++k) {
-        const uint16_t L = S[k], R = S[k + 1], X = (uint16_t)(L ^ R);
-        for (int key = 0; key < 2 * m_; ++key) {
-            if (!(X & (1u << key))) continue;
-            pq((R & (1u << key)) ? L : R, P, q);   // the side where key is inactive
-            v_on(P, q, c, tau[k], v);
-            real g = -rhs_[key];
-            for (int j = 0; j < m_; ++j) {
-                real vt = rI_ ? v[j] : 0.0;
-                if (!rI_) for (int i = j; i < m_; ++i) vt += Lc_[i][j] * v[i];
-                g += rows_[key][j] * vt;
-            }
-            if (nr >= MAXRES) return false;
-            res[nr++] = g;
-        }
-    }
-    *nres = nr;
-    return true;
-}
-
-bool Solver::newton(const uint16_t* S, int nseq, real* tau, real* c, int* its, real* resmax) const {
-    const int nj = nseq - 1;
-    const real tol = 1e-12;
-    const real T = (real)p_->T;
-    real r[MAXRES], rp[MAXRES], rm[MAXRES], rn[MAXRES];
-    real J[MAXRES][MAXJ_TAU];
-    real tn[MAXJ_TAU], tt[MAXJ_TAU], cn[MAXN], ctmp[MAXN];
-    int nr, nr2;
-    *its = 0;
-    if (!residual(S, nseq, tau, r, &nr, c)) return false;
-    real rmax = 0.0;
-    for (int i = 0; i < nr; ++i) rmax = fmax(rmax, fabs(r[i]));
-    *resmax = rmax;
-    if (nj == 0) return true;
-    const real gap = 1e-9 * T;
-    for (int it = 1; it <= MAX_NEWTON; ++it) {
-        if (rmax < tol) return true;
-        *its = it;
-        const real hstep = 1e-7 * fmax(1.0, T);
-        for (int i = 0; i < nj; ++i) {
-            for (int q = 0; q < nj; ++q) tt[q] = tau[q];
-            tt[i] = tau[i] + hstep;
-            if (!residual(S, nseq, tt, rp, &nr2, ctmp) || nr2 != nr) return false;
-            tt[i] = tau[i] - hstep;
-            if (!residual(S, nseq, tt, rm, &nr2, ctmp) || nr2 != nr) return false;
-            for (int q = 0; q < nr; ++q) J[q][i] = (rp[q] - rm[q]) / (2.0 * hstep);
-        }
-        // Gauss-Newton step from the normal equations (J^T J) d = -J^T r
-        real N[MAXJ_TAU * MAXJ_TAU], d[MAXJ_TAU];
-        for (int a = 0; a < nj; ++a) {
-            real s = 0.0;
-            for (int q = 0; q < nr; ++q) s += J[q][a] * r[q];
-            d[a] = -s;
-            for (int b = 0; b < nj; ++b) {
-                real g = 0.0;
-                for (int q = 0; q < nr; ++q) g += J[q][a] * J[q][b];
-                N[a * MAXJ_TAU + b] = g;
-            }
-        }
-        if (!lu_solve(N, nj, MAXJ_TAU, d, 1, 1)) return false;
-        real nr0 = 0.0;
-        for (int q = 0; q < nr; ++q) nr0 += r[q] * r[q];
-        nr0 = sqrt(nr0);
-        real alpha = 1.0;
-        bool accepted = false;
-        while (alpha > 1e-6) {
-            bool ordered = true;
-            for (int a = 0; a < nj; ++a) tn[a] = tau[a] + alpha * d[a];
-            real prev = 0.0;
-            for (int a = 0; a <= nj; ++a) {
-                const real cur = (a < nj) ? tn[a] : T;
-                if (!(cur - prev > gap)) ordered = false;
-                prev = cur;
-            }
-            if (ordered && residual(S, nseq, tn, rn, &nr2, cn) && nr2 == nr) {
-                real nn = 0.0;
-                for (int q = 0; q < nr; ++q) nn += rn[q] * rn[q];
-                nn = sqrt(nn);
-                if (nn < (1.0 - 1e-4 * alpha) * nr0 || nn < tol) { accepted = true; break; }
-            }
-            alpha *= 0.5;
-        }
-        if (!accepted) return false;
-        rmax = 0.0;
-        for (int a = 0; a < nj; ++a) tau[a] = tn[a];
-        for (int q = 0; q < nr; ++q) { r[q] = rn[q]; rmax = fmax(rmax, fabs(rn[q])); }
-        for (int i = 0; i < n_; ++i) c[i] = cn[i];
-        *resmax = rmax;
-    }
-    return rmax < tol;
-}
-#endif
-
 static const char* const CAPFAIL = "arc capacity LQOCP_MAXARC_E exceeded";
 static const char* const INFEAS = "infeasible endpoint (no feasible input)";
 
-bool Solver::solve(Result& R, int method) { return start(R, method, -1); }
+bool Solver::solve(Result& R) { return start(R, -1); }
 bool Solver::solve_warm(Result& R, int max_its, double dt) {
     if (!isfinite(dt)) { R.converged = false; R.failure = "dt not finite"; return false; }
     if (dt != 0.0 && !general_) shift_warm(R, (real)dt);
-    return start(R, METHOD_NEWTON, max_its);
+    return start(R, max_its);
 }
 
-bool Solver::start(Result& R, int method, int warm_its) {
-    R.method = method;
+bool Solver::start(Result& R, int warm_its) {
     R.converged = false;
     R.failure = "general cost: use GSolver";
     if (general_) return false;                       // general cost: use GSolver
@@ -655,90 +555,8 @@ bool Solver::start(Result& R, int method, int warm_its) {
     R.box_fast_path = false;
     R.reduced = false;
     capfail_ = false;
-    if (method == METHOD_NEWTON) return solve_newton(R, warm_its);
-#ifdef LQOCP_NO_TAU
-    R.failure = "tau method not built (LQOCP_NO_TAU)";
-    return false;
-#else
-    return solve_tau(R);
-#endif
+    return solve_newton(R, warm_its);
 }
-
-#ifndef LQOCP_NO_TAU
-// Active-set sequence for the tau method: the exact event walk of the newton method (per arc and
-// row, the cubic gap's roots in closed form; section 7.3). Fails if the walk fails or needs more
-// junctions than the tau method supports.
-bool Solver::detect_exact(const real* c) {
-    const Eval& e = ew_.ev[0];
-    if (!walk(c, ew_.ev[0]) || e.narcs > MAXJ_TAU + 1) return false;
-    ew_.nseq2 = e.narcs;
-    for (int i = 0; i < ew_.nseq2; ++i) ew_.seq2[i] = e.S[i];
-    for (int i = 0; i + 1 < ew_.nseq2; ++i) ew_.tau2[i] = e.tau[i];
-    return true;
-}
-
-bool Solver::solve_tau(Result& R) {
-    R.iterations = 0;
-    R.newton_iterations = 0;
-    R.outer_iterations = 0;
-    R.residual = 0.0;
-    R.pmp_violation = 0.0;
-    R.narcs = 0;
-    R.failure = "tau: setup";
-    // 1) unconstrained primitive
-    ew_.nseq = 1;
-    ew_.seq[0] = 0;
-    if (!solve_c(ew_.seq, ew_.tau, ew_.nseq, R.c)) return false;
-    R.iterations = 1;
-    bool conv = !p_->has_bounds;
-    if (p_->has_bounds) {
-        real c_try[MAXN];
-        real c0n = 1.0;
-        for (int i = 0; i < n_; ++i) c0n = fmax(c0n, 1.0 + fabs(R.c[i]));
-        for (int outer = 1; outer <= MAX_OUTER; ++outer) {
-            R.outer_iterations = outer;
-            // early exits: iteration cap, diverging w (dual unbounded: infeasible)
-            if (R.newton_iterations > MAX_TAU_TOTAL) break;
-            real cn = 0.0;
-            for (int i = 0; i < n_; ++i) cn = fmax(cn, fabs(R.c[i]));
-            if (cn > 1e6 * c0n) break;
-            // 2) active-set sequence from the pointwise H-minimiser of the current w(t)
-            if (!detect_exact(R.c)) break;
-            if (outer == 1 && ew_.nseq2 == 1 && ew_.seq2[0] == 0) { conv = true; break; }
-            // 3) junction-time Newton with inner linear BC solve
-            int its = 0;
-            real rmax = 0.0;
-            bool ok = newton(ew_.seq2, ew_.nseq2, ew_.tau2, c_try, &its, &rmax);
-            R.newton_iterations += its;
-            R.iterations += 1 + its;
-            R.residual = rmax;
-            if (ok) {
-                ew_.nseq = ew_.nseq2;
-                for (int i = 0; i < ew_.nseq; ++i) ew_.seq[i] = ew_.seq2[i];
-                for (int i = 0; i + 1 < ew_.nseq; ++i) ew_.tau[i] = ew_.tau2[i];
-                for (int i = 0; i < n_; ++i) R.c[i] = c_try[i];
-                R.pmp_violation = verify(ew_.seq, ew_.tau, ew_.nseq, R.c);
-                if (R.pmp_violation <= 1e-9 * R_) { conv = true; break; }
-            } else {
-                // fixed-point step: fix detected junctions, solve c, re-detect next round
-                if (!detect_exact(R.c)) break;
-                if (!solve_c(ew_.seq2, ew_.tau2, ew_.nseq2, c_try)) break;
-                ew_.nseq = ew_.nseq2;
-                for (int i = 0; i < ew_.nseq; ++i) ew_.seq[i] = ew_.seq2[i];
-                for (int i = 0; i + 1 < ew_.nseq; ++i) ew_.tau[i] = ew_.tau2[i];
-                for (int i = 0; i < n_; ++i) R.c[i] = c_try[i];
-            }
-        }
-    }
-    R.narcs = ew_.nseq;
-    for (int i = 0; i < ew_.nseq; ++i) R.S[i] = ew_.seq[i];
-    for (int i = 0; i + 1 < ew_.nseq; ++i) R.tau[i] = ew_.tau[i];
-    R.cost = cost(R.S, R.tau, R.narcs, R.c);
-    R.converged = conv;
-    R.failure = conv ? nullptr : capfail_ ? CAPFAIL : "tau method did not converge";
-    return conv;
-}
-#endif
 
 void Solver::eval_u(const Result& R, double t, double u[MAXM]) const {
     if (t < 0.0) t = 0.0;
@@ -806,7 +624,7 @@ int Solver::switch_times(const Result& R, double* out, int maxout) const {
 }
 
 // =====================================================================================
-// METHOD_NEWTON: Newton on c with exact (grid-free) event detection. Mirrors
+// Energy cost: Newton on c with exact (grid-free) event detection. Mirrors
 // develop/python/lqocp.py (_NewtonCtx / _solve_newton).
 // =====================================================================================
 namespace pd {

@@ -5,13 +5,10 @@
 //   energy  : Q = 0: J = 1/2 int v'Rv [+ 1/2 (s(T)-xf)'Qf(s(T)-xf)], else fixed endpoint
 //             (polynomial costate, NOTES.md sections 7 and 13)
 //   general : J = 1/2 int (s'Qs + v'Rv) + 1/2 (s(T)-xf)'Qf(s(T)-xf)  (or fixed endpoint)
-// Methods:
-//   METHOD_NEWTON (default): energy -> Newton on the 12 polynomial coefficients, exact cubic
-//                  events, line search on the concave dual; general -> stable-basis motion
-//                  primitives, Newton on the junction times with exact derivatives and exact
-//                  collapse events, event-driven bound-scale homotopy (NOTES.md section 9);
-//                  closed-form walk/cost and the MPC warm start GSolver::solve_warm (section 11).
-//   METHOD_TAU    : junction-time Gauss-Newton, sequence from the exact event walk (energy only).
+// Method: energy -> Newton on the 12 polynomial coefficients, exact cubic events, line search
+//   on the concave dual; general -> stable-basis motion primitives, Newton on the junction times
+//   with exact derivatives and exact collapse events, event-driven bound-scale homotopy (NOTES.md
+//   section 9); closed-form walk/cost and the MPC warm start GSolver::solve_warm (section 11).
 //
 // Embedded-friendly core: fixed-size arrays only, no heap allocation, no exceptions, no STL.
 // Sizes are reported in NOTES.md. Declare Solver/Result static/global on a microcontroller.
@@ -45,12 +42,9 @@ constexpr int MAXJ = MAXARC - 1;     // max junctions (switch times)
 constexpr int MAXARC_E = LQOCP_MAXARC_E;   // energy cost: max arcs (overflow -> Result.failure)
 constexpr int MAXJ_E = MAXARC_E - 1;
 static_assert(MAXARC_E >= 2, "LQOCP_MAXARC_E must be >= 2");
-constexpr int MAXJ_TAU = 16;         // max junctions handled by the tau method
-constexpr int MAXRES = 2 * MAXJ_TAU;
 constexpr int MAXSETS = 81;          // 3^MAXM candidate active sets
 constexpr int MAX_OUTER = 50;
 constexpr int MAX_NEWTON = 50;
-constexpr int MAX_TAU_TOTAL = 500;   // total junction-time Newton iterations (tau method)
 constexpr int N2 = 2 * MAXN;         // Hamiltonian state (s, lambda)
 constexpr int GN = 24;               // Taylor order of the sign tests at an event (general cost)
 constexpr int MAX_TAU_NEWTON = 8;    // Newton iterations on the junction times per corrector
@@ -63,8 +57,6 @@ constexpr int NPOLY = 2 * MAXK + 1;  // terms of an arc's centre polynomial: nil
 #endif
 constexpr int NSD = LQOCP_NSD;       // max slow modal dimensions coupled into the centre (general cost;
                                      // TINY at T = 0.45 needs 4, R1 8; 2 x 4 x 10 doubles of stack each)
-
-enum Method { METHOD_TAU = 0, METHOD_NEWTON = 1 };
 
 struct Problem {
     int m;                           // number of chains / inputs
@@ -84,18 +76,16 @@ struct Problem {
 // Energy-cost plan: v(t) on arc a is the projection of w(t) (from c) on the face of set S[a]
 // (v = P w + q with P, q = affine(S), recomputed when needed).
 struct Result {
-    int method;
     int narcs;
     uint16_t S[MAXARC_E];            // active signed rows: bit 2r = upper of row r, 2r+1 = lower
     real tau[MAXJ_E];              // switch times: arc a is [tau[a-1], tau[a]] (0 and T at the ends)
     real c[MAXN];                  // energy: coefficients of the switching polynomial w(t)
     real mu[MAXN];                 // energy with Qf (newton): dual iterate, nu = Cf^T mu, c = Lm nu
     real cost;
-    int iterations;                  // tau: BC solves + Newton its; newton: Newton iterations (warm:
-                                     // switch-time + dual Newton iterations)
+    int iterations;                  // Newton iterations (warm: switch-time + dual Newton iterations)
     int newton_iterations;           // dual Newton iterations
     int outer_iterations;
-    real residual;                 // tau: junction residual; newton: |F|_inf / terminal residual
+    real residual;                 // |F|_inf / terminal residual
     real pmp_violation;            // max violation of the optimality conditions found
     int backtracks;
     int degenerate_events;
@@ -111,7 +101,7 @@ public:
     bool setup(const Problem& p);
     const char* setup_failure() const { return sfail_; }   // why setup returned false
     // Returns r.converged. A general cost returns false (use GSolver).
-    bool solve(Result& r, int method = METHOD_NEWTON);
+    bool solve(Result& r);
     // MPC warm start (newton) from the previous result r, converged or not, computed dt earlier (the time the
     // horizon has moved; update x0 with set_x0 first). r is first shifted by dt: switch times -dt, ended arcs
     // dropped, the last arc stretched to T, the costate polynomial c (and mu) Taylor-shifted exactly; on
@@ -141,14 +131,6 @@ private:
         int ndeg;
     };
     struct EnergyWork {
-#ifndef LQOCP_NO_TAU
-        int nseq;
-        uint16_t seq[MAXARC_E];
-        real tau[MAXJ_E];
-        int nseq2;
-        uint16_t seq2[MAXARC_E];
-        real tau2[MAXJ_E];
-#endif
         Eval ev[2];
     };
     const Problem* p_;
@@ -209,13 +191,7 @@ private:
         return s;
     }
     void v_on(const real P[MAXM][MAXM], const real* q, const real* c, real t, real* v) const;
-#ifndef LQOCP_NO_TAU
-    bool residual(const uint16_t* S, int nseq, const real* tau, real* res, int* nres, real* c) const;
-    bool newton(const uint16_t* S, int nseq, real* tau, real* c, int* its, real* resmax) const;
-    bool solve_tau(Result& r);
-    bool detect_exact(const real* c);
-#endif
-    bool start(Result& r, int method, int warm_its);
+    bool start(Result& r, int warm_its);
     void shift_warm(Result& r, real dt);
     void shift_dual(real* c, real* y, real dt) const;   // c(t) -> c(t + dt); y: its nu (or mu with Qf)
     bool solve_newton(Result& r, int warm_its);

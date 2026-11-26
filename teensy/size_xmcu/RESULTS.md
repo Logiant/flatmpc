@@ -1,8 +1,8 @@
 # Size on other cores: energy path vs TinyMPC 0.0.8 (build-only, not run)
 
 Each program does setup + one cold solve + one warm closed-loop step and writes the result to a
-volatile sink (`src/main.cpp`). Ours: TINY with Q = 0 and TinyMPC's Qf (`TQ0`, NOTES.md 13.3),
-`LQOCP_NO_TAU`. TinyMPC: matched problem (Q = 0, input bounds only, N = 10, rho fix), as
+volatile sink (`src/main.cpp`). Ours: TINY with Q = 0 and TinyMPC's Qf (`TQ0`, NOTES.md 13.3).
+TinyMPC: matched problem (Q = 0, input bounds only, N = 10, rho fix), as
 `teensy/tinympc_bench` env `double_q0_nox`. Toolchain Arm GNU 15.2 (as on the Teensy), PlatformIO
 ststm32 + STM32Cube (startup and CMSIS only, no HAL calls), newlib-nano.
 
