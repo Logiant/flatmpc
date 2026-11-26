@@ -25,9 +25,9 @@ no state bounds.
 
 | | Cold solve | Median step | Mean step | Peak RAM | Code |
 |---|---|---|---|---|---|
-| Ours, double | 28 ms | 0.23 ms | 1.0 ms | ~10 kB | ~19 kB |
+| Ours, double | 30 ms | 0.24 ms | 1.1 ms | ~10.3 kB | ~19 kB |
 | TinyMPC 0.0.8, double (max_iter 1000) | 351 ms | 1.95 ms | 37 ms | ~48 kB | ~89 kB |
-| Ours, float | 13 ms | 0.14 ms | 0.5 ms | ~5.6 kB | |
+| Ours, float | 14 ms | 0.14 ms | 0.53 ms | ~5.6 kB | ~19 kB |
 | TinyMPC 0.0.8, float | 188 ms | 1.10 ms | 21 ms | | |
 
 Our closed loop converges at all 100 steps. TinyMPC converges at 84 and lets the applied input exceed the box slightly.
