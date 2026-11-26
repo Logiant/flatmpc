@@ -164,6 +164,7 @@ private:
     real rhs_scale_;
     real R_;
     real jmax_;                      // max of 1/2 v^T R v over the thrust box (HUGE_VAL: unbounded): T jmax_ >= any J
+    real sig_[MAXN];                 // fixed-endpoint stop scale per state: max(|xf_i|, box reach); |free_i| added at the stop
     bool identity_;
     bool general_;
     bool rI_, qf_;                   // R = I; terminal cost (else fixed endpoint)

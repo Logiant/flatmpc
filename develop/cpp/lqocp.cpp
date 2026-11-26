@@ -264,6 +264,7 @@ bool Solver::setup_(const Problem& p) {
     R_ = 1.0 + mx;
     // jmax_: 1/2 v^T R v is convex, so its max over the box {lo <= M v <= hi} is at a vertex v = M^-1 u
     jmax_ = HUGE_VAL;
+    for (int i = 0; i < n_; ++i) sig_[i] = fabs((real)p.xf[i]);
     bool bounded = p.has_bounds != 0;
     for (int r = 0; r < m_; ++r) bounded = bounded && isfinite(p.lo[r]) && isfinite(p.hi[r]);
     if (bounded) {
@@ -280,6 +281,14 @@ bool Solver::setup_(const Problem& p) {
                 for (int j = 0; j < m_; ++j) v[j] = V[j * nv + k];
                 for (int j = 0; j < m_; ++j) q += 0.5 * v[j] * (rI_ ? v[j] : vR(j, v));
                 jmax_ = fmax(jmax_, q);
+            }
+            for (int j = 0; j < m_; ++j) {   // sig_ = max(|xf_i|, reach umax_j T^e/e!), e = order - derivative index
+                real um = 0.0;
+                for (int k = 0; k < nv; ++k) um = fmax(um, fabs(V[j * nv + k]));
+                for (int q = 0; q < p.orders[j]; ++q) {
+                    const int e = p.orders[j] - q;
+                    sig_[off_[j] + q] = fmax(sig_[off_[j] + q], um * ipow(p.T, e) / fact(e));
+                }
             }
         }
     }
@@ -1307,7 +1316,18 @@ bool Solver::solve_newton(Result& R, int warm_its) {
         // dual unbounded (infeasible problem): the iterates c diverge. Tested before the stop: E.scale
         // grows with |c|, so a diverging iterate can meet the relative stop with an O(1) endpoint miss.
         if (!qf_ && infeasible(E.D, E.Dabs, E.narcs)) { why = INFEAS; break; }
-        if (Fn <= rtol * E.scale) { conv = true; break; }
+        if (sizeof(real) == 4 || qf_) {
+            if (Fn <= rtol * E.scale) { conv = true; break; }
+        } else {   // double, fixed endpoint: per state, relative to its scale sigma_i or its rounding floor
+            bool st = true;
+            for (int i = 0; i < n_ && st; ++i) {
+                real gc = 0.0, a = 0.0;   // a = sum |terms of F_i| (G c, the constant part, xf): F_i's rounding is (n+2) EPS a
+                for (int j = 0; j < n_; ++j) { gc += G_[i * MAXN + j] * c[j]; a += fabs(G_[i * MAXN + j] * c[j]); }
+                a += fabs(E.F[i] - gc + (real)p_->xf[i]) + fabs((real)p_->xf[i]);
+                st = fabs(E.F[i]) <= fmax(rtol * fmax(sig_[i], fabs(free_[i])), (n_ + 2) * EPS * a);
+            }
+            if (st) { conv = true; break; }
+        }
         if (its >= max_its) { why = "iteration cap"; break; }
         ++its;
         // (J Lm) d_nu = -F, J Lm = int K P K^T dt symmetric PSD; d_c = Lm d_nu
