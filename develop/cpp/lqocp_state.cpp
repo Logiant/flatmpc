@@ -1205,9 +1205,14 @@ bool StateSolver::run(StateResult& r) {
     return conv;
 }
 
-bool StateSolver::solve_warm(StateResult& r, int max_its, double shift) {
+bool StateSolver::solve_warm(StateResult& r, int max_its, double dt) {
     const double T = base_.p_->T;
     const int n = base_.n_;
+    if (dt != 0.0) {                                     // dual polynomial c(t) -> c(t + dt), as tier 1
+        double c[MAXN];
+        cvec(r.y, c);
+        base_.shift_dual(c, r.y, dt);
+    }
     its_ = 0;
     cap_ = max_its;
     hs_ = 1.0;
@@ -1216,9 +1221,9 @@ bool StateSolver::solve_warm(StateResult& r, int max_its, double shift) {
     int k = 0;
     for (int q = 0; q < r.nsa && q < MAXSA; ++q) {
         StateArc a = r.sa[q];
-        if (!a.fix2) a.t2 -= shift;
+        if (!a.fix2) a.t2 -= dt;
         if (a.t2 <= 1e-9 * T) continue;                  // ended: drop
-        if (!touch(a)) a.t1 -= shift;
+        if (!touch(a)) a.t1 -= dt;
         a.b = bnd(a.chain, a.side);                      // the target (a stalled continuation leaves b(s < 1))
         double d = r.y[n + q];
         if (a.fix1 || a.t1 <= 1e-9 * T) {

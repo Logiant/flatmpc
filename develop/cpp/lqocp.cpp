@@ -557,7 +557,10 @@ static const char* const CAPFAIL = "arc capacity LQOCP_MAXARC_E exceeded";
 static const char* const INFEAS = "infeasible endpoint (no feasible input)";
 
 bool Solver::solve(Result& R, int method) { return start(R, method, -1); }
-bool Solver::solve_warm(Result& R, int max_its) { return start(R, METHOD_NEWTON, max_its); }
+bool Solver::solve_warm(Result& R, int max_its, double dt) {
+    if (dt != 0.0 && !general_) shift_warm(R, (real)dt);
+    return start(R, METHOD_NEWTON, max_its);
+}
 
 bool Solver::start(Result& R, int method, int warm_its) {
     R.method = method;
@@ -1135,6 +1138,39 @@ real Solver::verify(const uint16_t* S, const real* tau, int n, const real* c, re
     }
     if (amp) *amp = a_max;
     return worst;
+}
+
+// c(t) -> c(t + dt) per chain (exact Taylor shift); y = Lm^-1 c (nu), with Qf the mu of nu = Cf^T mu (Cf upper
+// triangular; a zero pivot of a semidefinite Qf leaves that mu at 0: only a starting guess)
+void Solver::shift_dual(real* c, real* y, real dt) const {
+    real b[MAXK], nu[MAXN];
+    for (int j = 0; j < m_; ++j) {
+        shift(c + off_[j], p_->orders[j], dt, b);
+        for (int k = 0; k < p_->orders[j]; ++k) c[off_[j] + k] = b[k];
+    }
+    for (int i = 0; i < n_; ++i) {
+        real s = 0.0;
+        for (int j = 0; j < n_; ++j) s += Linv_[i * MAXN + j] * c[j];
+        nu[i] = s;
+    }
+    for (int i = 0; i < n_; ++i) {
+        if (!qf_) { y[i] = nu[i]; continue; }
+        real s = nu[i];
+        for (int j = 0; j < i; ++j) s -= Cf_[j * MAXN + i] * y[j];
+        y[i] = Cf_[i * MAXN + i] > 0.0 ? s / Cf_[i * MAXN + i] : 0.0;
+    }
+}
+
+// Time shift of a warm start (solve_warm): the pattern loses the arcs that ended by dt, its switch times move
+// by -dt (the last arc reaches T), and c / mu are Taylor-shifted (natural extension of w on [T - dt, T]).
+void Solver::shift_warm(Result& R, real dt) {
+    real nu[MAXN];
+    shift_dual(R.c, qf_ ? R.mu : nu, dt);
+    int k0 = 0;
+    while (k0 + 1 < R.narcs && R.tau[k0] - dt <= 1e-9 * (real)p_->T) ++k0;
+    R.narcs -= k0;
+    for (int a = 0; a < R.narcs; ++a) R.S[a] = R.S[a + k0];
+    for (int a = 0; a + 1 < R.narcs; ++a) R.tau[a] = R.tau[a + k0] - dt;
 }
 
 // warm_its < 0: cold start (unconstrained solution; mu = 0 with Qf), else from R.c / R.mu.
@@ -3726,7 +3762,7 @@ bool GSolver::cold(GResult& R, int max_its) {
 // R is the current iterate (it satisfies the dynamics and both boundary conditions) with
 // converged = false. A previous plan that is not converged and violates PMP by more than WRESET*R
 // (a stale active set asking for inputs far outside the box) is not reused: cold restart.
-bool GSolver::solve_warm(GResult& R, double dt, int max_its) {
+bool GSolver::solve_warm(GResult& R, int max_its, double dt) {
     if (R.narcs < 1 || R.narcs > NA || !x0ok_ || (!R.converged && !(R.pmp_violation <= WRESET * R_)))
         return cold(R, max_its);
     const double T = p_->T;

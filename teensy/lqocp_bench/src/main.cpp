@@ -1,8 +1,9 @@
 // lqocp bench on Teensy 4.1: solves TINY (general cost) or A and B (energy cost) and prints
 // cost, iterations and solve time (setup + solve) over serial. With BENCH_TINY it also runs the
 // closed loop of teensy/tinympc_bench: 100 MPC steps at dt = 0.05 on the exact ZOH model, warm
-// started (solve_warm), applying the mean of the planned input over the step. With BENCH_ENERGY
-// the same cold solve and loop run on TINY with Q = 0 (energy path: terminal cost Qf, TINY's R).
+// started (solve_warm, shifted by dt), applying the mean of the last verified plan over the step
+// (lqocp::MpcPlan). With BENCH_ENERGY the same cold solve and loop run on TINY with Q = 0 (energy
+// path: terminal cost Qf, TINY's R).
 // See platformio.ini.
 #include <Arduino.h>
 #include <algorithm>
@@ -12,7 +13,8 @@
 
 #ifdef BENCH_TINY
 static lqocp::GSolver gs;
-static lqocp::GResult gr;
+static lqocp::MpcPlan<lqocp::GSolver, lqocp::GResult> gm;
+static lqocp::GResult& gr = gm.it;
 static const lqocp::SetBasis* lookup(void*, uint16_t S) {
     for (int i = 0; i < TINY_NBASES; ++i)
         if (TINY_BASES[i].S == S) return &TINY_BASES[i];
@@ -21,13 +23,15 @@ static const lqocp::SetBasis* lookup(void*, uint16_t S) {
 #endif
 #ifdef BENCH_ENERGY
 static lqocp::Solver es;
-static lqocp::Result er;
+static lqocp::MpcPlan<lqocp::Solver, lqocp::Result> em;
+static lqocp::Result& er = em.it;
 #include "qf_q0.h"                                    // TQ0: TINY with Q = 0, in flash
 #endif
 #ifdef BENCH_TIER2
 #include "lqocp_state.hpp"
 static lqocp::StateSolver ts;
-static lqocp::StateResult tr;
+static lqocp::MpcPlan<lqocp::StateSolver, lqocp::StateResult> tm;
+static lqocp::StateResult& tr = tm.it;
 #include "qf_q0.h"                                    // TQ0: TINY with Q = 0, in flash
 // |x_phys| <= 5 on every physical state, in flat coordinates (quad_problem.Tf2p, one nonzero per row);
 // only the roll/pitch/yaw rates and z speed are enforced, the rest is verified on the result
@@ -46,9 +50,9 @@ static bool tier2_setup() {
 static const lqocp::Problem& loop_prob() { return BENCH_PROB[2]; }
 static bool loop_setup() { return gs.setup(BENCH_PROB[2], lookup, nullptr); }
 static void loop_x0(const double* x) { gs.set_x0(x); }
-static bool loop_solve(int k, double dt, int cap) { return (k == 0) ? gs.solve(gr) : gs.solve_warm(gr, dt, cap); }
+static bool loop_solve(int k, double dt, int cap) { return (k == 0) ? gm.cold(gs) : gm.warm(gs, cap, dt); }
 static int loop_u(double dt, double* u) {
-    gs.mean_u(gr, 0.0, dt, u);                        // saturated to the bounds; false: holds u
+    gm.mean_u(gs, dt, u);                             // saturated to the bounds; false: holds u
     return gr.iterations;
 }
 #elif defined(BENCH_TIER2)
@@ -56,21 +60,22 @@ static const lqocp::Problem& loop_prob() { return TQ0; }
 static bool loop_setup() { return tier2_setup(); }
 static void loop_x0(const double* x) { ts.set_x0(x); }
 static bool loop_solve(int k, double dt, int cap) {
-    if (k == 0) return ts.solve(tr);
-    if (ts.solve_warm(tr, cap, dt)) return true;
-    return (tr.failure && strstr(tr.failure, "iteration cap")) ? false : ts.solve(tr);   // cold fallback
+    if (k == 0) return tm.cold(ts);
+    bool ok = ts.solve_warm(tr, cap, dt);
+    if (!ok && !(tr.failure && strstr(tr.failure, "iteration cap"))) ok = ts.solve(tr);   // cold fallback
+    return tm.keep(ok, dt);
 }
 static int loop_u(double dt, double* u) {
-    ts.mean_u(tr, 0.0, dt, u);
+    tm.mean_u(ts, dt, u);
     return tr.iterations;
 }
 #else
 static const lqocp::Problem& loop_prob() { return TQ0; }
 static bool loop_setup() { return es.setup(TQ0); }
 static void loop_x0(const double* x) { es.set_x0(x); }
-static bool loop_solve(int k, double, int cap) { return (k == 0) ? es.solve(er) : es.solve_warm(er, cap); }
+static bool loop_solve(int k, double dt, int cap) { return (k == 0) ? em.cold(es) : em.warm(es, cap, dt); }
 static int loop_u(double dt, double* u) {
-    es.mean_u(er, 0.0, dt, u);                        // v = Proj(w) is feasible for any iterate
+    em.mean_u(es, dt, u);
     return er.iterations;
 }
 #endif

@@ -5,7 +5,8 @@
 //
 // Problem (gen_data.py): Q = 0, R = 4I on the thrusts, |u| <= 0.5, T = 0.45, Qf(N) = dt (DARE(Ad, Bd, rho I, R + rho I) - rho I),
 // tier 2 adds |x_phys| <= 5 on all 12 states. Control period 0.05 s, 100 steps.
-// Applied input: ours, the mean of its plan over the period (ZOH); TinyMPC, its plan's held inputs over the period
+// Applied input: ours, the mean of its last verified plan over the period (ZOH; lqocp::MpcPlan: warm starts shifted
+// by dt from the newest iterate, a failed step applies the verified plan shifted by its age); TinyMPC, its plan's held inputs over the period
 // (u0 for N = 10; for N > 10 the inputs of every knot interval inside [0, 0.05], the last one cut at 0.05),
 // unprojected work->u as upstream (clamp = 0) or clamped to the box (clamp = 1).
 // The state box is checked in continuous time on every held piece: each state is a polynomial of degree <= 4 in t,
@@ -125,9 +126,11 @@ static double qf_cost(int sw, const double* s) {
 #ifdef BENCH_OURS
 static lqocp::Problem P;
 static lqocp::Solver es;
-static lqocp::Result er;
+static lqocp::MpcPlan<lqocp::Solver, lqocp::Result> em;
+static lqocp::Result& er = em.it;
 static lqocp::StateSolver ss;
-static lqocp::StateResult sr;
+static lqocp::MpcPlan<lqocp::StateSolver, lqocp::StateResult> sm;
+static lqocp::StateResult& sr = sm.it;
 static double SLO[12], SHI[12];
 static void make_problem(int sw, const double* s0) {
     P.m = 4;
@@ -151,10 +154,10 @@ static bool ours_setup(int tier, int sw, const double* s0) {
 static bool ours_solve(int tier, int k, int cap, int* its) {
     bool ok;
     if (tier == 1) {
-        ok = (k == 0) ? es.solve(er) : es.solve_warm(er, cap);
+        ok = (k == 0) ? em.cold(es) : em.warm(es, cap, DT);
         *its = er.iterations;
     } else {
-        ok = (k == 0) ? ss.solve(sr) : ss.solve_warm(sr, cap, DT);
+        ok = (k == 0) ? sm.cold(ss) : sm.warm(ss, cap, DT);
         *its = sr.iterations;
     }
     if (!ok) DBG("tier %d step %d: %s\n", tier, k, tier == 1 ? er.failure : sr.failure);
@@ -229,7 +232,7 @@ static Res loop(Who who, int tier, int cap, int clamp, int sw, const double* s0)
             ok = ours_solve(tier, k, cap, &its);
             t[k] = toc(c0);
             pl.n = 1, pl.h[0] = DT;
-            tier == 1 ? es.mean_u(er, 0.0, DT, pl.v[0]) : ss.mean_u(sr, 0.0, DT, pl.v[0]);
+            tier == 1 ? em.mean_u(es, DT, pl.v[0]) : sm.mean_u(ss, DT, pl.v[0]);
             mulv(UMAP, pl.v[0], pl.u[0]);
         }
 #endif

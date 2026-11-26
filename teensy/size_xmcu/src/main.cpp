@@ -20,7 +20,7 @@ int main() {
     bool ok = es.setup(TQ0) && es.solve(er) && es.mean_u(er, 0.0, 0.05, u);
     for (int i = 0; i < 12; ++i) x[i] = 0.9 * TQ0.x0[i];   // stand-in for the plant step
     ok = ok && es.set_x0(x);
-    ok = ok && es.solve_warm(er, 5) && es.mean_u(er, 0.0, 0.05, u);
+    ok = ok && es.solve_warm(er, 5, 0.05) && es.mean_u(er, 0.0, 0.05, u);
     sink = ok + er.cost + u[0] + u[1] + u[2] + u[3];
     for (;;) {}
 }

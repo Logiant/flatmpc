@@ -4,7 +4,7 @@ Usage: python3 sizes.py (after `pio run`)."""
 import pathlib, re, subprocess, sys
 here = pathlib.Path(__file__).parent
 size = "/home/intsyslab/.platformio/packages/toolchain-gccarmnoneeabi-15.2-sym/bin/arm-none-eabi-size"
-roots = {"ours": "_ZN5lqocp6Solver10solve_warmERNS_6ResultEi", "tiny": "tiny_solve"}
+roots = {"ours": "_ZN5lqocp6Solver10solve_warmERNS_6ResultEid", "tiny": "tiny_solve"}
 print("| env | text | data | bss | flash | static RAM | stack main | stack solve |")
 print("|---|---:|---:|---:|---:|---:|---:|---:|")
 for b in sorted((here / ".pio/build").glob("*/firmware.elf")):

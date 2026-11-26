@@ -112,11 +112,14 @@ public:
     const char* setup_failure() const { return sfail_; }   // why setup returned false
     // Returns r.converged. A general cost returns false (use GSolver).
     bool solve(Result& r, int method = METHOD_NEWTON);
-    // MPC warm start (newton): first Newton on the switch times of the previous pattern r.S (at most
-    // min(max_its, 4) iterations, accepted only if verified; r.reduced), else the dual Newton from the
-    // previous r.c / r.mu with at most max_its iterations (then r is the current iterate; its
-    // v = Proj(w) is feasible). Update x0 with set_x0 first.
-    bool solve_warm(Result& r, int max_its);
+    // MPC warm start (newton) from the previous result r, converged or not, computed dt earlier (the time the
+    // horizon has moved; update x0 with set_x0 first). r is first shifted by dt: switch times -dt, ended arcs
+    // dropped, the last arc stretched to T, the costate polynomial c (and mu) Taylor-shifted exactly; on
+    // [T - dt, T] the guess is the natural extension of the costate polynomial. Then Newton on the switch
+    // times of that pattern r.S (at most min(max_its, 4) iterations, accepted only if verified; r.reduced),
+    // else the dual Newton from the shifted r.c / r.mu with at most max_its iterations (then r is the
+    // current iterate; its v = Proj(w) is feasible). dt = 0: no shift. MPC policy: see MpcPlan.
+    bool solve_warm(Result& r, int max_its, double dt);
     bool set_x0(const double* x0);   // false if x0 is not finite
     // mean u on [t0, t1] (what a zero-order hold should apply); false: no plan
     bool mean_u(const Result& r, double t0, double t1, double u[MAXM]) const;
@@ -124,6 +127,7 @@ public:
     void eval_x(const Result& r, double t, double x[MAXN]) const;
     int switch_times(const Result& r, double* out, int maxout) const;
     bool is_general() const { return general_; }
+    double horizon() const { return p_->T; }
 
 private:
     friend class StateSolver;        // tier 2 (lqocp_state.hpp) reuses the setup data
@@ -209,6 +213,8 @@ private:
     bool detect_exact(const real* c);
 #endif
     bool start(Result& r, int method, int warm_its);
+    void shift_warm(Result& r, real dt);
+    void shift_dual(real* c, real* y, real dt) const;   // c(t) -> c(t + dt); y: its nu (or mu with Qf)
     bool solve_newton(Result& r, int warm_its);
     __attribute__((noinline)) bool try_reduced(Result& r, int max_its);
     __attribute__((noinline)) bool solve_reduced(Result& r, int max_its, int* its);
@@ -300,9 +306,10 @@ public:
     bool setup(const Problem& p, BasisFn fn, void* ctx);
     const char* setup_failure = nullptr;
     bool solve(GResult& r);
-    // MPC warm start from the previous solution in r (x0 updated in the Problem; junction times
-    // shifted by -dt); at most max_its Newton iterations (then r is the current iterate)
-    bool solve_warm(GResult& r, double dt, int max_its);
+    // MPC warm start from the previous result r, converged or not, computed dt earlier (x0 updated with
+    // set_x0): junction times -dt, ended arcs dropped, the last arc stretched to T (the BVP recomputes the
+    // costate); at most max_its Newton iterations (then r is the current iterate). MPC policy: see MpcPlan.
+    bool solve_warm(GResult& r, int max_its, double dt);
     // (setup copies p.x0) false if x0 is not finite: the next solve then fails
     bool set_x0(const double* x0);
     // eval_u and mean_u (mean u on [t0, t1], what a zero-order hold should apply) saturate u to the
@@ -479,6 +486,32 @@ private:
     double W_[MAXSETS][N2 * N2], Wi_[MAXSETS][N2 * N2], re_[MAXSETS][N2], im_[MAXSETS][N2],
         Tc_[MAXSETS][N2 * N2], cs_[MAXSETS][N2];
     bool build(uint16_t S, int slot);
+};
+
+// MPC step policy for any tier (S = Solver / StateSolver / GSolver, R = its result; NOTES.md 13.10):
+//   it   : the newest iterate. Each warm step continues from it, shifted by dt, converged or not, so N
+//          iterations per step over M steps act like M x N.
+//   plan : the last verified (converged) solution, and age the time since it was verified. The input applied
+//          is the plan on [age, age + dt] (the verified plan shifted by dt per failed step) until a solve
+//          verifies again.
+// The iterate is applied before the first verified solve and once the plan is used up (age + dt > T, after
+// T/dt failures in a row): nothing verified is left, and the iterate is the only input that still reacts to x0.
+// RAM: one extra R.
+template <class S, class R> struct MpcPlan {
+    R it, plan;
+    double age = -1.0;                               // < 0: no verified plan
+    bool keep(bool ok, double dt) {
+        if (ok) plan = it, age = 0.0;
+        else if (age >= 0.0) age += dt;
+        return ok;
+    }
+    bool cold(S& s) { age = -1.0; return keep(s.solve(it), 0.0); }   // starts afresh
+    bool warm(S& s, int max_its, double dt) { return keep(s.solve_warm(it, max_its, dt), dt); }
+    bool use_it(const S& s, double dt) const { return age < 0.0 || age + dt > s.horizon() * (1.0 + 1e-12); }   // apply it
+    // mean input over the next dt (what a zero-order hold applies)
+    bool mean_u(const S& s, double dt, double u[MAXM]) const {
+        return use_it(s, dt) ? s.mean_u(it, 0.0, dt, u) : s.mean_u(plan, age, age + dt, u);
+    }
 };
 
 }  // namespace lqocp

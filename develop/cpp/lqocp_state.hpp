@@ -55,10 +55,13 @@ public:
     // MPC: from the previous arcs and dual iterate, at most max_its inner Newton iterations in total. If that
     // structure fails (not by the cap), the bound continuation from the arc-free problem, in the same budget.
     // When the budget is spent r holds the best plan so far (failure "iteration cap ...").
-    // shift: time the horizon moved since r was computed (arcs move left by it; an arc that now starts
-    // at or before 0 starts at 0, one that ended is dropped). Update x0 with set_x0 first.
-    bool solve_warm(StateResult& r, int max_its, double shift = 0.0);
+    // dt: time the horizon moved since r was computed (r converged or not). Arcs move left by dt (an arc that
+    // now starts at or before 0 starts at 0 if x0 is on its bound, else it is dropped; one that ended is
+    // dropped); the dual polynomial is Taylor-shifted exactly (as Solver::solve_warm; the Deltas move with
+    // their entries). Update x0 with set_x0 first. MPC policy: see MpcPlan (lqocp.hpp).
+    bool solve_warm(StateResult& r, int max_its, double dt);
     bool set_x0(const double* x0) { return base_.set_x0(x0); }
+    double horizon() const { return base_.horizon(); }
     bool mean_u(const StateResult& r, double t0, double t1, double u[MAXM]) const;
     void eval_u(const StateResult& r, double t, double u[MAXM]) const;
     void eval_x(const StateResult& r, double t, double x[MAXN]) const;
