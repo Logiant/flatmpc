@@ -3,6 +3,7 @@
 
 #include "lqocp_cont.hpp"
 #include "lqocp_pd.hpp"
+#include "lqocp_prof.hpp"
 
 #include <math.h>
 #include <stdio.h>
@@ -42,6 +43,7 @@ int proots(const double* a, int len, double L, double* out) {
 }  // namespace
 
 bool StateSolver::setup(const Problem& p, const double* slo, const double* shi) {
+    LQOCP_PROF_SCOPE(S_SETUP);
     nsa_ = 0;
     hs_ = 1.0;
     if (!base_.setup(p)) { sfail_ = base_.setup_failure(); return false; }
@@ -200,6 +202,7 @@ bool proj(int m, const double (*a)[MAXM], const double* b, int ne, int nc, const
 // sig[j] the pin multiplier of chain j in w units (R v = w - sig_j e_j - ...). false: singular.
 bool StateSolver::kkt(uint16_t S, const double Wc[MAXM][4], double Pv[MAXM][MAXM], double Vv[MAXM][4],
                       double phi[2 * MAXM][4], bool has[2 * MAXM], double sig[MAXM][4]) const {
+    LQOCP_PROF_SCOPE(S_KKT);
     const Solver& B = base_;
     const int m = B.m_;
     double rw[MAXM][MAXM], rh[MAXM];
@@ -335,6 +338,7 @@ bool StateSolver::pset(const double Wc[MAXM][4], uint16_t pin, double t, double 
 
 // Event walk (Solver::walk) on each piece between boundary-arc junctions
 bool StateSolver::walk(const double* c, const double* y, Ev& e) const {
+    LQOCP_PROF_SCOPE(S_WALK);
     const Solver& B = base_;
     const double T = B.p_->T;
     double bp[2 * MAXSA + 2];
@@ -422,6 +426,7 @@ void StateSolver::vpoly(const uint16_t* S, const double* tau, int n, int a, cons
 
 // F = -grad D (terminal residual, then D_top(t1) - b per arc); H = -Hess D in H_ when wantH
 bool StateSolver::evaluate(const double* y, Ev& e, bool wantH) {
+    LQOCP_PROF_SCOPE(S_EVAL);
     double c[MAXN];
     cvec(y, c);
     return walk(c, y, e) && integrate(c, y, e, wantH);
@@ -429,6 +434,7 @@ bool StateSolver::evaluate(const double* y, Ev& e, bool wantH) {
 
 // the integrals of evaluate (own frame: its buffers are not on the stack under walk)
 __attribute__((noinline)) bool StateSolver::integrate(const double* c, const double* y, Ev& e, bool wantH) {
+    LQOCP_PROF_SCOPE(S_INTEG);
     const Solver& B = base_;
     const Problem& p = *B.p_;
     const int n = B.n_, ny = n + nsa_;
@@ -534,6 +540,7 @@ __attribute__((noinline)) bool StateSolver::integrate(const double* c, const dou
 
 // Newton on the concave dual for fixed junction times (as tier 1, plus the arcs' Delta)
 bool StateSolver::inner(double* y, int max_its) {
+    LQOCP_PROF_SCOPE(S_INNER);
     const int ny = base_.n_ + nsa_;
     int cur = 0;
     double y0 = 1.0;
@@ -596,6 +603,7 @@ double StateSolver::wbasis(int i, double t, double tm) const {
 // polynomial, so F_th is the jump of the integrand at th (thrust events inside a piece keep v continuous)
 // and g_th = v_j'(th). J may point into H_ (written only after H_ is factored).
 bool StateSolver::gres(const double* y, double* g, int* ng, double* vs, double* J, const double* zs, double* dgs) {
+    LQOCP_PROF_SCOPE(S_GRES);
     const Solver& B = base_;
     const Problem& p = *B.p_;
     const Ev& e = ev_[0];
@@ -714,6 +722,7 @@ static bool lsq(const double* J, const double* g, int ng, int nu, double* N, dou
 // dth = d(free junction times)/ds and dy = dy/ds by the implicit function theorem through the inner KKT
 // (F(y, th, s) = 0) and the junction conditions (g(y, th) = 0): J dth = -dg/ds|th, dy = -H^-1 (F_s + F_th dth).
 bool StateSolver::tangent(const double* y, double* dth, double* dy) {
+    LQOCP_PROF_SCOPE(S_TANGENT);
     const int n = base_.n_, ny = n + nsa_;
     double g[2 * MAXSA], dgs[2 * MAXSA], vs;
     int ng;
@@ -734,6 +743,7 @@ bool StateSolver::tangent(const double* y, double* dth, double* dy) {
 // Newton (exact Jacobian, gres) on the free junction times: dJ/dt = 0 at each (see gres).
 // false with collapsed_ = q: arc q collapsed (t2 <= t1).
 bool StateSolver::junctions(double* y, int max_its, int* outer) {
+    LQOCP_PROF_SCOPE(S_JUNCTIONS);
     const double T = base_.p_->T;
     const int ny = base_.n_ + nsa_;
     for (int it = 0; it < 40; ++it) {
@@ -808,6 +818,7 @@ bool StateSolver::junctions(double* y, int max_its, int* outer) {
 // of v_j). With tw >= 0: the crossings of the bound around tw (entry ta, exit tb).
 double StateSolver::scan(const double* c, const double* y, int j, int side, double tw, double* twout,
                          double* ta, double* tb) const {
+    LQOCP_PROF_SCOPE(S_SCAN);
     const Solver& B = base_;
     const Ev& e = ev_[0];
     const double T = B.p_->T, b = bnd(j, side);
@@ -853,6 +864,7 @@ double StateSolver::scan(const double* c, const double* y, int j, int side, doub
 
 double StateSolver::check(const double* y, int* wc, int* ws, double* ta, double* tb, double* twout,
                           double* psign, double* ppmp, int* sq, double* st) const {
+    LQOCP_PROF_SCOPE(S_CHECK);
     const Solver& B = base_;
     const Ev& e = ev_[0];
     const double T = B.p_->T;
@@ -1208,6 +1220,7 @@ void StateSolver::drop(int q, double* y, unsigned* gone) {
 }
 
 void StateSolver::fill(StateResult& r) const {
+    LQOCP_PROF_SCOPE(S_FILL);
     const Ev& e = ev_[0];
     r.narcs = e.narcs;
     for (int a = 0; a < e.narcs; ++a) r.S[a] = e.S[a];
@@ -1247,6 +1260,7 @@ __attribute__((noinline)) bool StateSolver::cold(StateResult& r) {
 // Junction solver from the arcs and dual iterate in r (the corrector of the continuation). Iterations count
 // into its_ / r.outer; the inner solves stop at the call's total budget cap_.
 bool StateSolver::run(StateResult& r) {
+    LQOCP_PROF_SCOPE(S_RUN);
     const Solver& B = base_;
     const int n = B.n_;
     const double T = B.p_->T;
@@ -1424,6 +1438,7 @@ bool StateSolver::run(StateResult& r) {
 }
 
 bool StateSolver::solve_warm(StateResult& r, int max_its, double dt) {
+    LQOCP_PROF_SCOPE(S_WARM);
     if (!isfinite(dt)) { r.converged = false; r.failure = "dt not finite"; return false; }
     const double T = base_.p_->T;
     const int n = base_.n_;
@@ -1574,6 +1589,7 @@ __attribute__((noinline)) bool StateSolver::homotopy(StateResult& r) {
 
 // Cold solve: tier 1, then the bound continuation. The first step is s = 0 -> 1, i.e. the direct solve.
 bool StateSolver::solve(StateResult& r) {
+    LQOCP_PROF_SCOPE(S_SOLVE);
     hs_ = 1.0;
     its_ = 0;
     cap_ = 1 << 30;
@@ -1628,6 +1644,7 @@ void StateSolver::eval_x(const StateResult& r, double t, double x[MAXN]) const {
 }
 
 bool StateSolver::mean_u(const StateResult& r, double t0, double t1, double u[MAXM]) const {
+    LQOCP_PROF_SCOPE(S_MEANU);
     if (r.narcs < 1 || !(t1 > t0)) return false;
     double c[MAXN], V[MAXM][4], av[4], acc[MAXM] = {0.0, 0.0, 0.0, 0.0};
     cvec(r.y, c);

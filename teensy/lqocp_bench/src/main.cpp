@@ -82,6 +82,18 @@ static int loop_u(double dt, double* u) {
 
 static float cyc_us(uint32_t c) { return c / (F_CPU_ACTUAL / 1e6f); }
 
+#ifdef LQOCP_PROF
+// cumulative profile counters (cycles; host: ns), nonzero entries: P label id calls incl excl, Q label parent id calls incl
+static void prof_dump(const char* label) {
+    using namespace lqocp::prof;
+    for (int i = 1; i < NID; ++i)
+        if (calls[i]) Serial.printf("P %s %s %lu %.0f %.0f\n", label, name[i], (unsigned long)calls[i], (double)incl[i], (double)excl[i]);
+    for (int i = 0; i < NID; ++i)
+        for (int j = 1; j < NID; ++j)
+            if (pcalls[i][j]) Serial.printf("Q %s %s %s %lu %.0f\n", label, name[i], name[j], (unsigned long)pcalls[i][j], (double)pincl[i][j]);
+}
+#endif
+
 // x+ = Ad x + Bd u: exact zero-order hold of the integrator chains (dt^k / k!)
 static void zoh_step(const lqocp::Problem& p, double dt, const double* u, double* x) {
     double y[lqocp::MAXN], f[5] = {1, dt, dt * dt / 2, dt * dt * dt / 6, dt * dt * dt * dt / 24};
@@ -98,7 +110,12 @@ static void zoh_step(const lqocp::Problem& p, double dt, const double* u, double
     for (int i = 0; i < off; ++i) x[i] = y[i];
 }
 
+#ifdef LQOCP_PROF
+// sel: steps whose profile to print (before and after the step), -1 ends; also after step 0 and at the end
+static void closed_loop(int cap, const int* sel, int* order) {
+#else
 static void closed_loop(int cap) {
+#endif
     const int STEPS = 100;
     const double dt = 0.05;
     const lqocp::Problem& p = loop_prob();
@@ -107,7 +124,16 @@ static void closed_loop(int cap) {
     int itot = 0, itmax = 0, nconv = 0;
     for (int i = 0; i < 12; ++i) x[i] = p.x0[i];
     loop_setup();
+#ifdef LQOCP_PROF
+    char lab[32];
+    lqocp::prof::reset();
+#endif
     for (int k = 0; k < STEPS; ++k) {
+#ifdef LQOCP_PROF
+        bool pk = false;
+        for (int i = 0; sel && sel[i] >= 0; ++i) pk = pk || sel[i] == k;
+        if (pk) { snprintf(lab, sizeof lab, "c%d_pre%d", cap, k); prof_dump(lab); }
+#endif
         loop_x0(x);
         const uint32_t c0 = ARM_DWT_CYCCNT, m0 = micros();
         const bool ok = loop_solve(k, dt, cap);
@@ -124,7 +150,18 @@ static void closed_loop(int cap) {
             for (int j = 0; j < 4; ++j) ur += u[i] * p.R[i][j] * u[j];
         J += 0.5 * (sq + ur) * dt;
         zoh_step(p, dt, u, x);
+#ifdef LQOCP_PROF
+        if (pk) { snprintf(lab, sizeof lab, "c%d_post%d", cap, k); prof_dump(lab); Serial.printf("S c%d %d %.1f\n", cap, k, t[k]); }
+        if (k == 0 && sel) { snprintf(lab, sizeof lab, "c%d_post0", cap); prof_dump(lab); }
+#endif
     }
+#ifdef LQOCP_PROF
+    if (sel) { snprintf(lab, sizeof lab, "c%d_end", cap); prof_dump(lab); }
+    if (order) {                                       // warm steps by time: order[0] fastest .. order[98] slowest
+        for (int k = 0; k < STEPS - 1; ++k) order[k] = k + 1;
+        std::sort(order, order + STEPS - 1, [&](int a, int b) { return t[a] < t[b]; });
+    }
+#endif
     double xn = 0.0, tsum = 0.0;
     for (int i = 0; i < 12; ++i) xn += x[i] * x[i];
     const float cold = t[0];
@@ -155,6 +192,18 @@ static void report(const char* name, double J, int its, uint32_t us, int conv, i
     Serial.printf("%s J=%.12f its=%d t=%lu us conv=%d switches=%d\n", name, J, its, (unsigned long)us, conv, nsw);
 }
 
+#ifdef LQOCP_PROF
+#define PROF_RESET() lqocp::prof::reset()
+#define PROF_DUMP(l) prof_dump(l)
+// pass 1 orders the warm steps by time; pass 2 (the same deterministic loop) prints the median and the slowest step
+#define PROF_LOOP(cap) do { static int o[99]; closed_loop(cap, nullptr, o); const int sel[3] = {o[49], o[98], -1}; \
+                            closed_loop(cap, sel, nullptr); } while (0)
+#else
+#define PROF_RESET()
+#define PROF_DUMP(l)
+#define PROF_LOOP(cap) closed_loop(cap)
+#endif
+
 void setup() {
     Serial.begin(115200);
     ARM_DEMCR |= ARM_DEMCR_TRCENA;                     // DWT cycle counter
@@ -166,13 +215,15 @@ void setup() {
 void loop() {
 #ifdef BENCH_TINY
     {
+        PROF_RESET();
         const uint32_t t0 = micros();
         bool ok = gs.setup(BENCH_PROB[2], lookup, nullptr) && gs.solve(gr);
         const uint32_t t1 = micros();
         report("TINY", gr.cost, gr.iterations, t1 - t0, ok, gr.narcs - 1);
         if (!ok) Serial.printf("  failure: %s\n", gr.failure ? gr.failure : "setup");
-        closed_loop(100);
-        closed_loop(5);
+        PROF_DUMP("cold");
+        PROF_LOOP(100);
+        PROF_LOOP(5);
     }
 #elif defined(BENCH_ENERGY)
     for (int k = 0; k < 2; ++k) {
@@ -182,23 +233,27 @@ void loop() {
         report(k ? "B" : "A", er.cost, er.iterations, t1 - t0, ok, er.narcs - 1);
     }
     {
+        PROF_RESET();
         const uint32_t t0 = micros();
         bool ok = es.setup(TQ0) && es.solve(er);   // TinyMPC's own Q=0 terminal weight
         const uint32_t t1 = micros();
         report("TINY_Q0", er.cost, er.iterations, t1 - t0, ok, er.narcs - 1);
-        closed_loop(100);
-        closed_loop(5);
+        PROF_DUMP("cold");
+        PROF_LOOP(100);
+        PROF_LOOP(5);
     }
 #elif defined(BENCH_TIER2)
     {
+        PROF_RESET();
         const uint32_t t0 = micros();
         bool ok = tier2_setup() && ts.solve(tr);
         const uint32_t t1 = micros();
         report("TINY_Q0_X5", tr.cost, tr.iterations, t1 - t0, ok, tr.narcs - 1);
         if (!ok) Serial.printf("  failure: %s\n", tr.failure ? tr.failure : "setup");
         Serial.printf("  sizeof(StateSolver)=%u sizeof(StateResult)=%u\n", (unsigned)sizeof(ts), (unsigned)sizeof(tr));
-        closed_loop(100);
-        closed_loop(5);
+        PROF_DUMP("cold");
+        PROF_LOOP(100);
+        PROF_LOOP(5);
     }
 #else
     const uint32_t t0 = micros();

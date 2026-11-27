@@ -16,6 +16,7 @@
 #define LQOCP_HPP
 
 #include <stdint.h>
+#include "lqocp_prof.hpp"
 
 namespace lqocp {
 
@@ -499,6 +500,7 @@ template <class S, class R> struct MpcPlan {
     R it, plan;
     double age = -1.0;                               // < 0: no verified plan
     bool keep(bool ok, double dt) {
+        LQOCP_PROF_SCOPE(M_KEEP);
         if (ok) plan = it, age = 0.0;
         else if (age >= 0.0) age += dt;
         return ok;
@@ -508,6 +510,7 @@ template <class S, class R> struct MpcPlan {
     bool use_it(const S& s, double dt) const { return age < 0.0 || age + dt > s.horizon() * (1.0 + 1e-12); }   // apply it
     // mean input over the next dt (what a zero-order hold applies)
     bool mean_u(const S& s, double dt, double u[MAXM]) const {
+        LQOCP_PROF_SCOPE(M_MEANU);
         return use_it(s, dt) ? s.mean_u(it, 0.0, dt, u) : s.mean_u(plan, age, age + dt, u);
     }
 };

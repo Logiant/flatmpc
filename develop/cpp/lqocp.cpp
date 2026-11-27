@@ -1,11 +1,38 @@
 // Solver core. See lqocp.hpp. No heap, no exceptions, no STL.
 #include "lqocp.hpp"
 #include "lqocp_pd.hpp"
+#include "lqocp_prof.hpp"
 
 #include <math.h>
 #include <string.h>
 
 namespace lqocp {
+#ifdef LQOCP_PROF
+namespace prof {
+#define LQOCP_PROF_NAME(x) #x,
+const char* const name[NID] = {"top", LQOCP_PROF_IDS(LQOCP_PROF_NAME)};
+uint64_t incl[NID], excl[NID], pincl[NID][NID];
+uint32_t calls[NID], pcalls[NID][NID], depth[NID];
+int cur = NONE;
+uint64_t* cur_child = nullptr;
+#if defined(__arm__)
+uint32_t lo_, hi_;
+#else
+}  // namespace prof
+}  // namespace lqocp
+#include <chrono>
+namespace lqocp {
+namespace prof {
+uint64_t now() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+#endif
+void reset() {
+    memset(incl, 0, sizeof incl); memset(excl, 0, sizeof excl); memset(pincl, 0, sizeof pincl);
+    memset(calls, 0, sizeof calls); memset(pcalls, 0, sizeof pcalls);
+}
+}  // namespace prof
+#endif
 
 namespace pd {   // polynomial/linear-algebra helpers (lqocp_pd.hpp)
 
@@ -291,6 +318,7 @@ bool project(const T (*rows)[MAXM], const T* rhs, int m, uint16_t S, bool zfull,
 }  // namespace pd
 
 bool Solver::setup(const Problem& p) {
+    LQOCP_PROF_SCOPE(E_SETUP);
     sfail_ = pd::check_problem(p);
     return !sfail_ && setup_(p);
 }
@@ -499,6 +527,7 @@ void Solver::v_on(const real P[MAXM][MAXM], const real* q, const real* c, real t
 }
 
 void Solver::assemble(const uint16_t* S, const real* tau, int n, real* G, real* h) const {
+    LQOCP_PROF_SCOPE(E_ASSEMBLE);
     // s(T) = G c + h ; G is also the exact Jacobian ds(T)/dc. Row i of e^{A(T-t)} B has one
     // nonzero, (T-t)^(k-1-r)/(k-1-r)! in column l (state i = entry r of chain l, order k).
     real P[MAXM][MAXM], q[MAXM], KP[MAXM], tp[MAXK];
@@ -532,6 +561,7 @@ void Solver::assemble(const uint16_t* S, const real* tau, int n, real* G, real* 
 
 // uses G_ and W_
 bool Solver::solve_c(const uint16_t* S, const real* tau, int n, real* c) const {
+    LQOCP_PROF_SCOPE(E_SOLVEC);
     real h[MAXN];
     real* M = G_;
     assemble(S, tau, n, G_, h);
@@ -556,6 +586,7 @@ bool Solver::solve_c(const uint16_t* S, const real* tau, int n, real* c) const {
 }
 
 real Solver::cost(const uint16_t* S, const real* tau, int n, const real* c) const {
+    LQOCP_PROF_SCOPE(E_COST);
     real J = 0.0, v[MAXM], P[MAXM][MAXM], q[MAXM];
     for (int a = 0; a < n; ++a) {
         real t0, t1;
@@ -590,12 +621,14 @@ static const char* const INFEAS = "infeasible endpoint (no feasible input)";
 
 bool Solver::solve(Result& R) { return start(R, -1); }
 bool Solver::solve_warm(Result& R, int max_its, double dt) {
+    LQOCP_PROF_SCOPE(E_WARM);
     if (!isfinite(dt)) { R.converged = false; R.failure = LQOCP_STR("dt not finite"); return false; }
     if (dt != 0.0 && !general_) shift_warm(R, (real)dt);
     return start(R, max_its);
 }
 
 bool Solver::start(Result& R, int warm_its) {
+    LQOCP_PROF_SCOPE(E_SOLVE);
     R.converged = false;
     R.failure = LQOCP_STR("general cost: use GSolver");
     if (general_) return false;                       // general cost: use GSolver
@@ -647,6 +680,7 @@ void Solver::eval_x(const Result& R, double td, double xd[MAXN]) const {
 }
 
 bool Solver::mean_u(const Result& R, double t0d, double t1d, double u[MAXM]) const {
+    LQOCP_PROF_SCOPE(E_MEANU);
     const real t0 = (real)t0d, t1 = (real)t1d;
     if (R.narcs < 1 || !(t1 > t0)) return false;
     real acc[MAXM] = {0.0, 0.0, 0.0, 0.0}, v[MAXM], P[MAXM][MAXM], q[MAXM];
@@ -883,6 +917,7 @@ bool Solver::lex_set(const real* c, real t, uint16_t ev, uint16_t guess, uint16_
 }
 
 bool Solver::walk(const real* c, Eval& e) {
+    LQOCP_PROF_SCOPE(E_WALK);
     e.ndeg = 0;
     if (identity_) return walk_box(c, e);
     const real T = (real)p_->T;
@@ -948,6 +983,7 @@ bool Solver::walk(const real* c, Eval& e) {
 }
 
 bool Solver::walk_box(const real* c, Eval& e) {
+    LQOCP_PROF_SCOPE(E_WALKBOX);
     // Umap = identity: v_j = clip(w_j, lo_j, hi_j) per chain, events = roots of w_j - bound.
     const real T = (real)p_->T;
     real times[MAXARC_E];
@@ -1001,6 +1037,7 @@ bool Solver::walk_box(const real* c, Eval& e) {
 }
 
 real Solver::dual(const uint16_t* S, const real* tau, int n, const real* c, const real* mu, real* dabs) const {
+    LQOCP_PROF_SCOPE(E_DUAL);
     real val = 0.0, ab = 0.0;
     for (int i = 0; i < n_ && qf_; ++i) val += mu[i] * (g_[i] - 0.5 * mu[i]);
     for (int i = 0; i < n_ && !qf_; ++i) {
@@ -1036,11 +1073,13 @@ real Solver::dual(const uint16_t* S, const real* tau, int n, const real* c, cons
 // Weak duality: a feasible problem has D <= J* <= T jmax_. D above that by more than its rounding (a sum of
 // n_ + 4 narcs (2 m_ + 1) terms of total size Dabs) proves that no feasible input exists (exact, no threshold).
 bool Solver::infeasible(real D, real Dabs, int narcs) const {
+    LQOCP_PROF_SCOPE(E_INFEAS);
     const real J = (real)p_->T * jmax_;
     return D - J > (n_ + 4 * narcs * (2 * m_ + 1) + 2) * EPS * (Dabs + J);
 }
 
 bool Solver::evaluate(const real* c, const real* mu, Eval& e) {
+    LQOCP_PROF_SCOPE(E_EVAL);
     if (!walk(c, e)) return false;
     real h[MAXN];
     assemble(e.S, e.tau, e.narcs, G_, h);
@@ -1072,6 +1111,7 @@ bool Solver::evaluate(const real* c, const real* mu, Eval& e) {
 }
 
 real Solver::verify(const uint16_t* S, const real* tau, int n, const real* c, real* amp) const {
+    LQOCP_PROF_SCOPE(E_VERIFY);
     real worst = 0.0, box = 0.0, a_max = 0.0, phi[2 * MAXM][4], b[4], d[3], cr[2];
     bool has[2 * MAXM];
     for (int a = 0; a < n; ++a) {
@@ -1130,6 +1170,7 @@ void Solver::shift_dual(real* c, real* y, real dt) const {
 // Time shift of a warm start (solve_warm): the pattern loses the arcs that ended by dt, its switch times move
 // by -dt (the last arc reaches T), and c / mu are Taylor-shifted (natural extension of w on [T - dt, T]).
 void Solver::shift_warm(Result& R, real dt) {
+    LQOCP_PROF_SCOPE(E_SHIFT);
     real nu[MAXN];
     shift_dual(R.c, qf_ ? R.mu : nu, dt);
     int k0 = 0;
@@ -1141,6 +1182,7 @@ void Solver::shift_warm(Result& R, real dt) {
 
 // warm_its < 0: cold start (unconstrained solution; mu = 0 with Qf), else from R.c / R.mu.
 bool Solver::solve_newton(Result& R, int warm_its) {
+    LQOCP_PROF_SCOPE(E_NEWTON);
     R.iterations = 0;                             // warm: first the previous pattern
     if (warm_its >= 0 && try_reduced(R, warm_its < 4 ? warm_its : 4)) return true;
     R.newton_iterations = R.outer_iterations = 0;
@@ -1313,6 +1355,7 @@ real Solver::vtol(real amp) const { return 1e-12 * TS * (amp + R_); }
 // inactive, g(t) = e^T w(t) + g0. Control continuity at the switch <=> g = 0. gd = dg/dt,
 // gs = magnitude of g's terms (tolerance scale).
 real Solver::gapk(uint16_t SL, uint16_t SR, real t, const real* c, real* e, real* gd, real* gs) const {
+    LQOCP_PROF_SCOPE(E_GAPK);
     const uint16_t X = (uint16_t)(SL ^ SR);
     int key = 0;
     while (!(X & (1u << key))) ++key;
@@ -1343,6 +1386,7 @@ real Solver::gapk(uint16_t SL, uint16_t SR, real t, const real* c, real* e, real
 // Warm step on the previous pattern: accepted if the reduced Newton converges and verify passes
 // (then R is the solution); else R.iterations = the reduced iterations spent, R otherwise unchanged.
 bool Solver::try_reduced(Result& R, int max_its) {
+    LQOCP_PROF_SCOPE(E_REDUCED);
     if (!solve_reduced(R, max_its, &R.iterations)) return false;
     real amp;
     const real viol = verify(R.S, ew_.ev[1].tau, R.narcs, ew_.ev[1].F, &amp);
@@ -1369,6 +1413,7 @@ bool Solver::try_reduced(Result& R, int max_its) {
 // a = dg/dc (entries e_j t^p).
 void Solver::swjac(uint16_t SL, uint16_t SR, real t, const real* c, real g, real gd, const real* e,
                    real* d) const {
+    LQOCP_PROF_SCOPE(E_SWJAC);
     real dv[MAXM];
     {                                                 // own scope: stack shared with qk
         real P[MAXM][MAXM], q[MAXM], vr[MAXM];
@@ -1717,6 +1762,7 @@ void matvec(const double* M, int n, int ld, const double* v, double* t) {
 }  // namespace
 
 bool GSolver::setup(const Problem& p, BasisFn fn, void* ctx) {
+    LQOCP_PROF_SCOPE(G_SETUP);
     mt_.b = nullptr;
     setup_failure = fn ? check_problem(p) : LQOCP_STR("no BasisFn");
     if (setup_failure) return false;
@@ -1899,6 +1945,7 @@ bool GSolver::hmat(uint16_t S, double* H) const {
 
 // arc k of the structure (seq, tau): basis, projection, particular part
 bool GSolver::arc(int k, const uint16_t* seq, int N, const double* tau, Arc& a) const {
+    LQOCP_PROF_SCOPE(G_ARC);
     a.t0 = (k == 0) ? 0.0 : tau[k - 1];
     a.L = ((k == N - 1) ? p_->T : tau[k]) - a.t0;
     a.S = seq[k];
@@ -1939,6 +1986,7 @@ bool GSolver::arc(int k, const uint16_t* seq, int N, const double* tau, Arc& a) 
 // with the slow blocks' G(j) = L^j phi_j(Ls L) (gfun), the sum by Horner in N; the row form is its
 // transpose. No truncation, no substeps.
 void GSolver::cexp(const Arc& a, double L, double* y, bool row, bool aff) const {
+    LQOCP_PROF_SCOPE(G_CEXP);
     const SetBasis& b = *a.b;
     const int nc = b.nc, nz = b.nz, ni = b.ni;
     if (nc == 0 || L == 0.0) return;
@@ -2030,6 +2078,7 @@ void GSolver::cexp(const Arc& a, double L, double* y, bool row, bool aff) const 
 // z (augmented, z[2n] = 1) at t0 + sig on arc a
 // za (optional): za_i = sum_j |W_ij y_j|, the terms of z_i (its scale and rounding)
 void GSolver::zat(const Arc& a, double sig, double* z, double* za) const {
+    LQOCP_PROF_SCOPE(G_ZAT);
     const SetBasis& b = *a.b;
     const int n2 = 2 * n_, ns = b.ns, nc = b.nc, s1 = ns + nc;
     const double* x = a.x;
@@ -2109,6 +2158,7 @@ int GSolver::gphi(uint16_t S, int keys[2 * MAXM], double G[2 * MAXM][MAXM], doub
 // A = P - iQ in its two slots) and the centre part e^{M sig} [c; 1], M = [[Tc, yp_c], [0, 0]],
 // a polynomial of ni + 1 terms (M^(ni+1) = 0).
 bool GSolver::chan(const Arc& a, ArcFn& F) const {
+    LQOCP_PROF_SCOPE(G_CHAN);
     const SetBasis& b = *a.b;
     const int n = n_, n2 = 2 * n, ns = b.ns, nc = b.nc, s1 = ns + nc;
     double (*Bw)[N2] = F.amp;                          // wt = Bw y (y: modal coordinates); the
@@ -2249,6 +2299,7 @@ double GSolver::sbound(const RowFn& f, int nder, double t, bool full) const {
 // fills mt_ for the arc of F at sig (and its bound factors of kind 1 or 2 at half-width h; kind 2:
 // node [lo, hi] with midpoint sig)
 void GSolver::mtab(const ArcFn& F, double sig, double h, int kind, double lo, double hi) const {
+    LQOCP_PROF_SCOPE(G_MTAB);
     const SetBasis& b = *F.b;
     const int n2 = 2 * n_, ns = b.ns, s1 = ns + b.nc;
     const bool at = (mt_.b == F.b && mt_.L == F.L && mt_.sig == sig);
@@ -2271,6 +2322,7 @@ void GSolver::mtab(const ArcFn& F, double sig, double h, int kind, double lo, do
 
 // derivatives d[0..nd] of f at sig (closed form)
 void GSolver::feval(const RowFn& f, double sig, int nd, double* d) const {
+    LQOCP_PROF_SCOPE(G_FEVAL);
     const SetBasis& b = *f.F->b;
     const int n2 = 2 * n_, ns = b.ns, s1 = ns + b.nc;
     for (int k = 0; k <= nd; ++k) d[k] = 0.0;
@@ -2335,6 +2387,7 @@ void GSolver::ptaylor(const RowFn& f, double sig, int nd, double* d) const {
 // f(m) + |f'(m)| h + M2 h^2 / 2 and the same bound for the slow modes plus the envelopes
 // |A| e^{Re lam (t - anc)} of the fast ones (|lam| h > 1), which only decay away from their anchor.
 double GSolver::node(const RowFn& f, double lo, double hi, double* d, double* M2p) const {
+    LQOCP_PROF_SCOPE(G_NODE);
     const SetBasis& b = *f.F->b;
     const int n2 = 2 * n_, ns = b.ns, s1 = ns + b.nc, np = f.F->np;
     const double m = 0.5 * (lo + hi), h = 0.5 * (hi - lo), L = f.F->L;
@@ -2383,6 +2436,7 @@ double GSolver::node(const RowFn& f, double lo, double hi, double* d, double* M2
 
 // root of f in [lo, hi] with f(lo) <= 0 < f(hi): safeguarded Newton
 double GSolver::froot(const RowFn& f, double lo, double hi) const {
+    LQOCP_PROF_SCOPE(G_FROOT);
     double x = 0.5 * (lo + hi), d[2];
     for (int it = 0; it < 200; ++it) {
         feval(f, x, 1, d);
@@ -2404,6 +2458,7 @@ double GSolver::froot(const RowFn& f, double lo, double hi) const {
 // NaN when f is not finite.
 double GSolver::bb(const RowFn& f, double a, double b, double thr, double atol, bool first,
                    double* root, bool* simple) const {
+    LQOCP_PROF_SCOPE(G_BB);
     const SetBasis& sb = *f.F->b;
     if (sb.nc == 2 * n_ && !f.F->nsb) return pbb(f, a, b, thr, first, root, simple);
     const double minw = 1e-14 * p_->T;
@@ -2449,6 +2504,7 @@ double GSolver::bb(const RowFn& f, double a, double b, double thr, double atol, 
 // roots of the next one; one root per sign change, safeguarded Newton). Same contract as bb().
 double GSolver::pbb(const RowFn& f, double a, double b, double thr, bool first, double* root,
                     bool* simple) const {
+    LQOCP_PROF_SCOPE(G_PBB);
     const int np = f.F->np;
     double P[NPOLY] = {0.0}, Pl[NPOLY], Pd[NPOLY], x[NPOLY + 1], y[NPOLY + 1];
     for (int k = 0; k < np; ++k) P[k] = f.p(k) + ((k == 0) ? f.c0 : 0.0);
@@ -2522,6 +2578,7 @@ bool GSolver::glex_ok(uint16_t S, const ArcFn& F, double sig, double h, double* 
 // the minimiser's set just right of sig; tol[r] gets the lead() tolerances of its rows
 bool GSolver::glex_set(const ArcFn& F, double sig, double h, uint16_t guess, uint16_t* out, double* tol,
                        uint16_t ev) const {
+    LQOCP_PROF_SCOPE(G_GLEX);
     if (guess != 0xFFFFu && valid_set(guess) && glex_ok(guess, F, sig, h, tol, ev)) { *out = guess; return true; }
     return for_sets([&](uint16_t S) {
         if (!glex_ok(S, F, sig, h, tol, ev)) return false;
@@ -2535,6 +2592,7 @@ bool GSolver::glex_set(const ArcFn& F, double sig, double h, uint16_t guess, uin
 // value there (a root's rounding, amplified by nearly dependent rows) is not used
 double GSolver::lead(const ArcFn& F, const double* G, double g0, double sig, double h, double* tolp,
                      int* ilead, bool ev) const {
+    LQOCP_PROF_SCOPE(G_LEAD);
     if (!ev) {   // cheap case: f(sig) above a bound of the tolerance (sum_k |c_k| h^k <= this sum)
         RowFn f;
         rowfn(F, G, g0, f);
@@ -2573,6 +2631,7 @@ double GSolver::lead(const ArcFn& F, const double* G, double g0, double sig, dou
 // (lead()); *imm gets the rows already beyond tolerance at sig (order 0: not zero there).
 int GSolver::events(const ArcFn& F, uint16_t S, double sig, double h, double* rootk, bool* simplek,
                     int* keyk, double* s1p, const double* lexed, uint16_t ev, uint16_t* imm) {
+    LQOCP_PROF_SCOPE(G_EVENTS);
     int keys[2 * MAXM], nc = 0;
     double G[2 * MAXM][MAXM], g0[2 * MAXM], s1 = HUGE_VAL;
     const int nk = gphi(S, keys, G, g0);
@@ -2607,6 +2666,7 @@ int GSolver::events(const ArcFn& F, uint16_t S, double sig, double h, double* ro
 // Per arc of the iterate, the switching rows are exponential-polynomials: the first crossing is
 // found by bb() (certified, no grid), the set after it by the Taylor sign tests at the event.
 bool GSolver::gwalk(const uint16_t* seq, int N, const double* tau, int* ndeg) {
+    LQOCP_PROF_SCOPE(G_GWALK);
     const double T = p_->T;
     *ndeg = 0;
     int ns = 0;
@@ -2671,6 +2731,7 @@ bool GSolver::gwalk(const uint16_t* seq, int N, const double* tau, int* ndeg) {
 // arcs differ only by the BVP solution's error) and (b) the junction residuals the tau stop left (newton_tau's resid:
 // a row's value at its own junction, zero at the exact junction time; a stall leaves it at the noise, t3_port3.md).
 double GSolver::jnoise(const uint16_t* seq, int N, const double* tau) const {
+    LQOCP_PROF_SCOPE(G_JNOISE);
     double D = 0.0, zl[N2 + 1], zr[N2 + 1], wl[MAXM], wr[MAXM], G[2 * MAXM][MAXM], g0[2 * MAXM];
     Arc al, ar;
     for (int k = 1; k < N; ++k) {
@@ -2703,6 +2764,7 @@ double GSolver::jnoise(const uint16_t* seq, int N, const double* tau) const {
 // it at its junction); a box row (inactive: a gap in input units) is also held to BOXTOL R - D, so its true value is
 // within the box acceptance. bb's max is within its level of the true one, a tenth of vt. *worst = the largest row max
 double GSolver::gverify(const uint16_t* seq, int N, const double* tau, double D, double* worst) {
+    LQOCP_PROF_SCOPE(G_GVERIFY);
     double q = 0.0;
     ArcFn F;
     RowFn f;
@@ -2790,6 +2852,7 @@ void GSolver::wint(const ArcFn& F, double sa, double sb, double* I) const {
 
 // lambda(0)'x0 - lambda(T)'s(T)
 double GSolver::gends(const uint16_t* seq, int N, const double* tau) const {
+    LQOCP_PROF_SCOPE(G_GENDS);
     double z0[N2 + 1], J = 0.0;
     zstart(seq, N, tau, 0, z0);
     for (int i = 0; i < n_; ++i) J += z0[n_ + i] * x0_[i] - zT_[n_ + i] * zT_[i];
@@ -2800,6 +2863,7 @@ double GSolver::gends(const uint16_t* seq, int N, const double* tau) const {
 // so int = 1/2 [lambda(0)'x0 - lambda(T)'s(T) - int mu'b dt] (the terminal cost: gterm); mu is linear in wt
 // on a saturated arc, and int wt = sum of modal phi1 terms + the integrated polynomial.
 double GSolver::gcost(const uint16_t* seq, int N, const double* tau, double ends) {
+    LQOCP_PROF_SCOPE(G_GCOST);
     double J = ends, mub = 0.0;
     ArcFn F;
     for (int ka = 0; ka < N; ++ka) {
@@ -2825,11 +2889,13 @@ double GSolver::gcost(const uint16_t* seq, int N, const double* tau, double ends
 }
 
 void GSolver::gscale(double kap) {
+    LQOCP_PROF_SCOPE(G_GSCALE);
     for (int k = 0; k < 2 * m_; ++k) rhs_[k] = rhs0_[k] * kap;
 }
 
 // max_t of (row r of the unscaled bounds) / bound along the current trajectory (exact max)
 double GSolver::gmax_ratio(const uint16_t* seq, int N, const double* tau) {
+    LQOCP_PROF_SCOPE(G_GMAXR);
     double r = 0.0;
     ArcFn F;
     RowFn f;
@@ -2868,6 +2934,7 @@ void GSolver::init_rel() {
 
 // Advance the relation from the start of arc a to its end (z-space at both ends).
 bool GSolver::fstep(const Arc& a, int nb) {
+    LQOCP_PROF_SCOPE(G_FSTEP);
     const SetBasis& b = *a.b;
     const int n = n_, n2 = 2 * n, ns = b.ns, nc = b.nc, s1 = ns + nc;
     const int c1 = N2 + 1 + nb;
@@ -2943,6 +3010,7 @@ bool GSolver::fstep(const Arc& a, int nb) {
 // in z directly: C' = C e^{-HL} = sum_k w_k, w_k = C (-HL)^k / k!, d' = d + sum_k (w_k f) L / (k + 1)
 // (= C int_0^L e^{-Hs} f ds). Finite sums: w_k = 0 for k >= the nilpotency index (<= 2 n).
 void GSolver::vstep(const Arc& a) {
+    LQOCP_PROF_SCOPE(G_VSTEP);
     const int n = n_, n2 = 2 * n;
     double f[MAXM];
     for (int j = 0; j < m_; ++j) {
@@ -2979,6 +3047,7 @@ void GSolver::vstep(const Arc& a) {
 
 // re-orthonormalise the relation rows (modified Gram-Schmidt, twice), same ops on rhs/sensitivities
 bool GSolver::ortho(int c1) {
+    LQOCP_PROF_SCOPE(G_ORTHO);
     const int n = n_, n2 = 2 * n;
     for (int i = 0; i < n; ++i) {
         for (int pass = 0; pass < 2; ++pass)
@@ -3001,6 +3070,7 @@ bool GSolver::ortho(int c1) {
 // Vector-field jump (f_{j-1} - f_j)(z(tau_j)) = (Bt (vt_{j-1} - vt_j), 0): only the chain-end
 // entries end_[i] are nonzero; D[i] holds them.
 void GSolver::jump(const uint16_t* seq, int N, const double* tau, int j, double* D) const {
+    LQOCP_PROF_SCOPE(G_JUMP);
     double z[N2 + 1], wt[MAXM], P[MAXM][MAXM], q[MAXM], dv[MAXM];
     zstart(seq, N, tau, j, z);
     wt_of(z + n_, wt);
@@ -3075,6 +3145,7 @@ void GSolver::unforce(Arc& a) const {
 }
 
 bool GSolver::forward(const uint16_t* seq, int N, const double* tau, int b0, int nb, int* stride) {
+    LQOCP_PROF_SCOPE(G_FORWARD);
     const int st = (N + NCK) / NCK;                    // ceil((N + 1) / NCK)
     const int w = N2 + 1 + nb;
     init_rel();
@@ -3090,6 +3161,7 @@ bool GSolver::forward(const uint16_t* seq, int N, const double* tau, int b0, int
 
 // relation at tau_k^+ (start of arc k) from the nearest stored one
 bool GSolver::load(const uint16_t* seq, int N, const double* tau, int k, int stride, int b0, int nb) {
+    LQOCP_PROF_SCOPE(G_LOAD);
     const int c = k / stride, w = N2 + 1 + nb;
     if (c == 0) init_rel();
     else
@@ -3106,6 +3178,7 @@ bool GSolver::load(const uint16_t* seq, int N, const double* tau, int k, int str
 // Column 0 (rhs) -> zT (if given); sensitivity columns (homogeneous) -> Z_.
 // zp (refine): the plan's z(T); column 0 is then the correction delta with zp + delta meeting the condition.
 bool GSolver::terminal(int nb, double* zT, const double* zp) {
+    LQOCP_PROF_SCOPE(G_TERMINAL);
     const int n = n_;
     const bool qf = p_->has_Qf;
     double cs[MAXN], cl[MAXN];
@@ -3192,6 +3265,7 @@ void GSolver::zrows(const Arc& a, const double* eta) {
 // sensitivity columns) and the relation at t0 in rel_, solve for the arc coefficients
 // (-> xout for the BVP column) and replace the columns by z(t0).
 bool GSolver::recover(const Arc& a, int nb, bool aff, double* xout, double* zb) {
+    LQOCP_PROF_SCOPE(G_RECOVER);
     const SetBasis& b = *a.b;
     const int n = n_, n2 = 2 * n, ns = b.ns, nc = b.nc, s1 = ns + nc;
     const int ncols = aff ? 1 : nb, c0 = aff ? N2 : N2 + 1;
@@ -3312,6 +3386,7 @@ bool GSolver::recover(const Arc& a, int nb, bool aff, double* xout, double* zb) 
 
 // Linear BVP for fixed junction times -> arc coefficients R_out->x, zT_
 bool GSolver::bvp(const uint16_t* seq, int N, const double* tau) {
+    LQOCP_PROF_SCOPE(G_BVP);
     if (N > NA) { capfail_ = true; return false; }
     int stride;
     if (!forward(seq, N, tau, 0, 0, &stride) || !terminal(0, zT_)) return false;
@@ -3333,6 +3408,7 @@ bool GSolver::bvp(const uint16_t* seq, int N, const double* tau) {
 // represent misses x0, continuity and the terminal condition by the BVP's conditioning times rounding. Those
 // defects drive the same sweep without particular parts; the correction is added to the arcs, zT_ follows.
 bool GSolver::refine(const uint16_t* seq, int N, const double* tau) {
+    LQOCP_PROF_SCOPE(G_REFINE);
     double zp[N2 + 1], zb[N2], dT[N2], dx[N2], D[N2];
     Arc a;
     if (!arc(N - 1, seq, N, tau, a)) return false;
@@ -3360,6 +3436,7 @@ bool GSolver::refine(const uint16_t* seq, int N, const double* tau) {
 // Residual rows of the junction conditions: one per switching row, evaluated on the side where
 // the row is inactive (control continuity). Returns -1 if there are more than NR.
 int GSolver::jrows(const uint16_t* seq, int N) {
+    LQOCP_PROF_SCOPE(G_JROWS);
     int nr = 0;
     for (int j = 1; j < N; ++j) {
         const uint16_t L = seq[j - 1], Rr = seq[j], X = (uint16_t)(L ^ Rr);
@@ -3400,6 +3477,7 @@ bool GSolver::rowphi(const uint16_t* seq, int q, double G[MAXM], double* g0) con
 }
 
 double GSolver::resid(const uint16_t* seq, int N, const double* tau, double* rv) const {
+    LQOCP_PROF_SCOPE(G_RESID);
     double mx = 0.0;
     for (int q = 0; q < nr_; ++q) {
         double z[N2 + 1], wt[MAXM], G[MAXM], g0 = 0.0;
@@ -3417,6 +3495,7 @@ double GSolver::resid(const uint16_t* seq, int N, const double* tau, double* rv)
 // Jacobian of the junction residuals w.r.t. the junction times (implicit part): moving tau_j
 // injects the jump D_j into the homogeneous BVP. Columns in blocks of NB -> J_.
 bool GSolver::sens(const uint16_t* seq, int N, const double* tau) {
+    LQOCP_PROF_SCOPE(G_SENS);
     const int nj = N - 1;
     for (int b0 = 0; b0 < nj; b0 += NB) {
         const int nb = (nj - b0 < NB) ? nj - b0 : NB;
@@ -3489,6 +3568,7 @@ void GSolver::collapse(uint16_t* seq, int* N, double* tau, int j) const {
 // explicit part of d r_q / d tau_k: the evaluation point moves, z(tau_k^-)' = zdot, whose lambda
 // part -Q s - A^T lambda is the same on both sides
 double GSolver::explicit_term(const uint16_t* seq, int N, const double* tau, int q) const {
+    LQOCP_PROF_SCOPE(G_EXPL);
     const int k = jq_[q];
     double z[N2 + 1], ld[MAXN], wt[MAXM], G[MAXM], g0, v = 0.0;
     zstart(seq, N, tau, k, z);
@@ -3508,6 +3588,7 @@ double GSolver::explicit_term(const uint16_t* seq, int N, const double* tau, int
 // Newton on the junction times with exact derivatives. Arc collapse inside a step is an exact
 // event. Fails fast when the residual does not contract. seq/N/tau are updated in place.
 bool GSolver::newton_tau(uint16_t* seq, int* Np, double* tau, int* its) {
+    LQOCP_PROF_SCOPE(G_NEWTON);
     *its = 0;
     int N = *Np;
     if (!bvp(seq, N, tau)) return false;
@@ -3534,6 +3615,7 @@ bool GSolver::newton_tau(uint16_t* seq, int* Np, double* tau, int* its) {
         if (chord) ++nchord;
         else ++nfresh;
         if (chord) {
+            LQOCP_PROF_SCOPE(N_CHORD);
             for (int q = 0; q < nr; ++q) J_[q][nj] = (real)(-r[q]);
             for (int k = 0; k < nj; ++k) {              // stored reflections (v below the diagonal)
                 double s = hv[k] * J_[k][nj];
@@ -3543,6 +3625,7 @@ bool GSolver::newton_tau(uint16_t* seq, int* Np, double* tau, int* its) {
                 for (int q = k + 1; q < nr; ++q) J_[q][nj] = (real)(J_[q][nj] - s * J_[q][k]);
             }
         } else {
+        LQOCP_PROF_SCOPE(N_SENSQR);
         if (nr < nj || !sens(seq, N, tau)) { *Np = N; return false; }
         for (int q = 0; q < nr; ++q) {
             const int k = jq_[q];
@@ -3550,6 +3633,7 @@ bool GSolver::newton_tau(uint16_t* seq, int* Np, double* tau, int* its) {
             J_[q][nj] = (real)(-r[q]);
         }
         // Gauss-Newton step: least squares J d = -r by Householder QR (in place)
+        LQOCP_PROF_SCOPE(N_QR);
         double jmax = 0.0;
         for (int q = 0; q < nr; ++q)
             for (int c = 0; c < nj; ++c) jmax = fmax(jmax, fabs(J_[q][c]));
@@ -3576,11 +3660,13 @@ bool GSolver::newton_tau(uint16_t* seq, int* Np, double* tau, int* its) {
         fact = !sing;
         }
         if (sing) { *Np = N; return false; }
+        LQOCP_PROF_SCOPE(N_SOLVE);
         for (int i = nj - 1; i >= 0; --i) {
             double s = J_[i][nj];
             for (int k = i + 1; k < nj; ++k) s -= J_[i][k] * d[k];
             d[i] = s / J_[i][i];
         }
+        LQOCP_PROF_END(N_SOLVE);
         // exact arc-collapse event along the full step
         double amax = 1.0;
         int jc = -1;
@@ -3590,6 +3676,7 @@ bool GSolver::newton_tau(uint16_t* seq, int* Np, double* tau, int* its) {
             if (dL < 0 && L + dL <= gap && L / -dL < amax) { amax = L / -dL; jc = j; }
         }
         if (jc >= 0) {
+            LQOCP_PROF_SCOPE(N_COLLAPSE);
             uint16_t sq[NA];                          // undo copy (tn is free here)
             const int N0 = N;
             for (int j = 0; j < N; ++j) sq[j] = seq[j];
@@ -3619,6 +3706,7 @@ bool GSolver::newton_tau(uint16_t* seq, int* Np, double* tau, int* its) {
         double nr0 = 0.0;
         for (int q = 0; q < nr; ++q) nr0 += r[q] * r[q];
         nr0 = sqrt(nr0);
+        LQOCP_PROF_SCOPE(N_LSEARCH);
         double alpha = 1.0;
         bool acc = false;
         while (alpha > 1e-3) {
@@ -3631,6 +3719,7 @@ bool GSolver::newton_tau(uint16_t* seq, int* Np, double* tau, int* its) {
             }
             alpha *= 0.5;
         }
+        LQOCP_PROF_END(N_LSEARCH);
         if (!acc && chord && bvp(seq, N, tau)) { fact = false; continue; }   // retry with a fresh J
         if (!acc) {
             bvp(seq, N, tau);                         // restore the state of tau
@@ -3650,6 +3739,7 @@ bool GSolver::newton_tau(uint16_t* seq, int* Np, double* tau, int* its) {
 
 // Exact event walk along the current BVP solution -> wseq_/wtau_ (round-off chatter removed)
 bool GSolver::propose(const uint16_t* seq, int N, const double* tau, int* ndeg) {
+    LQOCP_PROF_SCOPE(G_PROPOSE);
     if (!gwalk(seq, N, tau, ndeg)) return false;
     for (int i = 1; i + 1 < wn_;) {
         const double len = wtau_[i] - wtau_[i - 1];
@@ -3668,6 +3758,7 @@ bool GSolver::propose(const uint16_t* seq, int N, const double* tau, int* ndeg) 
 // the exact walk; repeat with the walked structure (at most `rounds` times). On failure aseq_/atau_
 // hold the last iterate's structure.
 bool GSolver::correct(int* its, int* outer, int* ndeg, int rounds) {
+    LQOCP_PROF_SCOPE(G_CORRECT);
     uint16_t seq[NA];
     double tau[NA];
     int N = an_, retry = (rounds > 3) ? rounds : 1;   // walks after a failed Newton (warm: every round)
@@ -3738,6 +3829,7 @@ const char* GSolver::bfail() {
 bool GSolver::solve(GResult& R) { return cold(R, MAX_GEN_ITS); }
 
 bool GSolver::cold(GResult& R, int max_its) {
+    LQOCP_PROF_SCOPE(G_COLD);
     begin(R, max_its);
     R.narcs = 0;
     if (!x0ok_) { R.failure = LQOCP_STR("non-finite x0"); return false; }
@@ -3827,9 +3919,11 @@ bool GSolver::cold(GResult& R, int max_its) {
 // converged = false. A previous plan that is not converged and violates PMP by more than WRESET*R
 // (a stale active set asking for inputs far outside the box) is not reused: cold restart.
 bool GSolver::solve_warm(GResult& R, int max_its, double dt) {
+    LQOCP_PROF_SCOPE(G_WARM);
     if (!isfinite(dt)) { R.converged = false; R.failure = LQOCP_STR("dt not finite"); return false; }
     if (R.narcs < 1 || R.narcs > NA || !x0ok_ || (!R.converged && !(R.pmp_violation <= WRESET * R_)))
         return cold(R, max_its);
+    LQOCP_PROF_SCOPE(G_SHIFT);
     const double T = p_->T;
     an_ = 0;
     for (int k = 0; k < R.narcs; ++k) {
@@ -3840,6 +3934,7 @@ bool GSolver::solve_warm(GResult& R, int max_its, double dt) {
         if (!last) atau_[an_] = t1;
         ++an_;
     }
+    LQOCP_PROF_END(G_SHIFT);
     begin(R, max_its);
     int its = 0, outer = 0, ndeg = 0;
     if (correct(&its, &outer, &ndeg, 12)) return finish(R, true, nullptr, its, 0, ndeg);
@@ -3861,6 +3956,7 @@ bool GSolver::solve_warm(GResult& R, int max_its, double dt) {
 // terms of s(T)). Returns max_i |F_i| / a_i; *jf = 1/2 |Cf (s(T) - xf)|^2 at
 // zT_ (factored: e'Qf e cancels below 0 for an ill-conditioned Qf).
 double GSolver::gterm(double* jf) const {
+    LQOCP_PROF_SCOPE(G_GTERM);
     const GResult& R = *R_out;
     const int n = n_;
     double z[N2 + 1], za[N2], sg[MAXN], r = 0.0;
@@ -3916,6 +4012,7 @@ double GSolver::gterm(double* jf) const {
 // more than its rounding proves that no such input exists: exact, no threshold. nu = -+lambda(T) of the BVP solution in
 // place (an infeasible problem's costate runs off along a separating nu; any nu is valid, so both signs are tried).
 bool GSolver::infeasible() const {
+    LQOCP_PROF_SCOPE(G_INFEAS);
     static_assert(MAXK == 4, "g = g[0..3]: g' has degree <= 2");
     if (p_->has_Qf || !p_->has_bounds || !mreg_) return false;
     auto pv = [](const double* c, double x) { double v = 0.0; for (int k = MAXK - 1; k >= 0; --k) v = v * x + c[k]; return v; };
@@ -4000,6 +4097,7 @@ bool GSolver::infeasible() const {
 // shortcut: no test without a certificate (fixed endpoint, M singular) or with 0 outside the box (Qf, jbnd_ < 0): the
 // homotopy's step floor or the iteration cap ends a diverging run there; a feasible point's cost would be the upgrade.
 bool GSolver::diverged(bool pmp) {
+    LQOCP_PROF_SCOPE(G_DIVERGED);
     if (!p_->has_Qf) return infeas_ = infeasible();
     if (!pmp) return false;
     if (jbnd_ != jbnd_) free_bound();
@@ -4045,6 +4143,7 @@ void GSolver::free_bound() {
 }
 
 bool GSolver::finish(GResult& R, bool conv, const char* why, int its, int nsteps, int ndeg) {
+    LQOCP_PROF_SCOPE(G_FINISH);
     R.iterations = its;
     R.outer_iterations = nsteps;
     R.degenerate_events = ndeg;
@@ -4110,6 +4209,7 @@ void GSolver::eval_x(const GResult& R, double t, double x[MAXN]) const {
 
 // u = Lc^-T vt (R = Lc Lc^T), saturated to lo <= M u <= hi
 void GSolver::clampu(double* u) const {
+    LQOCP_PROF_SCOPE(G_CLAMPU);
     for (int i = m_ - 1; i >= 0; --i) {
         double s = u[i];
         for (int k = i + 1; k < m_; ++k) s -= Lc_[k][i] * u[k];
@@ -4152,6 +4252,7 @@ bool GSolver::eval_u(const GResult& R, double t, double u[MAXM]) const {
 
 // mean input over [t0, t1] (closed form); u is left unchanged on failure
 bool GSolver::mean_u(const GResult& R, double t0, double t1, double u[MAXM]) const {
+    LQOCP_PROF_SCOPE(G_MEANU);
     double v[MAXM] = {0.0, 0.0, 0.0, 0.0};
     if (R.narcs < 1 || !(t1 > t0)) return false;
     Arc a;
