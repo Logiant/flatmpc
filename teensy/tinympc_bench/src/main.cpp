@@ -3,6 +3,9 @@
 #include <Arduino.h>
 #include <algorithm>
 #include <malloc.h>
+#ifdef EXACT_ZOH
+#include "exact_zoh.h"
+#endif
 
 // measured peak stack (DTCM painted from above the 32-byte MPU guard at _ebss to the stack top) and heap (bytes malloc got from sbrk)
 extern "C" char _ebss, _estack;
@@ -17,6 +20,11 @@ static void mem_report() {
                   (unsigned)mallinfo().arena, (unsigned)mallinfo().uordblks);
 }
 
+#ifdef SAT_U
+#define SAT_TAG " sat"
+#else
+#define SAT_TAG ""
+#endif
 static TinySolver *make(int max_iter) {
     TinySolver *s = quad_setup();
     // rho fix: rebuild the cache from the ORIGINAL Q, R (tiny_setup passes Q+rho, R+rho, so rho is added twice).
@@ -39,6 +47,15 @@ static void cold(int max_iter) {
         tiny_solve(s);
         uint32_t c = ARM_DWT_CYCCNT - c0;
         int it = s->solution->iter;
+#ifdef TRACE   // plan (unprojected work->u, 9 columns) and the cached Pinf, for the host judge (t3_tinympc_matched/judge.py)
+        if (rep == 0) {
+            Serial.printf("TC");
+            for (int k = 0; k < NH - 1; k++) for (int i = 0; i < NU; i++) Serial.printf(" %.17g", (double)s->work->u(i, k));
+            Serial.printf("\nTP");
+            for (int i = 0; i < NX; i++) for (int j = 0; j < NX; j++) Serial.printf(" %.17g", (double)s->cache->Pinf(i, j));
+            Serial.printf("\n");
+        }
+#endif
         Serial.printf("cold maxit=%d rep=%d iter=%d solved=%d t_us=%.1f us_per_iter=%.2f u0=[%.6f %.6f %.6f %.6f]\n",
                       max_iter, rep, it, s->solution->solved, us(c), us(c) / it,
                       (double)s->solution->u(0, 0), (double)s->solution->u(1, 0),
@@ -52,6 +69,13 @@ static void closed_loop(int max_iter) {
     const int STEPS = 100;
     TinySolver *s = make(max_iter);
     tinyVector x = Map<const tinyVector>(X0, NX);
+#ifdef EXACT_ZOH   // plant state in double, propagated by the exact ZOH of lqocp_bench's loop
+    double xd[NX];
+    for (int i = 0; i < NX; i++) xd[i] = X0[i];
+#define XK(i) xd[i]
+#else
+#define XK(i) (double)x(i)
+#endif
     double J = 0, Jq = 0, umax = 0;  // J_cl = sum 1/2 (x'Qx + u'Ru) dt with the stage Q, and with TINY's Q; max |u| applied
     float t[STEPS]; long total = 0; int nconv = 0, itmax = 0; double tsum = 0, itus = 0;
     for (int k = 0; k < STEPS; k++) {
@@ -62,13 +86,33 @@ static void closed_loop(int max_iter) {
         int it = s->solution->iter;
         total += it; nconv += s->solution->solved; itmax = std::max(itmax, it); tsum += t[k];
         if (it) itus += t[k] / it;
+#ifdef TRACE   // step, iter, solved, t_us, plant state, plan (unprojected work->u)
+        Serial.printf("TS %d %d %d %.1f", k, it, s->solution->solved, (double)t[k]);
+        for (int i = 0; i < NX; i++) Serial.printf(" %.17g", XK(i));
+        for (int j = 0; j < NH - 1; j++) for (int i = 0; i < NU; i++) Serial.printf(" %.17g", (double)s->work->u(i, j));
+        Serial.printf("\n");
+#endif
         tinyVector u0 = s->work->u.col(0);
+#ifdef SAT_U   // host variant (t3_tinympc_matched): apply col 0 clipped to the box, as ours (MpcPlan::mean_u saturates)
+        u0 = u0.cwiseMax(tinytype(-0.5)).cwiseMin(tinytype(0.5));
+#endif
         double ur = 4.0 * (double)u0.squaredNorm(), sq = 0, sqt = 0;
-        for (int i = 0; i < NX; i++) { sq += Q_stage[i] * x(i) * x(i); sqt += Q_d[i] * x(i) * x(i); }
+        for (int i = 0; i < NX; i++) { sq += Q_stage[i] * XK(i) * XK(i); sqt += Q_d[i] * XK(i) * XK(i); }
         J += 0.5 * (sq + ur) * 0.05; Jq += 0.5 * (sqt + ur) * 0.05;
         umax = std::max(umax, (double)u0.cwiseAbs().maxCoeff());
+#ifdef EXACT_ZOH
+        double y[NX];
+        for (int i = 0; i < NX; i++) {
+            y[i] = 0;
+            for (int j = 0; j < NX; j++) y[i] += AZ[i][j] * xd[j];
+            for (int j = 0; j < NU; j++) y[i] += BZ[i][j] * (double)u0(j);
+        }
+        for (int i = 0; i < NX; i++) x(i) = (tinytype)(xd[i] = y[i]);
+#else
         x = s->work->Adyn * x + s->work->Bdyn * s->work->u.col(0);
+#endif
     }
+#undef XK
     std::sort(t, t + STEPS);
     Serial.printf("loop maxit=%d total_iter=%ld mean_iter=%.2f max_iter_seen=%d converged=%d/%d "
                   "t_us mean=%.1f median=%.1f max=%.1f min=%.1f total_ms=%.2f us_per_iter=%.2f final|x|=%.3g J_cl=%.9f J_cl_tinyQ=%.9f max|u|=%.6f\n",
@@ -85,7 +129,7 @@ void setup() {
 }
 
 void loop() {
-    Serial.printf("=== TinyMPC 0.0.8 %s Q%s, F_CPU=%lu ===\n", sizeof(tinytype) == 8 ? "double" : "float", Q_stage == Q_d ? "=TINY" : "=0", (unsigned long)F_CPU_ACTUAL);
+    Serial.printf("=== TinyMPC 0.0.8 %s Q%s" SAT_TAG ", F_CPU=%lu ===\n", sizeof(tinytype) == 8 ? "double" : "float", Q_stage == Q_d ? "=TINY" : "=0", (unsigned long)F_CPU_ACTUAL);
     cold(10000);
     closed_loop(1000);
     closed_loop(100);
