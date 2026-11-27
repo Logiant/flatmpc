@@ -357,6 +357,7 @@ private:
     int budget_;                     // Newton iterations left (iteration cap)
     bool cert_;                      // the BVP solution in place was certified by the walk
     double wthr_;                    // largest switching-row level the walk certified
+    bool hom_ = false;               // refine()'s sweep: plan defects injected, particular parts off
     mutable uint16_t bkey_;          // basis key whose BasisFn lookup failed (0xFFFF: none)
     char why_[40];                   // failure text of bfail()
     GResult* R_out;
@@ -433,7 +434,11 @@ private:
     bool advance(const uint16_t* seq, int N, const double* tau, int k, int b0, int nb);
     bool forward(const uint16_t* seq, int N, const double* tau, int b0, int nb, int* stride);
     bool load(const uint16_t* seq, int N, const double* tau, int k, int stride, int b0, int nb);
-    __attribute__((noinline)) bool terminal(int nb, double* zT);
+    __attribute__((noinline)) bool terminal(int nb, double* zT, const double* zp = nullptr);
+    bool defect(const uint16_t* seq, int N, const double* tau, int k, double* d) const;
+    bool hjump(const uint16_t* seq, int N, const double* tau, int k);
+    void unforce(Arc& a) const;
+    bool refine(const uint16_t* seq, int N, const double* tau);
     __attribute__((noinline)) bool recover(const Arc& a, int nb, bool aff, double* xout, double* zb);
     bool bvp(const uint16_t* seq, int N, const double* tau);
     int jrows(const uint16_t* seq, int N);

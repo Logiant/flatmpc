@@ -2824,7 +2824,7 @@ void GSolver::init_rel() {
     for (int r = 0; r < n_; ++r) {
         for (int c = 0; c < NCOL; ++c) rel_[r][c] = 0;
         rel_[r][r] = 1;
-        rel_[r][N2] = x0_[r];
+        rel_[r][N2] = hom_ ? 0.0 : x0_[r];             // (refine: x0's defect enters at junction 0)
     }
 }
 
@@ -2994,7 +2994,46 @@ void GSolver::inject(int k, int b0, int nb) {
 
 bool GSolver::advance(const uint16_t* seq, int N, const double* tau, int k, int b0, int nb) {
     inject(k, b0, nb);
-    return arc(k, seq, N, tau, ac_) && fstep(ac_, nb);
+    if (!hjump(seq, N, tau, k) || !arc(k, seq, N, tau, ac_)) return false;
+    if (hom_) unforce(ac_);
+    return fstep(ac_, nb);
+}
+
+// plan defect at junction k of R_out->x on (seq, tau): z_k(tau_k^+) - z_{k-1}(tau_k^-); k = 0: (s_0(0) - x0, 0)
+bool GSolver::defect(const uint16_t* seq, int N, const double* tau, int k, double* d) const {
+    Arc a;
+    double z[N2 + 1], w[N2 + 1];
+    if (!arc(k, seq, N, tau, a)) return false;
+    a.x = R_out->x[k];
+    zat(a, 0.0, z);
+    if (k == 0)
+        for (int i = 0; i < n_; ++i) { w[i] = x0_[i]; w[n_ + i] = z[n_ + i]; }
+    else {
+        if (!arc(k - 1, seq, N, tau, a)) return false;
+        a.x = R_out->x[k - 1];
+        zat(a, a.L, w);
+    }
+    for (int i = 0; i < 2 * n_; ++i) d[i] = z[i] - w[i];
+    return true;
+}
+
+// correction sweep (hom_): the relation at tau_k^+ takes the plan's defect, delta(tau_k^+) = delta(tau_k^-) - D_k
+bool GSolver::hjump(const uint16_t* seq, int N, const double* tau, int k) {
+    if (!hom_) return true;
+    double D[N2];
+    if (!defect(seq, N, tau, k, D)) return false;
+    for (int r = 0; r < n_; ++r) {
+        double s = 0.0;
+        for (int j = 0; j < 2 * n_; ++j) s += rel_[r][j] * D[j];
+        rel_[r][N2] -= s;
+    }
+    return true;
+}
+
+// the correction is homogeneous: no particular part, no forcing
+void GSolver::unforce(Arc& a) const {
+    for (int i = 0; i < 2 * n_; ++i) a.yp[i] = 0.0;
+    for (int i = 0; i < m_; ++i) a.q[i] = 0.0;
 }
 
 bool GSolver::forward(const uint16_t* seq, int N, const double* tau, int b0, int nb, int* stride) {
@@ -3022,12 +3061,13 @@ bool GSolver::load(const uint16_t* seq, int N, const double* tau, int k, int str
     for (int j = c * stride; j < k; ++j)
         if (!advance(seq, N, tau, j, b0, nb)) return false;
     inject(k, b0, nb);                                 // relation at tau_k^+
-    return true;
+    return hjump(seq, N, tau, k);
 }
 
 // Terminal conditions with the relation at T: s(T) = xf, or lambda(T) = Qf (s(T) - xf).
 // Column 0 (rhs) -> zT (if given); sensitivity columns (homogeneous) -> Z_.
-bool GSolver::terminal(int nb, double* zT) {
+// zp (refine): the plan's z(T); column 0 is then the correction delta with zp + delta meeting the condition.
+bool GSolver::terminal(int nb, double* zT, const double* zp) {
     const int n = n_;
     const bool qf = p_->has_Qf;
     double cs[MAXN], cl[MAXN];
@@ -3041,13 +3081,14 @@ bool GSolver::terminal(int nb, double* zT) {
                 for (int i = 0; i < n; ++i) {
                     const double q = 0.5 * (p_->Qf[i][j] + p_->Qf[j][i]);
                     s += cl[i] * q;
-                    u += q * p_->xf[i];
+                    u += q * (zp ? zp[i] - p_->xf[i] : p_->xf[i]);
                 }
                 row[j] = s;
-                d += cl[j] * u;
+                if (zp) d -= cl[j] * (u - zp[n + j]);  // delta_l = Qf delta_s + Qf (s_p - xf) - lambda_p
+                else d += cl[j] * u;
             } else {
                 row[j] = cl[j];
-                d -= cs[j] * p_->xf[j];
+                d -= cs[j] * (zp ? p_->xf[j] - zp[j] : p_->xf[j]);
             }
         }
         row[N2] = d;
@@ -3058,14 +3099,14 @@ bool GSolver::terminal(int nb, double* zT) {
         for (int i = 0; i < n; ++i) {
             const double v = rel_[i][N2 + c];
             if (qf) z[i] = v;
-            else { z[i] = (c == 0) ? p_->xf[i] : 0.0; z[n + i] = v; }
+            else { z[i] = (c > 0) ? 0.0 : zp ? p_->xf[i] - zp[i] : p_->xf[i]; z[n + i] = v; }
         }
         if (qf)
             for (int i = 0; i < n; ++i) {
                 double s = 0.0;
                 for (int j = 0; j < n; ++j)
-                    s += 0.5 * (p_->Qf[i][j] + p_->Qf[j][i]) * (z[j] - ((c == 0) ? p_->xf[j] : 0.0));
-                z[n + i] = s;
+                    s += 0.5 * (p_->Qf[i][j] + p_->Qf[j][i]) * (z[j] - ((c > 0) ? 0.0 : zp ? p_->xf[j] - zp[j] : p_->xf[j]));
+                z[n + i] = (zp && c == 0) ? s - zp[n + i] : s;
             }
         for (int i = 0; i < 2 * n; ++i) {
             if (c > 0) Z_[i][c - 1] = (real)z[i];
@@ -3144,33 +3185,55 @@ bool GSolver::recover(const Arc& a, int nb, bool aff, double* xout, double* zb) 
             for (int r = k; r < n; ++r) rel_[r][c] = (rel_[r][c] - s * v[r]);
         }
     }
-    for (int i = 0; i < ns;) {
-        const int sz = mblk(b.re, b.im, i, a.L, E);
-        for (int l = 0; l < sz; ++l) {
-            double lr[N2], lc[NB + 1];
-            for (int j = 0; j < ns; ++j) lr[j] = 0.0;
-            lr[i] = E[2 * l];
-            if (sz == 2) lr[i + 1] = E[2 * l + 1];
-            for (int c = 0; c < ncols; ++c)
-                lc[c] = aff ? zb[i + l] - a.yp[i + l] : (double)Z_[i + l][c];
-            for (int j = i; j < ns; ++j) {            // Givens: rotate the row into R row j
-                if (lr[j] == 0.0) continue;
-                const double rj = rel_[j][j], hh = sqrt(rj * rj + lr[j] * lr[j]);
-                const double cg = rj / hh, sg = lr[j] / hh;
-                for (int k = j; k < ns; ++k) {
-                    const double u = rel_[j][k], w = lr[k];
-                    rel_[j][k] = (cg * u + sg * w);
-                    lr[k] = -sg * u + cg * w;
-                }
-                for (int c = 0; c < ncols; ++c) {
-                    const double u = rel_[j][c0 + c], w = lc[c];
-                    rel_[j][c0 + c] = (cg * u + sg * w);
-                    lc[c] = -sg * u + cg * w;
-                }
+    auto absorb = [&](double* lr, double* lc, int j0) {
+        for (int j = j0; j < ns; ++j) {               // Givens: rotate the row into R row j
+            if (lr[j] == 0.0) continue;
+            const double rj = rel_[j][j], hh = sqrt(rj * rj + lr[j] * lr[j]);
+            const double cg = rj / hh, sg = lr[j] / hh;
+            for (int k = j; k < ns; ++k) {
+                const double u = rel_[j][k], w = lr[k];
+                rel_[j][k] = (cg * u + sg * w);
+                lr[k] = -sg * u + cg * w;
+            }
+            for (int c = 0; c < ncols; ++c) {
+                const double u = rel_[j][c0 + c], w = lc[c];
+                rel_[j][c0 + c] = (cg * u + sg * w);
+                lc[c] = -sg * u + cg * w;
             }
         }
-        i += sz;
-    }
+    };
+    double lr[N2], lc[NB + 1];
+    if (hom_) {
+        // refine(): the end rows in z units, W_s (E_s a - eta_s) = 0 (the defects it corrects are z-space misfits;
+        // modal units weight them by W's column norms, up to 1e3 in TINY)
+        for (int r = 0; r < n2; ++r) {
+            for (int i = 0; i < ns;) {
+                const int sz = mblk(b.re, b.im, i, a.L, E);
+                for (int m = 0; m < sz; ++m) {
+                    double s = 0.0;
+                    for (int l = 0; l < sz; ++l) s += b.W[r * n2 + i + l] * E[2 * l + m];
+                    lr[i + m] = s;
+                }
+                i += sz;
+            }
+            double s = 0.0;                            // (aff only: refine's sweep has no sensitivity columns)
+            for (int i = 0; i < ns; ++i) s += b.W[r * n2 + i] * (zb[i] - a.yp[i]);
+            lc[0] = s;
+            absorb(lr, lc, 0);
+        }
+    } else
+        for (int i = 0; i < ns;) {
+            const int sz = mblk(b.re, b.im, i, a.L, E);
+            for (int l = 0; l < sz; ++l) {
+                for (int j = 0; j < ns; ++j) lr[j] = 0.0;
+                lr[i] = E[2 * l];
+                if (sz == 2) lr[i + 1] = E[2 * l + 1];
+                for (int c = 0; c < ncols; ++c)
+                    lc[c] = aff ? zb[i + l] - a.yp[i + l] : (double)Z_[i + l][c];
+                absorb(lr, lc, i);
+            }
+            i += sz;
+        }
     for (int c = 0; c < ncols; ++c)                    // back substitution -> a in rel_ col c0+c
         for (int i = ns - 1; i >= 0; --i) {
             double s = rel_[i][c0 + c];
@@ -3211,6 +3274,35 @@ bool GSolver::bvp(const uint16_t* seq, int N, const double* tau) {
     for (int i = 0; i < 2 * n_; ++i)
         if (!isfinite(zT_[i])) return false;
     return true;
+}
+
+// One defect correction (iterative refinement) of the BVP solution R_out->x of (seq, tau): the backward recovery
+// fits each arc's stable part in least squares to its start relation and its end value, so the plan the arcs
+// represent misses x0, continuity and the terminal condition by the BVP's conditioning times rounding. Those
+// defects drive the same sweep without particular parts; the correction is added to the arcs, zT_ follows.
+bool GSolver::refine(const uint16_t* seq, int N, const double* tau) {
+    double zp[N2 + 1], zb[N2], dT[N2], dx[N2], D[N2];
+    Arc a;
+    if (!arc(N - 1, seq, N, tau, a)) return false;
+    a.x = R_out->x[N - 1];
+    zat(a, a.L, zp);
+    hom_ = true;
+    int stride;
+    bool ok = forward(seq, N, tau, 0, 0, &stride) && terminal(0, zb, zp);
+    for (int i = 0; i < 2 * n_; ++i) dT[i] = zb[i];
+    for (int k = N - 1; ok && k >= 0; --k) {
+        ok = load(seq, N, tau, k, stride, 0, 0) && arc(k, seq, N, tau, ac_);
+        if (ok) unforce(ac_);
+        ok = ok && recover(ac_, 0, true, dx, zb) && (k == 0 || defect(seq, N, tau, k, D));
+        for (int i = 0; ok && i < 2 * n_; ++i) {
+            R_out->x[k][i] += dx[i];                   // (D_k is taken before arc k changes)
+            if (k) zb[i] += D[i];
+            ok = isfinite(R_out->x[k][i]);
+        }
+    }
+    hom_ = false;
+    for (int i = 0; ok && i < 2 * n_; ++i) zT_[i] = zp[i] + dT[i];
+    return ok;
 }
 
 // Residual rows of the junction conditions: one per switching row, evaluated on the side where
@@ -3789,10 +3881,23 @@ bool GSolver::finish(GResult& R, bool conv, const char* why, int its, int nsteps
     }
     double jf = 0.0;
     R.residual = gterm(&jf);
+    const double rtol = fmax(GTOL, (n_ + 2) * DBL_EPSILON);
+    // the BVP's rounding shows in the arcs: defect corrections while they lower the residual (each one a BVP, from
+    // the iteration budget)
+    const bool ref = conv && !(R.residual <= rtol);
+    for (double r0 = HUGE_VAL; conv && budget_ > 0 && !(R.residual <= rtol) && R.residual < r0; --budget_) {
+        r0 = R.residual;
+        if (!refine(R.S, R.narcs, R.t1)) {
+            if (!bvp(aseq_, an_, atau_)) { R.narcs = 0; R.failure = "linear BVP failed"; return false; }
+            R.residual = gterm(&jf);
+            break;
+        }
+        R.residual = gterm(&jf);
+    }
     // the walk's certificate suffices when its levels are below the verification tolerance
-    R.pmp_violation = (cert && wthr_ <= VTOL * R_) ? wthr_ : gverify(R.S, R.narcs, R.t1);
+    R.pmp_violation = (cert && !ref && wthr_ <= VTOL * R_) ? wthr_ : gverify(R.S, R.narcs, R.t1);
     if (conv && !(R.pmp_violation <= VTOL * R_)) { conv = false; why = "optimality check failed"; }
-    if (conv && !(R.residual <= fmax(GTOL, (n_ + 2) * DBL_EPSILON))) { conv = false; why = "terminal condition check failed"; }
+    if (conv && !(R.residual <= rtol)) { conv = false; why = "terminal condition check failed"; }
     R.cost = loose ? HUGE_VAL : gcost(R.S, R.narcs, R.t1, gends(R.S, R.narcs, R.t1)) + jf;
     R.converged = conv;
     R.failure = conv ? nullptr : bfail() ? bfail() : (why ? why : "not converged");
