@@ -1,21 +1,13 @@
 // Solver core. See lqocp.hpp. No heap, no exceptions, no STL.
 #include "lqocp.hpp"
+#include "lqocp_pd.hpp"
 
-#include <float.h>
 #include <math.h>
 #include <string.h>
 
 namespace lqocp {
 
-namespace pd {   // polynomial/linear-algebra helpers, shared with lqocp_state.cpp
-
-// Round-off tolerances below are written for double as k * DBL_EPSILON; TS rescales them to
-// the scalar type (1 in double, LQOCP_FTOL FLT_EPSILON / 1e-12 in float).
-const real EPS = sizeof(real) == 4 ? FLT_EPSILON : DBL_EPSILON;
-#ifndef LQOCP_FTOL
-#define LQOCP_FTOL 32
-#endif
-const real TS = sizeof(real) == 4 ? LQOCP_FTOL * FLT_EPSILON / 1e-12 : 1.0;
+namespace pd {   // polynomial/linear-algebra helpers (lqocp_pd.hpp)
 
 const real GL_X[4] = {-0.86113631159405257522, -0.33998104358485626480,
                         0.33998104358485626480, 0.86113631159405257522};
@@ -34,8 +26,6 @@ real ipow(real x, int k) {
     return r;
 }
 
-// In-place LU solve of A x = b (A is n x n stored with row stride ld). b overwritten by x.
-// nrhs right-hand sides stored column-wise in B (row stride ldb). Returns false if singular.
 template <class T>
 bool lu_solve(T* A, int n, int ld, T* B, int nrhs, int ldb) {
     T amax = 0.0;
@@ -73,13 +63,60 @@ template bool lu_solve<double>(double*, int, int, double*, int, int);
 }  // namespace pd
 using namespace pd;
 
-bool Solver::setup(const Problem& p) {
-    sfail_ = check_problem(p);
-    return !sfail_ && setup_(p);
+namespace pd {   // setup shared by tier 1 (Solver) and tier 3 (GSolver)
+
+// TS of the scalar type T (a double GSolver in a float build keeps the double tolerances)
+template <class T> constexpr double ts_of() { return sizeof(T) == sizeof(real) ? (double)TS : 1.0; }
+
+// S = C^T C (C upper triangular, row stride MAXN): semidefinite Cholesky of the unit-diagonal Ss = D S D, D = diag(S)^-1/2
+// (pivots are scale-free; a zero pivot leaves a zero row and needs a zero column, else S is indefinite). false: not PSD
+template <class T>
+bool psd_factor(const double (*S)[MAXN], int n, T* C) {
+    for (int i = 0; i < MAXN * MAXN; ++i) C[i] = 0.0;
+    T D[MAXN];
+    for (int i = 0; i < n; ++i) {
+        for (int k = 0; k < n; ++k)          // a zero diagonal needs a zero row (else indefinite)
+            if (S[i][i] < 0.0 || (S[i][i] == 0.0 && S[i][k] != 0.0)) return false;
+        D[i] = S[i][i] > 0.0 ? 1.0 / sqrt((T)S[i][i]) : 0.0;
+    }
+    const T tol = 1e-14 * ts_of<T>();
+    for (int j = 0; j < n; ++j) {
+        T d = D[j] > 0.0 ? 1.0 : 0.0;
+        for (int k = 0; k < j; ++k) d -= C[k * MAXN + j] * C[k * MAXN + j];
+        if (d < -1e2 * tol) return false;
+        const bool zero = d <= tol;
+        if (!zero) C[j * MAXN + j] = sqrt(d);
+        for (int i = j + 1; i < n; ++i) {
+            T s = S[i][j] * D[i] * D[j];
+            for (int k = 0; k < j; ++k) s -= C[k * MAXN + i] * C[k * MAXN + j];
+            if (zero) {   // PSD: s^2 <= d * Ss_ii <= tol
+                if (s * s > tol) return false;
+            } else {
+                C[j * MAXN + i] = s / C[j * MAXN + j];
+            }
+        }
+    }
+    for (int j = 0; j < n; ++j)                  // undo the scaling: C = Cs D^-1 (columns)
+        for (int i = 0; i <= j; ++i) C[i * MAXN + j] = D[j] > 0.0 ? C[i * MAXN + j] / D[j] : 0.0;
+    return true;
 }
 
-// input checks at the trust boundary; nullptr if fine
-const char* Solver::check_problem(const Problem& p) {
+// own frame: the factor's scratch lives only during the check
+__attribute__((noinline)) bool psd_ok(const double (*S)[MAXN], int n) {
+    double C[MAXN * MAXN];
+    return psd_factor(S, n, C);
+}
+
+bool symmetric(const double (*S)[MAXN], int n) {   // relative to |S_ij| <= sqrt(S_ii S_jj) of a PSD S
+    for (int i = 0; i < n; ++i)
+        for (int j = 0; j < n; ++j)
+            if (fabs(S[i][j] - S[j][i]) > 1e-12 * (fabs(S[i][j]) + fabs(S[j][i]) + sqrt(fabs(S[i][i] * S[j][j]))))
+                return false;
+    return true;
+}
+
+// input checks at the trust boundary (tiers 1 and 3); nullptr if fine
+const char* check_problem(const Problem& p) {
     if (p.m < 1 || p.m > MAXM) return "unsupported number of chains";
     int n = 0;
     for (int j = 0; j < p.m; ++j) {
@@ -109,19 +146,153 @@ const char* Solver::check_problem(const Problem& p) {
                 if (fabs(p.R[i][j] - p.R[j][i]) > 1e-12 * (fabs(p.R[i][j]) + fabs(p.R[j][i])))
                     return "R not symmetric";       // (rounding-level asymmetry is accepted)
             }
+        bool q0 = true;
         for (int i = 0; i < n; ++i)
-            for (int j = 0; j < n; ++j)
+            for (int j = 0; j < n; ++j) {
                 if (!isfinite(p.Q[i][j])) return "Q not finite";
-        if (p.has_Qf)
+                q0 = q0 && p.Q[i][j] == 0.0;
+            }
+        if (!q0 && !symmetric(p.Q, n)) return "Q not symmetric";
+        if (!q0 && !psd_ok(p.Q, n)) return "Q not PSD";   // (Qf: by each solver's own factor)
+        if (p.has_Qf) {
             for (int i = 0; i < n; ++i)
-                for (int j = 0; j < n; ++j) {
+                for (int j = 0; j < n; ++j)
                     if (!isfinite(p.Qf[i][j])) return "Qf not finite";
-                    if (fabs(p.Qf[i][j] - p.Qf[j][i]) > 1e-12 * (fabs(p.Qf[i][j]) + fabs(p.Qf[j][i]) +
-                                                                  sqrt(fabs(p.Qf[i][i] * p.Qf[j][j]))))
-                        return "Qf not symmetric";   // relative to |Qf_ij| <= sqrt(Qf_ii Qf_jj) of a PSD Qf
-                }
+            if (!symmetric(p.Qf, n)) return "Qf not symmetric";
+        }
     }
     return nullptr;
+}
+
+// Box rows on vt (Mrow = M Lc^-T): rows[2r] = Mrow[r] <= hi_r, rows[2r+1] = -Mrow[r] <= -lo_r. Parallel rows
+// (duplicate, opposing, multiple: row r = a row q) make the active-row Gram singular: row r's bounds tighten
+// row q's, row r is dropped. rownorm2 = |rows|^2; R = 1 + the largest finite bound. nullptr if fine
+template <class T>
+const char* build_rows(const Problem& p, const T (*Mrow)[MAXM], T (*rows)[MAXM], T* rhs, bool* finite, T* rownorm2,
+                       T* R) {
+    const int m = p.m;
+    for (int r = 0; r < m; ++r) {
+        for (int j = 0; j < m; ++j) {
+            rows[2 * r][j] = Mrow[r][j];
+            rows[2 * r + 1][j] = -Mrow[r][j];
+        }
+        rhs[2 * r] = p.hi[r];
+        rhs[2 * r + 1] = -p.lo[r];
+        finite[2 * r] = p.has_bounds && isfinite(p.hi[r]);
+        finite[2 * r + 1] = p.has_bounds && isfinite(p.lo[r]);
+    }
+    for (int r = 1; r < m; ++r)
+        for (int q = 0; q < r && (finite[2 * r] || finite[2 * r + 1]); ++q) {
+            T dot = 0.0, n2 = 0.0, dev = 0.0, rm = 0.0;
+            for (int j = 0; j < m; ++j) { dot += Mrow[q][j] * Mrow[r][j]; n2 += Mrow[q][j] * Mrow[q][j]; }
+            if (!(n2 > 0.0)) continue;
+            const T a = dot / n2;
+            for (int j = 0; j < m; ++j) { dev = fmax(dev, fabs(Mrow[r][j] - a * Mrow[q][j])); rm = fmax(rm, fabs(Mrow[r][j])); }
+            if (!(dev <= 1e-12 * ts_of<T>() * rm) || a == 0.0) continue;
+            const T hi = finite[a > 0.0 ? 2 * r : 2 * r + 1] ? (a > 0.0 ? rhs[2 * r] : -rhs[2 * r + 1]) / a : HUGE_VAL;
+            const T lo = finite[a > 0.0 ? 2 * r + 1 : 2 * r] ? (a > 0.0 ? -rhs[2 * r + 1] : rhs[2 * r]) / a : -HUGE_VAL;
+            if (isfinite(hi) && (!finite[2 * q] || hi < rhs[2 * q])) { rhs[2 * q] = hi; finite[2 * q] = true; }
+            if (isfinite(lo) && (!finite[2 * q + 1] || -lo < rhs[2 * q + 1])) { rhs[2 * q + 1] = -lo; finite[2 * q + 1] = true; }
+            if (finite[2 * q] && finite[2 * q + 1] && rhs[2 * q] < -rhs[2 * q + 1]) return "bounds: lo > hi";
+            finite[2 * r] = finite[2 * r + 1] = false;
+        }
+    T mx = 0.0;
+    for (int k = 0; k < 2 * m; ++k) {
+        T s = 0.0;
+        for (int j = 0; j < m; ++j) s += rows[k][j] * rows[k][j];
+        rownorm2[k] = s;
+        if (finite[k]) mx = fmax(mx, fabs(rhs[k]));
+    }
+    *R = 1.0 + mx;
+    return nullptr;
+}
+
+// Vertices v = M^-1 u of the box {lo <= M v <= hi} on the merged rows: column k < 2^m of V (row stride 2^m + m;
+// the last m columns get M^-1). false: unbounded (a side disabled, or a row dropped as parallel: the box is open
+// along M's null direction), or M singular to rounding (kappa_inf(M) m EPS >= 1, LU's relative forward-error bound
+// reaches 1: the vertices are undetermined, counted as unbounded like an exactly singular M)
+template <class T>
+bool box_vertices(const Problem& p, const T* rhs, const bool* finite, T* V) {
+    const int m = p.m;
+    for (int k = 0; k < 2 * m; ++k)
+        if (!finite[k]) return false;
+    T A[MAXM * MAXM];
+    const int nv = 1 << m, ld = nv + m;
+    T mn = 0.0, mi = 0.0;
+    for (int r = 0; r < m; ++r) {
+        T s = 0.0;
+        for (int j = 0; j < m; ++j) {
+            A[r * MAXM + j] = p.M[r][j];
+            s += fabs(A[r * MAXM + j]);
+            V[r * ld + nv + j] = r == j ? 1.0 : 0.0;
+        }
+        mn = fmax(mn, s);
+        for (int k = 0; k < nv; ++k) V[r * ld + k] = (k >> r & 1) ? rhs[2 * r] : -rhs[2 * r + 1];
+    }
+    if (!lu_solve(A, m, MAXM, V, ld, ld)) return false;
+    for (int r = 0; r < m; ++r) {
+        T s = 0.0;
+        for (int j = 0; j < m; ++j) s += fabs(V[r * ld + nv + j]);
+        mi = fmax(mi, s);
+    }
+    return mn * mi * m * (sizeof(T) == sizeof(real) ? EPS : DBL_EPSILON) < 1.0;
+}
+
+// sig_i = max(sig_i, reach of state i under the box: umax_j T^e / e!, e = order - derivative index), V from box_vertices
+template <class T>
+void box_reach(const Problem& p, const T* V, T* sig) {
+    const int nv = 1 << p.m, ld = nv + p.m;
+    for (int j = 0, o = 0; j < p.m; o += p.orders[j++]) {
+        T um = 0.0;
+        for (int k = 0; k < nv; ++k) um = fmax(um, fabs(V[j * ld + k]));
+        for (int q = 0; q < p.orders[j]; ++q) {
+            const int e = p.orders[j] - q;
+            sig[o + q] = fmax(sig[o + q], um * ipow(p.T, e) / fact(e));
+        }
+    }
+}
+
+// Projection on the face of the active rows S (m inputs): P = I - A^T G^-1 A, q = A^T G^-1 b with G = A A^T;
+// X (row stride MAXM + 1) = G^-1 [A | b] for the multipliers, idx/na the active rows. zfull: P = 0 exactly when
+// every input is fixed (na == m). false (P = I, q = 0) on more than MAXM rows or a singular Gram
+template <class T>
+bool project(const T (*rows)[MAXM], const T* rhs, int m, uint16_t S, bool zfull, T P[MAXM][MAXM], T q[MAXM],
+             T* X, int* idx, int* nap) {
+    int na = 0;
+    *nap = 0;
+    for (int i = 0; i < m; ++i) {
+        q[i] = 0.0;
+        for (int j = 0; j < m; ++j) P[i][j] = (i == j) ? 1.0 : 0.0;
+    }
+    for (int k = 0; k < 2 * m; ++k)
+        if (S & (1u << k)) { if (na >= MAXM) return false; idx[na++] = k; }
+    if (na == 0) return true;
+    T G[MAXM * MAXM];
+    const int ldx = MAXM + 1;
+    for (int a = 0; a < na; ++a) {
+        for (int b = 0; b < na; ++b) {
+            T s = 0.0;
+            for (int j = 0; j < m; ++j) s += rows[idx[a]][j] * rows[idx[b]][j];
+            G[a * MAXM + b] = s;
+        }
+        for (int j = 0; j < m; ++j) X[a * ldx + j] = rows[idx[a]][j];
+        X[a * ldx + m] = rhs[idx[a]];
+    }
+    if (!lu_solve(G, na, MAXM, X, m + 1, ldx)) return false;
+    for (int i = 0; i < m; ++i)
+        for (int a = 0; a < na; ++a) {
+            const T ai = rows[idx[a]][i];
+            for (int j = 0; j < m; ++j) P[i][j] = (zfull && na == m) ? 0.0 : P[i][j] - ai * X[a * ldx + j];
+            q[i] += ai * X[a * ldx + m];
+        }
+    *nap = na;
+    return true;
+}
+}  // namespace pd
+
+bool Solver::setup(const Problem& p) {
+    sfail_ = pd::check_problem(p);
+    return !sfail_ && setup_(p);
 }
 
 bool Solver::setup_(const Problem& p) {
@@ -174,66 +345,10 @@ bool Solver::setup_(const Problem& p) {
             for (int k = 0; k < m_; ++k) s += p.M[r][k] * Lci_[j][k];
             Mrow[r][j] = rI_ ? p.M[r][j] : s;
         }
-    // Qf = Cf^T Cf (Cf = L^T D^-1, semidefinite Cholesky of the unit-diagonal Qs = D Qf D, D = diag(Qf)^-1/2:
-    // pivots are scale-free; a zero pivot leaves a zero row and needs a zero column, else Qf is indefinite)
+    // Qf = Cf^T Cf (scale-free semidefinite factor, psd_factor)
     for (int i = 0; i < MAXN * MAXN; ++i) Cf_[i] = 0.0;
-    if (qf_) {
-        real D[MAXN];
-        for (int i = 0; i < n_; ++i) {
-            for (int k = 0; k < n_; ++k)          // a zero diagonal needs a zero row (else indefinite)
-                if (p.Qf[i][i] < 0.0 || (p.Qf[i][i] == 0.0 && p.Qf[i][k] != 0.0)) { sfail_ = "Qf not PSD"; return false; }
-            D[i] = p.Qf[i][i] > 0.0 ? 1.0 / sqrt((real)p.Qf[i][i]) : 0.0;
-        }
-        const real tol = 1e-14 * TS;
-        for (int j = 0; j < n_; ++j) {
-            real d = D[j] > 0.0 ? 1.0 : 0.0;
-            for (int k = 0; k < j; ++k) d -= Cf_[k * MAXN + j] * Cf_[k * MAXN + j];
-            if (d < -1e2 * tol) { sfail_ = "Qf not PSD"; return false; }
-            const bool zero = d <= tol;
-            if (!zero) Cf_[j * MAXN + j] = sqrt(d);
-            for (int i = j + 1; i < n_; ++i) {
-                real s = p.Qf[i][j] * D[i] * D[j];
-                for (int k = 0; k < j; ++k) s -= Cf_[k * MAXN + i] * Cf_[k * MAXN + j];
-                if (zero) {   // PSD: s^2 <= d * Qs_ii <= tol
-                    if (s * s > tol) { sfail_ = "Qf not PSD"; return false; }
-                } else {
-                    Cf_[j * MAXN + i] = s / Cf_[j * MAXN + j];
-                }
-            }
-        }
-        for (int j = 0; j < n_; ++j)                  // undo the scaling: Cf = Cs D^-1 (columns)
-            for (int i = 0; i <= j; ++i) Cf_[i * MAXN + j] = D[j] > 0.0 ? Cf_[i * MAXN + j] / D[j] : 0.0;
-    }
-    rhs_scale_ = 1.0;
-    for (int r = 0; r < m_; ++r) {
-        for (int j = 0; j < m_; ++j) {
-            rows_[2 * r][j] = Mrow[r][j];
-            rows_[2 * r + 1][j] = -Mrow[r][j];
-        }
-        rhs_[2 * r] = p.hi[r];
-        rhs_[2 * r + 1] = -p.lo[r];
-        finite_[2 * r] = p.has_bounds && isfinite(p.hi[r]);
-        finite_[2 * r + 1] = p.has_bounds && isfinite(p.lo[r]);
-    }
-    // parallel rows (duplicate, opposing, multiple: row r = a row q) make the active-row Gram singular:
-    // row r's bounds tighten row q's, row r is dropped
-    for (int r = 1; r < m_; ++r)
-        for (int q = 0; q < r && (finite_[2 * r] || finite_[2 * r + 1]); ++q) {
-            real dot = 0.0, n2 = 0.0, dev = 0.0, rm = 0.0;
-            for (int j = 0; j < m_; ++j) { dot += Mrow[q][j] * Mrow[r][j]; n2 += Mrow[q][j] * Mrow[q][j]; }
-            if (!(n2 > 0.0)) continue;
-            const real a = dot / n2;
-            for (int j = 0; j < m_; ++j) { dev = fmax(dev, fabs(Mrow[r][j] - a * Mrow[q][j])); rm = fmax(rm, fabs(Mrow[r][j])); }
-            if (!(dev <= 1e-12 * TS * rm) || a == 0.0) continue;
-            const real hi = finite_[a > 0.0 ? 2 * r : 2 * r + 1] ? (a > 0.0 ? rhs_[2 * r] : -rhs_[2 * r + 1]) / a : HUGE_VAL;
-            const real lo = finite_[a > 0.0 ? 2 * r + 1 : 2 * r] ? (a > 0.0 ? -rhs_[2 * r + 1] : rhs_[2 * r]) / a : -HUGE_VAL;
-            if (isfinite(hi) && (!finite_[2 * q] || hi < rhs_[2 * q])) { rhs_[2 * q] = hi; finite_[2 * q] = true; }
-            if (isfinite(lo) && (!finite_[2 * q + 1] || -lo < rhs_[2 * q + 1])) { rhs_[2 * q + 1] = -lo; finite_[2 * q + 1] = true; }
-            if (finite_[2 * q] && finite_[2 * q + 1] && rhs_[2 * q] < -rhs_[2 * q + 1]) { sfail_ = "bounds: lo > hi"; return false; }
-            finite_[2 * r] = finite_[2 * r + 1] = false;
-        }
-    for (int k = 0; k < 2 * m_; ++k)
-        if (finite_[k]) rhs_scale_ = fmax(rhs_scale_, 1.0 + fabs(rhs_[k]));
+    if (qf_ && !psd_factor(p.Qf, n_, Cf_)) { sfail_ = "Qf not PSD"; return false; }
+    if ((sfail_ = build_rows(p, Mrow, rows_, rhs_, finite_, rownorm2_, &R_))) return false;
     // candidate active sets, sorted by size
     nsets_ = 0;
     int total = 1;
@@ -252,61 +367,20 @@ bool Solver::setup_(const Problem& p) {
             if (ok && cnt == sz) sets_[nsets_++] = S;
         }
     }
-    // row norms; R_ = 1 + the largest finite bound
-    R_ = 1.0;
-    real mx = 0.0;
-    for (int k = 0; k < 2 * m_; ++k) {
-        real s = 0.0;
-        for (int j = 0; j < m_; ++j) s += rows_[k][j] * rows_[k][j];
-        rownorm2_[k] = s;
-        if (finite_[k]) mx = fmax(mx, fabs(rhs_[k]));
-    }
-    R_ = 1.0 + mx;
     // jmax_: 1/2 v^T R v is convex, so its max over the box {lo <= M v <= hi} is at a vertex v = M^-1 u
     jmax_ = HUGE_VAL;
     for (int i = 0; i < n_; ++i) sig_[i] = fabs((real)p.xf[i]);
-    // on the merged rows: a dropped (parallel) row leaves the box unbounded along M's null direction
-    bool bounded = true;
-    for (int k = 0; k < 2 * m_; ++k) bounded = bounded && finite_[k];
-    if (bounded) {
-        // the m_ extra columns give M^-1: M singular to rounding (kappa_inf(M) m EPS >= 1, LU's relative forward
-        // error bound reaches 1) leaves the vertices undetermined: the box counts as unbounded (as an exactly singular M)
-        real A[MAXM * MAXM], V[MAXM * ((1 << MAXM) + MAXM)];
+    real V[MAXM * ((1 << MAXM) + MAXM)];
+    if (box_vertices(p, rhs_, finite_, V)) {
         const int nv = 1 << m_, ld = nv + m_;
-        real mn = 0.0, mi = 0.0;
-        for (int r = 0; r < m_; ++r) {
-            real s = 0.0;
-            for (int j = 0; j < m_; ++j) {
-                A[r * MAXM + j] = p.M[r][j];
-                s += fabs(A[r * MAXM + j]);
-                V[r * ld + nv + j] = r == j ? 1.0 : 0.0;
-            }
-            mn = fmax(mn, s);
-            for (int k = 0; k < nv; ++k) V[r * ld + k] = (k >> r & 1) ? rhs_[2 * r] : -rhs_[2 * r + 1];
+        jmax_ = 0.0;
+        for (int k = 0; k < nv; ++k) {
+            real v[MAXM], q = 0.0;
+            for (int j = 0; j < m_; ++j) v[j] = V[j * ld + k];
+            for (int j = 0; j < m_; ++j) q += 0.5 * v[j] * (rI_ ? v[j] : vR(j, v));
+            jmax_ = fmax(jmax_, q);
         }
-        bool ok = lu_solve(A, m_, MAXM, V, ld, ld);
-        for (int r = 0; r < m_ && ok; ++r) {
-            real s = 0.0;
-            for (int j = 0; j < m_; ++j) s += fabs(V[r * ld + nv + j]);
-            mi = fmax(mi, s);
-        }
-        if (ok && mn * mi * m_ * EPS < 1.0) {
-            jmax_ = 0.0;
-            for (int k = 0; k < nv; ++k) {
-                real v[MAXM], q = 0.0;
-                for (int j = 0; j < m_; ++j) v[j] = V[j * ld + k];
-                for (int j = 0; j < m_; ++j) q += 0.5 * v[j] * (rI_ ? v[j] : vR(j, v));
-                jmax_ = fmax(jmax_, q);
-            }
-            for (int j = 0; j < m_; ++j) {   // sig_ = max(|xf_i|, reach umax_j T^e/e!), e = order - derivative index
-                real um = 0.0;
-                for (int k = 0; k < nv; ++k) um = fmax(um, fabs(V[j * ld + k]));
-                for (int q = 0; q < p.orders[j]; ++q) {
-                    const int e = p.orders[j] - q;
-                    sig_[off_[j] + q] = fmax(sig_[off_[j] + q], um * ipow(p.T, e) / fact(e));
-                }
-            }
-        }
+        box_reach(p, V, sig_);
     }
     identity_ = p.has_bounds != 0 && rI_;
     for (int r = 0; r < m_; ++r)
@@ -377,34 +451,9 @@ void Solver::phi_x0(real dt, real* s) const {
 }
 
 bool Solver::affine(uint16_t S, real P[MAXM][MAXM], real q[MAXM]) const {
-    int idx[MAXM], na = 0;
-    for (int k = 0; k < 2 * m_; ++k)
-        if (S & (1u << k)) { if (na >= MAXM) return false; idx[na++] = k; }
-    for (int i = 0; i < m_; ++i) {
-        q[i] = 0.0;
-        for (int j = 0; j < m_; ++j) P[i][j] = (i == j) ? 1.0 : 0.0;
-    }
-    if (na == 0) return true;
-    real G[MAXM * MAXM], X[MAXM * (MAXM + 1)];
-    const int ldx = MAXM + 1;
-    for (int a = 0; a < na; ++a) {
-        for (int b = 0; b < na; ++b) {
-            real s = 0.0;
-            for (int j = 0; j < m_; ++j) s += rows_[idx[a]][j] * rows_[idx[b]][j];
-            G[a * MAXM + b] = s;
-        }
-        for (int j = 0; j < m_; ++j) X[a * ldx + j] = rows_[idx[a]][j];
-        X[a * ldx + m_] = rhs_[idx[a]];
-    }
-    if (!lu_solve(G, na, MAXM, X, m_ + 1, ldx)) return false;
-    for (int i = 0; i < m_; ++i) {
-        for (int a = 0; a < na; ++a) {
-            real ai = rows_[idx[a]][i];
-            for (int j = 0; j < m_; ++j) P[i][j] -= ai * X[a * ldx + j];
-            q[i] += ai * X[a * ldx + m_];
-        }
-    }
-    return true;
+    int idx[MAXM], na;
+    real X[MAXM * (MAXM + 1)];
+    return project(rows_, rhs_, m_, S, false, P, q, X, idx, &na);
 }
 
 bool Solver::pq(uint16_t S, real P[MAXM][MAXM], real q[MAXM]) const {
@@ -696,12 +745,6 @@ real bisect(const real* r, int len, real a, real b) {
     }
     return 0.5 * (a + b);
 }
-
-struct Cross {
-    int n;
-    real root[4];
-    bool simple[4];
-};
 
 // Sign changes of phi(s) = s^k red(s) on (0, L] (tangential touches are not events).
 void crossings(const real* red, int len, int k, real L, real tol, Cross& o) {
@@ -1687,32 +1730,27 @@ void matvec(const double* M, int n, int ld, const double* v, double* t) {
 
 bool GSolver::setup(const Problem& p, BasisFn fn, void* ctx) {
     mt_.b = nullptr;
-    setup_failure = "unsupported dimensions";
-    if (p.m < 1 || p.m > MAXM || !fn) return false;
+    setup_failure = fn ? check_problem(p) : "no BasisFn";
+    if (setup_failure) return false;
     p_ = &p;
     bfn_ = fn;
     bctx_ = ctx;
     m_ = p.m;
     n_ = 0;
     for (int j = 0; j < m_; ++j) {
-        if (p.orders[j] < 1 || p.orders[j] > MAXK) return false;
         off_[j] = n_;
         n_ += p.orders[j];
         end_[j] = n_ - 1;
     }
-    if (n_ > MAXN) return false;
-    setup_failure = "non-finite problem data or T <= 0";   // x0 is checked by set_x0
-    bool fin = p.T > 0.0 && isfinite(p.T);
-    for (int i = 0; i < n_; ++i) {
-        fin = fin && isfinite(p.xf[i]);
-        for (int j = 0; j < n_; ++j)
-            fin = fin && (!p.has_cost || isfinite(p.Q[i][j])) && (!p.has_Qf || isfinite(p.Qf[i][j]));
-    }
-    for (int r = 0; r < m_; ++r) {                     // +-inf bounds disable a side; NaN does not
-        fin = fin && (!p.has_bounds || (p.lo[r] == p.lo[r] && p.hi[r] == p.hi[r]));
+    setup_failure = "non-finite problem data";        // (check_problem skips R, Q, Qf with has_cost = 0, M without bounds)
+    bool fin = true;
+    for (int i = 0; i < n_; ++i)
+        for (int j = 0; j < n_; ++j) fin = fin && isfinite(p.Q[i][j]) && (!p.has_Qf || isfinite(p.Qf[i][j]));
+    for (int r = 0; r < m_; ++r)
         for (int j = 0; j < m_; ++j) fin = fin && isfinite(p.R[r][j]) && isfinite(p.M[r][j]);
-    }
     if (!fin) return false;
+    setup_failure = "Qf not PSD";
+    if (p.has_Qf && !psd_ok(p.Qf, n_)) return false;
     setup_failure = "R not SPD";
     set_x0(p.x0);
     // Cholesky R = Lc Lc^T (symmetrised)
@@ -1735,30 +1773,20 @@ bool GSolver::setup(const Problem& p, BasisFn fn, void* ctx) {
             for (int k = i + 1; k < m_; ++k) s -= Lc_[k][i] * LiT_[k][c];
             LiT_[i][c] = s / Lc_[i][i];
         }
-    double mx = 0.0;
-    for (int r = 0; r < m_; ++r) {
+    double Mrow[MAXM][MAXM];                           // rows on vt: M Lc^-T
+    for (int r = 0; r < m_; ++r)
         for (int k = 0; k < m_; ++k) {
             double s = 0.0;
             for (int j = 0; j < m_; ++j) s += p.M[r][j] * LiT_[j][k];
-            rows_[2 * r][k] = s;
-            rows_[2 * r + 1][k] = -s;
+            Mrow[r][k] = s;
         }
-        rhs_[2 * r] = p.hi[r];
-        rhs_[2 * r + 1] = -p.lo[r];
-        finite_[2 * r] = p.has_bounds && isfinite(p.hi[r]);
-        finite_[2 * r + 1] = p.has_bounds && isfinite(p.lo[r]);
-    }
-    for (int k = 0; k < 2 * m_; ++k) {
-        double s = 0.0;
-        for (int j = 0; j < m_; ++j) s += rows_[k][j] * rows_[k][j];
-        rownorm2_[k] = s;
-        if (finite_[k]) mx = fmax(mx, fabs(rhs_[k]));
-        rhs0_[k] = rhs_[k];
-    }
-    R_ = 1.0 + mx;
+    if ((setup_failure = build_rows(p, Mrow, rows_, rhs_, finite_, rownorm2_, &R_))) return false;
+    for (int k = 0; k < 2 * m_; ++k) rhs0_[k] = rhs_[k];
+    for (int i = 0; i < n_; ++i) sig_[i] = fabs(p.xf[i]);
+    double V[MAXM * ((1 << MAXM) + MAXM)];
+    if (box_vertices(p, rhs_, finite_, V)) box_reach(p, V, sig_);
     nsets_ = 0;
     for_sets([&](uint16_t) { ++nsets_; return false; });
-    setup_failure = nullptr;
     return true;
 }
 
@@ -1808,33 +1836,9 @@ bool GSolver::valid_set(uint16_t S) const {
 }
 
 bool GSolver::affine(uint16_t S, double P[MAXM][MAXM], double q[MAXM]) const {
-    int idx[MAXM], na = 0;
-    for (int k = 0; k < 2 * m_; ++k)
-        if (S & (1u << k)) { if (na >= MAXM) return false; idx[na++] = k; }
-    for (int i = 0; i < m_; ++i) {
-        q[i] = 0.0;
-        for (int j = 0; j < m_; ++j) P[i][j] = (i == j) ? 1.0 : 0.0;
-    }
-    if (na == 0) return true;
-    double G[MAXM * MAXM], X[MAXM * (MAXM + 1)];
-    const int ldx = MAXM + 1;
-    for (int a = 0; a < na; ++a) {
-        for (int b = 0; b < na; ++b) {
-            double s = 0.0;
-            for (int j = 0; j < m_; ++j) s += rows_[idx[a]][j] * rows_[idx[b]][j];
-            G[a * MAXM + b] = s;
-        }
-        for (int j = 0; j < m_; ++j) X[a * ldx + j] = rows_[idx[a]][j];
-        X[a * ldx + m_] = rhs_[idx[a]];
-    }
-    if (!lu_solve(G, na, MAXM, X, m_ + 1, ldx)) return false;
-    for (int i = 0; i < m_; ++i)                       // (every channel fixed: P = 0 exactly)
-        for (int a = 0; a < na; ++a) {
-            const double ai = rows_[idx[a]][i];
-            for (int j = 0; j < m_; ++j) P[i][j] = (na == m_) ? 0.0 : P[i][j] - ai * X[a * ldx + j];
-            q[i] += ai * X[a * ldx + m_];
-        }
-    return true;
+    int idx[MAXM], na;
+    double X[MAXM * (MAXM + 1)];
+    return project(rows_, rhs_, m_, S, true, P, q, X, idx, &na);
 }
 
 // wt = -Bt^T lambda (Bt = B Lc^-T has the rows LiT_[j] at the chain ends)
@@ -2064,37 +2068,12 @@ void GSolver::zstart(const uint16_t* seq, int N, const double* tau, int k, doubl
 }
 
 // Switching rows of set S (one solve for the projection and the multipliers): inactive rows ->
-// gap a_r vt - b_r = G wt + g0; active rows -> -mu_r |a_r|^2. Both must stay <= 0.
+// gap a_r vt - b_r = G wt + g0; active rows -> -mu_r |a_r|^2. Both must stay <= 0. -1: singular Gram (no face)
 int GSolver::gphi(uint16_t S, int keys[2 * MAXM], double G[2 * MAXM][MAXM], double g0[2 * MAXM]) const {
-    int idx[MAXM], na = 0;
-    for (int key = 0; key < 2 * m_; ++key)
-        if (S & (1u << key)) { if (na >= MAXM) return 0; idx[na++] = key; }
+    int idx[MAXM], na;
     double X[MAXM * (MAXM + 1)], P[MAXM][MAXM], q[MAXM];
     const int ldx = MAXM + 1;
-    bool ok = true;
-    if (na > 0) {
-        double A[MAXM * MAXM];
-        for (int a = 0; a < na; ++a) {
-            for (int b = 0; b < na; ++b) {
-                double s = 0.0;
-                for (int j = 0; j < m_; ++j) s += rows_[idx[a]][j] * rows_[idx[b]][j];
-                A[a * MAXM + b] = s;
-            }
-            for (int j = 0; j < m_; ++j) X[a * ldx + j] = rows_[idx[a]][j];
-            X[a * ldx + m_] = rhs_[idx[a]];
-        }
-        ok = lu_solve(A, na, MAXM, X, m_ + 1, ldx);
-    }
-    for (int i = 0; i < m_; ++i) {                     // P, q as in affine()
-        q[i] = 0.0;
-        for (int j = 0; j < m_; ++j) P[i][j] = (i == j) ? 1.0 : 0.0;
-        if (ok)
-            for (int a = 0; a < na; ++a) {
-                const double ai = rows_[idx[a]][i];
-                for (int j = 0; j < m_; ++j) P[i][j] = (na == m_) ? 0.0 : P[i][j] - ai * X[a * ldx + j];
-                q[i] += ai * X[a * ldx + m_];
-            }
-    }
+    if (!project(rows_, rhs_, m_, S, true, P, q, X, idx, &na)) return -1;
     int nk = 0;
     for (int key = 0; key < 2 * m_; ++key) {
         if (!finite_[key] || (S & (1u << key))) continue;
@@ -2108,12 +2087,11 @@ int GSolver::gphi(uint16_t S, int keys[2 * MAXM], double G[2 * MAXM][MAXM], doub
         }
         g0[nk++] = c0;
     }
-    if (ok)
-        for (int a = 0; a < na; ++a) {
-            keys[nk] = idx[a];
-            for (int j = 0; j < m_; ++j) G[nk][j] = -X[a * ldx + j] * rownorm2_[idx[a]];
-            g0[nk++] = X[a * ldx + m_] * rownorm2_[idx[a]];
-        }
+    for (int a = 0; a < na; ++a) {
+        keys[nk] = idx[a];
+        for (int j = 0; j < m_; ++j) G[nk][j] = -X[a * ldx + j] * rownorm2_[idx[a]];
+        g0[nk++] = X[a * ldx + m_] * rownorm2_[idx[a]];
+    }
     return nk;
 }
 
@@ -2526,6 +2504,7 @@ bool GSolver::glex_ok(uint16_t S, const ArcFn& F, double sig, double h, double* 
     int keys[2 * MAXM], il;
     double G[2 * MAXM][MAXM], g0[2 * MAXM];
     const int nk = gphi(S, keys, G, g0);
+    if (nk < 0) return false;
     for (int r = 0; r < nk; ++r)
         if (lead(F, G[r], g0[r], sig, h, &tol[r], &il) > 0) return false;
     return true;
@@ -2696,6 +2675,7 @@ double GSolver::gverify(const uint16_t* seq, int N, const double* tau) {
         int keys[2 * MAXM];
         double G[2 * MAXM][MAXM], g0[2 * MAXM];
         const int nk = gphi(a.S, keys, G, g0);
+        if (nk < 0) return HUGE_VAL;
         if (nk == 0) continue;
         if (!chan(a, F)) return HUGE_VAL;
         for (int r = 0; r < nk; ++r) {
@@ -2772,11 +2752,10 @@ double GSolver::gends(const uint16_t* seq, int N, const double* tau) const {
     return J;
 }
 
-// J in closed form (ends = gends()). Along an extremal d/dt (lambda's) = -s'Qs - |vt|^2 - mu'b (mu' (Mt vt - b) = 0),
-// so J = 1/2 [lambda(0)'x0 - lambda(T)'s(T) - int mu'b dt] + terminal cost; mu is linear in wt
+// Running cost in closed form (ends = gends()). Along an extremal d/dt (lambda's) = -s'Qs - |vt|^2 - mu'b (mu' (Mt vt - b) = 0),
+// so int = 1/2 [lambda(0)'x0 - lambda(T)'s(T) - int mu'b dt] (the terminal cost: gterm); mu is linear in wt
 // on a saturated arc, and int wt = sum of modal phi1 terms + the integrated polynomial.
 double GSolver::gcost(const uint16_t* seq, int N, const double* tau, double ends) {
-    const int n = n_;
     double J = ends, mub = 0.0;
     ArcFn F;
     for (int ka = 0; ka < N; ++ka) {
@@ -2790,6 +2769,7 @@ double GSolver::gcost(const uint16_t* seq, int N, const double* tau, double ends
         int keys[2 * MAXM];
         double G[2 * MAXM][MAXM], g0[2 * MAXM];
         const int nk = gphi(seq[ka], keys, G, g0);
+        if (nk < 0) return HUGE_VAL;
         for (int r = 0; r < nk; ++r) {
             if (!(seq[ka] & (1u << keys[r]))) continue;   // active row: -mu |a|^2 = G wt + g0
             double v = g0[r] * a.L;
@@ -2797,12 +2777,7 @@ double GSolver::gcost(const uint16_t* seq, int N, const double* tau, double ends
             mub -= rhs_[keys[r]] * v / rownorm2_[keys[r]];
         }
     }
-    J = 0.5 * (J - mub);
-    if (p_->has_Qf)
-        for (int i = 0; i < n; ++i)
-            for (int k = 0; k < n; ++k)
-                J += 0.5 * (zT_[i] - p_->xf[i]) * p_->Qf[i][k] * (zT_[k] - p_->xf[k]);
-    return J;
+    return 0.5 * (J - mub);
 }
 
 void GSolver::gscale(double kap) {
@@ -3730,6 +3705,62 @@ bool GSolver::solve_warm(GResult& R, int max_its, double dt) {
     return finish(R, false, capfail_ ? "arc capacity NA exceeded" : "iteration cap reached", its, 0, ndeg);
 }
 
+// Terminal condition of the plan the arcs represent: z(T) of the last arc. (The BVP recovers the arcs backward from
+// zT_, which meets the condition by construction; an ill-conditioned BVP shows only in the arcs.) Per state, as tier 1's
+// relative stop: fixed endpoint F_i = s_i(T) - xf_i, terms a_i = sig_i; Qf = Cf^T Cf: F = Cf e - mu with
+// Cf^T mu = lambda(T) (tier 1's transversality form, Cf units), terms a_i = |mu_i| + sum_j |Cf_ij| sig_j; a zero
+// pivot of the semidefinite Cf leaves lambda_i - (Cf^T mu)_i (lambda units), terms |lambda_i| + sum_k |Cf_ki| a_k.
+// sig_i = max(sig_, |free_i|, |s_i(T)|) (free = e^{AT} x0). Returns max_i |F_i| / a_i; *jf = 1/2 |Cf (s(T) - xf)|^2 at
+// zT_ (factored: e'Qf e cancels below 0 for an ill-conditioned Qf).
+double GSolver::gterm(double* jf) const {
+    const GResult& R = *R_out;
+    const int n = n_;
+    double z[N2 + 1], sg[MAXN], r = 0.0;
+    Arc a;
+    if (R.narcs < 1 || !arc(R.narcs - 1, R.S, R.narcs, R.t1, a)) return HUGE_VAL;
+    a.x = R.x[R.narcs - 1];
+    zat(a, a.L, z);
+    for (int i = 0; i < 2 * n; ++i)
+        if (!isfinite(z[i])) return HUGE_VAL;
+    for (int j = 0; j < m_; ++j)
+        for (int i = off_[j]; i <= end_[j]; ++i) {   // e^{AT} x0 on chain j
+            double f = 0.0;
+            for (int l = i; l <= end_[j]; ++l) f += ipow(p_->T, l - i) / fact(l - i) * x0_[l];
+            sg[i] = fmax(sig_[i], fmax(fabs(f), fabs(z[i])));
+        }
+    *jf = 0.0;
+    if (!p_->has_Qf) {
+        for (int i = 0; i < n; ++i) {
+            const double d = fabs(z[i] - p_->xf[i]);
+            if (d > 0.0) r = fmax(r, d / sg[i]);       // (d > 0: sg_i >= |s_i| or |xf_i| > 0)
+        }
+        return r;
+    }
+    double Cf[MAXN * MAXN], mu[MAXN], am[MAXN];
+    if (!psd_factor(p_->Qf, n, Cf)) return HUGE_VAL;
+    for (int i = 0; i < n; ++i) {                     // Cf^T mu = lambda (lower triangular), mu_i = 0 on a zero pivot
+        double s = z[n + i], b = fabs(z[n + i]);
+        for (int k = 0; k < i; ++k) { s -= Cf[k * MAXN + i] * mu[k]; b += fabs(Cf[k * MAXN + i]) * am[k]; }
+        double ce = 0.0, ct = 0.0, cm = 0.0;
+        for (int j = i; j < n; ++j) {
+            ce += Cf[i * MAXN + j] * (z[j] - p_->xf[j]);
+            ct += Cf[i * MAXN + j] * (zT_[j] - p_->xf[j]);
+            cm += fabs(Cf[i * MAXN + j]) * sg[j];
+        }
+        *jf += 0.5 * ct * ct;
+        if (Cf[i * MAXN + i] > 0.0) {
+            mu[i] = s / Cf[i * MAXN + i];
+            am[i] = fabs(mu[i]) + cm;
+            const double d = fabs(ce - mu[i]);
+            if (d > 0.0) r = fmax(r, d / am[i]);
+        } else {
+            mu[i] = am[i] = 0.0;
+            if (s != 0.0) r = fmax(r, fabs(s) / b);   // (b >= |lambda_i| + rounding of s)
+        }
+    }
+    return r;
+}
+
 bool GSolver::finish(GResult& R, bool conv, const char* why, int its, int nsteps, int ndeg) {
     R.iterations = its;
     R.outer_iterations = nsteps;
@@ -3749,22 +3780,13 @@ bool GSolver::finish(GResult& R, bool conv, const char* why, int its, int nsteps
         R.S[k] = aseq_[k];
         R.t1[k] = (k == an_ - 1) ? p_->T : atau_[k];
     }
-    double rmax = 0.0;
-    for (int i = 0; i < n_; ++i) {
-        double v;
-        if (p_->has_Qf) {
-            v = zT_[n_ + i];
-            for (int k = 0; k < n_; ++k) v -= p_->Qf[i][k] * (zT_[k] - p_->xf[k]);
-        } else {
-            v = zT_[i] - p_->xf[i];
-        }
-        rmax = fmax(rmax, fabs(v));
-    }
-    R.residual = rmax;
+    double jf = 0.0;
+    R.residual = gterm(&jf);
     // the walk's certificate suffices when its levels are below the verification tolerance
     R.pmp_violation = (cert && wthr_ <= VTOL * R_) ? wthr_ : gverify(R.S, R.narcs, R.t1);
     if (conv && !(R.pmp_violation <= VTOL * R_)) { conv = false; why = "optimality check failed"; }
-    R.cost = loose ? HUGE_VAL : gcost(R.S, R.narcs, R.t1, gends(R.S, R.narcs, R.t1));
+    if (conv && !(R.residual <= fmax(GTOL, (n_ + 2) * DBL_EPSILON))) { conv = false; why = "terminal condition check failed"; }
+    R.cost = loose ? HUGE_VAL : gcost(R.S, R.narcs, R.t1, gends(R.S, R.narcs, R.t1)) + jf;
     R.converged = conv;
     R.failure = conv ? nullptr : bfail() ? bfail() : (why ? why : "not converged");
     return conv;

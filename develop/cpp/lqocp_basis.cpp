@@ -3,6 +3,7 @@
 // H_S = W diag(Ls, Tc, Lu) W^-1: sign-function dichotomy (stable | centre | unstable), then
 // the stable and unstable blocks are diagonalised (real 2x2 blocks for complex pairs).
 #include "lqocp.hpp"
+#include "lqocp_pd.hpp"
 
 #include <complex>
 #include <math.h>
@@ -13,32 +14,6 @@ namespace {
 
 const double YMAX = 8.0;    // lift |y| / |u| above which a slow mode stays coupled in the centre
 const double ZMAX = 12.0;   // ... if |Re lambda| T <= ZMAX (anchored at the arc start: growth <= e^ZMAX)
-
-bool lu(double* A, int n, double* B, int nrhs) {       // A (n x n), B (n x nrhs), in place
-    for (int k = 0; k < n; ++k) {
-        int piv = k;
-        for (int i = k + 1; i < n; ++i)
-            if (fabs(A[i * n + k]) > fabs(A[piv * n + k])) piv = i;
-        if (A[piv * n + k] == 0.0) return false;
-        if (piv != k) {
-            for (int j = 0; j < n; ++j) { double t = A[k * n + j]; A[k * n + j] = A[piv * n + j]; A[piv * n + j] = t; }
-            for (int j = 0; j < nrhs; ++j) { double t = B[k * nrhs + j]; B[k * nrhs + j] = B[piv * nrhs + j]; B[piv * nrhs + j] = t; }
-        }
-        for (int i = k + 1; i < n; ++i) {
-            const double f = A[i * n + k] / A[k * n + k];
-            if (f == 0.0) continue;
-            for (int j = k + 1; j < n; ++j) A[i * n + j] -= f * A[k * n + j];
-            for (int j = 0; j < nrhs; ++j) B[i * nrhs + j] -= f * B[k * nrhs + j];
-        }
-    }
-    for (int j = 0; j < nrhs; ++j)
-        for (int i = n - 1; i >= 0; --i) {
-            double s = B[i * nrhs + j];
-            for (int k = i + 1; k < n; ++k) s -= A[i * n + k] * B[k * nrhs + j];
-            B[i * nrhs + j] = s / A[i * n + i];
-        }
-    return true;
-}
 
 void mmul(const double* A, const double* B, double* C, int n) {
     for (int i = 0; i < n; ++i)
@@ -57,7 +32,7 @@ bool sign_fn(double* S, int n, double* W1, double* W2) {
         for (int i = 0; i < n * n; ++i) W1[i] = S[i];
         for (int i = 0; i < n * n; ++i) W2[i] = 0.0;
         for (int i = 0; i < n; ++i) W2[i * n + i] = 1.0;
-        if (!lu(W1, n, W2, n)) return false;           // W2 = S^-1
+        if (!pd::lu_solve(W1, n, n, W2, n, n)) return false;           // W2 = S^-1
         double ns = 0.0, ni = 0.0;
         for (int j = 0; j < n; ++j) {
             double a = 0.0, b = 0.0;
@@ -433,7 +408,7 @@ bool BasisBuilder::build(uint16_t S, int slot) {
         range_basis(Pu, k, nu, Wb, ns, Wk);
         mmul(H2, Wb, M5, k);                           // T2 = Wb^-1 H22 Wb
         for (int i = 0; i < k * k; ++i) M4[i] = Wb[i];
-        if (!lu(M4, k, M5, k)) return false;
+        if (!pd::lu_solve(M4, k, k, M5, k, k)) return false;
     }
     // modal blocks of H22: columns of U = Wb diag(Vs, Vu) (k x k), eigenvalues rk/ik
     double rk[N2], ik[N2];
@@ -568,7 +543,7 @@ bool BasisBuilder::build(uint16_t S, int slot) {
     }
     for (int i = 0; i < n * n; ++i) { M4[i] = W[i]; Wi[i] = 0.0; }
     for (int i = 0; i < n; ++i) Wi[i * n + i] = 1.0;
-    if (!lu(M4, n, Wi, n)) return false;
+    if (!pd::lu_solve(M4, n, n, Wi, n, n)) return false;
     double tcn = 0.0;
     for (int i = 0; i < nc; ++i) {
         double s = 0.0;

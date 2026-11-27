@@ -137,7 +137,6 @@ private:
     const Problem* p_;
     real x0_[MAXN];
     const char* sfail_ = nullptr;
-    static const char* check_problem(const Problem& p);
     bool setup_(const Problem& p);
     int n_, m_, off_[MAXM];
     real rows_[2 * MAXM][MAXM], rhs_[2 * MAXM], rownorm2_[2 * MAXM];
@@ -145,7 +144,6 @@ private:
     uint16_t sets_[MAXSETS];
     int nsets_;
     real free_[MAXN];
-    real rhs_scale_;
     real R_;
     real jmax_;                      // max of 1/2 v^T R v over the thrust box (HUGE_VAL: unbounded): T jmax_ >= any J
     real sig_[MAXN];                 // fixed-endpoint stop scale per state: max(|xf_i|, box reach); |free_i| added at the stop
@@ -271,7 +269,7 @@ struct GResult {
     double t1[NA];                   // arc end times (t1[narcs-1] = T)
     double x[NA][N2];                // arc coefficients (a, c, b) in the set's basis, times cs
     double cost;
-    double residual;                 // terminal condition residual
+    double residual;                 // terminal condition residual relative to its terms (converged: <= 1e-12)
     double pmp_violation;
     int iterations;                  // Newton iterations on the junction times (all homotopy steps)
     int outer_iterations;            // homotopy steps
@@ -283,7 +281,8 @@ struct GResult {
 class GSolver {
 public:
     // p must stay alive (it is referenced, not copied). R = Lc Lc^T must be SPD.
-    // On false, setup_failure says why (bad dimensions, non-finite data, R not SPD).
+    // On false, setup_failure says why (the checks of tier 1: dimensions, finiteness, lo <= hi, R, Q, Qf symmetric;
+    // Q, Qf PSD, R SPD).
     bool setup(const Problem& p, BasisFn fn, void* ctx);
     const char* setup_failure = nullptr;
     bool solve(GResult& r);
@@ -351,6 +350,7 @@ private:
     bool finite_[2 * MAXM];
     int nsets_;
     double R_;
+    double sig_[MAXN];               // terminal check scale per state: max(|xf_i|, box reach); |free_i|, |s_i(T)| added there
     double LiT_[MAXM][MAXM];         // Lc^-T: B~ = B Lc^-T has row end_[j] = LiT_[j]
     double Lc_[MAXM][MAXM];
     bool capfail_;                   // an arc/row capacity (NA, NR) was exceeded
@@ -422,6 +422,7 @@ private:
     double gverify(const uint16_t* seq, int N, const double* tau);
     __attribute__((noinline)) double gends(const uint16_t* seq, int N, const double* tau) const;
     double gcost(const uint16_t* seq, int N, const double* tau, double ends);
+    __attribute__((noinline)) double gterm(double* jf) const;
     double gmax_ratio(const uint16_t* seq, int N, const double* tau);
     void init_rel();
     bool fstep(const Arc& a, int nb);

@@ -4,7 +4,7 @@ BUILD := build
 
 all: $(BUILD)/lqocp_cli
 
-$(BUILD)/lqocp_cli: lqocp_cli.cpp lqocp.cpp lqocp_basis.cpp lqocp_state.cpp lqocp.hpp lqocp_state.hpp case_data.h | $(BUILD)
+$(BUILD)/lqocp_cli: lqocp_cli.cpp lqocp.cpp lqocp_basis.cpp lqocp_state.cpp lqocp.hpp lqocp_pd.hpp lqocp_state.hpp case_data.h | $(BUILD)
 	$(CXX) $(CXXFLAGS) -o $@ lqocp_cli.cpp lqocp.cpp lqocp_basis.cpp lqocp_state.cpp
 
 $(BUILD):
@@ -16,7 +16,7 @@ case_data:
 
 # Flash table of TINY's stable bases (one per set of active rows) + the A/B/TINY problems for
 # teensy/lqocp_bench.
-teensy_table: gen_basis_table.cpp lqocp.cpp lqocp_basis.cpp lqocp.hpp case_data.h | $(BUILD)
+teensy_table: gen_basis_table.cpp lqocp.cpp lqocp_basis.cpp lqocp.hpp lqocp_pd.hpp case_data.h | $(BUILD)
 	$(CXX) $(CXXFLAGS) -DLQOCP_NSD=4 -o $(BUILD)/gen_basis_table gen_basis_table.cpp lqocp.cpp lqocp_basis.cpp
 	$(BUILD)/gen_basis_table ../../teensy/lqocp_bench/src/bench_data.h
 

@@ -2,6 +2,7 @@
 #include "lqocp_state.hpp"
 
 #include "lqocp_cont.hpp"
+#include "lqocp_pd.hpp"
 
 #include <math.h>
 #include <stdio.h>
@@ -9,39 +10,15 @@
 
 namespace lqocp {
 
-namespace pd {   // helpers defined in lqocp.cpp
-double fact(int k);
-double ipow(double x, int k);
-template <class T> bool lu_solve(T* A, int n, int ld, T* B, int nrhs, int ldb);
-double pval(const double* b, int len, double s);
-void shift(const double* a, int len, double t0, double* b);
-double pscale(const double* b, int len, double L);
-int strip(const double* b, int len, double L, double tol, double* red, int* kout);
-int roots_le2(const double* d0, int len, double* out);
-double bisect(const double* r, int len, double a, double b);
-struct Cross { int n; double root[4]; bool simple[4]; };
-void crossings(const double* red, int len, int k, double L, double tol, Cross& o);
-}  // namespace pd
 using namespace pd;
 
 namespace {
-const double SGX[4] = {-0.86113631159405257522, -0.33998104358485626480,
-                       0.33998104358485626480, 0.86113631159405257522};
-const double SGW[4] = {0.34785484513745385737, 0.65214515486254614263,
-                       0.65214515486254614263, 0.34785484513745385737};
-const double EPS_ = 2.220446049250313e-16;
 const double TOL_X = 1e-9;           // state violation, relative to 1 + |b|
 const double TOL_SIGN = 1e-7;        // eta >= 0 on a boundary arc, relative
 const char CH[4] = {'x', 'y', 'z', 'p'};
 const double DEP = 1e-9;            // rows closer than this (relative) to the span of others count as dependent
 const int ZC = 2 * MAXSA;            // columns of Z_: one per free junction time
 static_assert(MAXARC_E <= 32, "check: dependent pieces are a 32-bit mask");
-
-void span_(const double* tau, int n, int a, double T, double* t0, double* t1) {
-    *t0 = a ? tau[a - 1] : 0.0;
-    *t1 = (a + 1 < n) ? tau[a] : T;
-}
-double peval(const double* V, double t) { return ((V[3] * t + V[2]) * t + V[1]) * t + V[0]; }
 
 // real roots of a polynomial (len <= 8) in (0, L), ascending: monotone pieces between the roots of
 // the derivative (recursively), one bisection per sign change
@@ -450,7 +427,7 @@ void StateSolver::vpoly(const uint16_t* S, const double* tau, int n, int a, cons
                         const StateArc* sa, int nsa, double V[MAXM][4]) const {
     double t0, t1, Wc[MAXM][4], Pv[MAXM][MAXM], phi[2 * MAXM][4], sig[MAXM][4];
     bool has[2 * MAXM];
-    span_(tau, n, a, base_.p_->T, &t0, &t1);
+    base_.span(tau, n, a, &t0, &t1);
     wpoly(c, y, sa, nsa, 0.5 * (t0 + t1), Wc, S[a] >> 8);
     if (!kkt(S[a], Wc, Pv, V, phi, has, sig))
         for (int j = 0; j < MAXM; ++j) for (int p = 0; p < 4; ++p) V[j][p] = 0.0;
@@ -480,16 +457,16 @@ __attribute__((noinline)) bool StateSolver::integrate(const double* c, const dou
     for (int a = 0; a < e.narcs; ++a) {
         double t0, t1, Wc[MAXM][4], Pv[MAXM][MAXM], Vv[MAXM][4], phi[2 * MAXM][4], sig[MAXM][4];
         bool has[2 * MAXM];
-        span_(e.tau, e.narcs, a, T, &t0, &t1);
+        base_.span(e.tau, e.narcs, a, &t0, &t1);
         if (!(t1 > t0)) continue;
         const double tm = 0.5 * (t0 + t1);
         wpoly(c, y, sa_, nsa_, tm, Wc, e.S[a] >> 8);
         if (!kkt(e.S[a], Wc, Pv, Vv, phi, has, sig)) return false;
         const double hw = 0.5 * (t1 - t0);
         for (int g = 0; g < 4; ++g) {
-            const double t = t0 + hw * (SGX[g] + 1.0), wg = SGW[g] * hw;
+            const double t = t0 + hw * (GL_X[g] + 1.0), wg = GL_W[g] * hw;
             for (int j = 0; j < B.m_; ++j) {
-                v[j] = peval(Vv[j], t);
+                v[j] = pval(Vv[j], 4, t);
                 double s = 0.0, tp = 1.0;                 // raw w_j (Wc is Lc^-1 w)
                 for (int k = 0; k < p.orders[j]; ++k) { s += c[B.off_[j] + k] * tp; tp *= t; }
                 for (int q = 0; q < nsa_; ++q)
@@ -608,7 +585,7 @@ bool StateSolver::inner(double* y, int max_its) {
             if (N.D >= E.D + 1e-4 * al * slope) { acc = true; break; }
             double nF2 = 0.0;
             for (int i = 0; i < ny; ++i) nF2 += N.F[i] * N.F[i];
-            if (al * slope <= 1e3 * EPS_ * (1.0 + fabs(E.D)) && nF2 < F2) { acc = true; break; }
+            if (al * slope <= 1e3 * EPS * (1.0 + fabs(E.D)) && nF2 < F2) { acc = true; break; }
         }
         if (!acc) { strcpy(why_, "line search failed"); if (cur) ev_[0] = ev_[1]; return false; }
         for (int i = 0; i < ny; ++i) y[i] = yn[i];
@@ -641,7 +618,7 @@ bool StateSolver::gres(const double* y, double* g, int* ng, double* vs, double* 
     bool has[2 * MAXM];
     cvec(y, c);
     auto arc = [&](int a) {                              // Vv, Pv of arc a (as vpoly)
-        span_(e.tau, e.narcs, a, T, &t0, &t1);
+        base_.span(e.tau, e.narcs, a, &t0, &t1);
         wpoly(c, y, sa_, nsa_, 0.5 * (t0 + t1), Wc, e.S[a] >> 8);
         return kkt(e.S[a], Wc, Pv, Vv, phi, has, sig);
     };
@@ -649,7 +626,7 @@ bool StateSolver::gres(const double* y, double* g, int* ng, double* vs, double* 
     *vs = 1.0;
     for (int a = 0; a < e.narcs; ++a) {
         if (!arc(a)) for (int j = 0; j < MAXM; ++j) for (int p = 0; p < 4; ++p) Vv[j][p] = 0.0;
-        for (int j = 0; j < B.m_; ++j) *vs = fmax(*vs, 1.0 + fabs(peval(Vv[j], t0)));
+        for (int j = 0; j < B.m_; ++j) *vs = fmax(*vs, 1.0 + fabs(pval(Vv[j], 4, t0)));
     }
     double* const Fth = Z_;                      // becomes Z = H^-1 F_th (dy/dth = -Z)
     double pg[2 * MAXSA][MAXM], tjk[2 * MAXSA], tmk[2 * MAXSA], gtk[2 * MAXSA];   // g_y row k, compact
@@ -672,14 +649,14 @@ bool StateSolver::gres(const double* y, double* g, int* ng, double* vs, double* 
             // control continuity: v_j(t1-) = 0, v_j(t2+) = 0 (v_j = 0 on the arc). This is dJ/dtj = 0
             // when the thrust rows active at the junction do not change.
             if (!J) {
-                g[k++] = arc(side == 0 ? ab : ab + 1) ? peval(Vv[j], tj) : 0.0;
+                g[k++] = arc(side == 0 ? ab : ab + 1) ? pval(Vv[j], 4, tj) : 0.0;
                 continue;
             }
             double vv[2][MAXM], tm[2];
             for (int s = 0; s < 2; ++s) {                // s = 0: arc left of tj, 1: right
                 if (!arc(ab + s)) return false;
                 tm[s] = 0.5 * (t0 + t1);
-                for (int l = 0; l < B.m_; ++l) vv[s][l] = peval(Vv[l], tj);
+                for (int l = 0; l < B.m_; ++l) vv[s][l] = pval(Vv[l], 4, tj);
                 if (s == side) {
                     for (int l = 0; l < B.m_; ++l) pg[k][l] = Pv[j][l];
                     gtk[k] = (3 * Vv[j][3] * tj + 2 * Vv[j][2]) * tj + Vv[j][1];
@@ -852,7 +829,7 @@ double StateSolver::scan(const double* c, const double* y, int j, int side, doub
     bool pend = tw >= 0.0;
     for (int a = 0; a < e.narcs; ++a) {
         double t0, t1, av[4], fp[5], red[4], pts[6];
-        span_(e.tau, e.narcs, a, T, &t0, &t1);
+        base_.span(e.tau, e.narcs, a, &t0, &t1);
         const double L = t1 - t0;
         if (!(L > 0)) continue;
         vpoly(e.S, e.tau, e.narcs, a, c, y, sa_, nsa_, V);
@@ -919,7 +896,7 @@ double StateSolver::check(const double* y, int* wc, int* ws, double* ta, double*
     for (int a = 0; a < e.narcs; ++a) {
         double t0, t1, Wc[MAXM][4], Pv[MAXM][MAXM], Vv[MAXM][4], phi[2 * MAXM][4], sig[MAXM][4], bb[4], d[3], cr[2];
         bool has[2 * MAXM];
-        span_(e.tau, e.narcs, a, T, &t0, &t1);
+        base_.span(e.tau, e.narcs, a, &t0, &t1);
         const double L = t1 - t0, tm = 0.5 * (t0 + t1);
         if (!(L > 0)) continue;
         wpoly(c, y, sa_, nsa_, tm, Wc, e.S[a] >> 8);   // thrust rows: without the pinned w (exact, less rounding)
@@ -1002,7 +979,7 @@ double StateSolver::check(const double* y, int* wc, int* ws, double* ta, double*
     for (int i = 0; i < B.n_; ++i) x[i] = B.x0_[i];
     for (int a = 0; a < e.narcs; ++a) {
         double t0, t1;
-        span_(e.tau, e.narcs, a, T, &t0, &t1);
+        base_.span(e.tau, e.narcs, a, &t0, &t1);
         const double h = t1 - t0;
         vpoly(e.S, e.tau, e.narcs, a, c, y, sa_, nsa_, V);
         for (int j = 0; j < B.m_; ++j) {
@@ -1115,7 +1092,7 @@ __attribute__((noinline)) bool StateSolver::lpsign(const double* c, const double
         if (!(P >> a & 1u)) continue;
         double t0, t1, ar[MAXM][MAXM], z[MAXM], r[MAXM], al[MAXM][MAXM], d[3], cr[2];
         int W[MAXM], key[MAXM], nk = 0;
-        span_(e.tau, e.narcs, a, T, &t0, &t1);
+        base_.span(e.tau, e.narcs, a, &t0, &t1);
         const double L = t1 - t0;
         const uint16_t K = (uint16_t)((e.S[a] | tch[a]) & 0xFFu);
         wpoly(c, y, sa_, nsa_, 0.5 * (t0 + t1), Wc);
@@ -1181,7 +1158,7 @@ __attribute__((noinline)) bool StateSolver::lpsign(const double* c, const double
         bool first = true;
         for (int a = 0; a < e.narcs; ++a) {
             double t0, t1;
-            span_(e.tau, e.narcs, a, T, &t0, &t1);
+            base_.span(e.tau, e.narcs, a, &t0, &t1);
             const double L = t1 - t0;
             if (!(L > 0) || !on(q, a)) continue;
             const int v = vix[a][j];
@@ -1433,15 +1410,15 @@ bool StateSolver::run(StateResult& r) {
     cvec(y, c);
     for (int a = 0; a < r.narcs; ++a) {
         double t0, t1;
-        span_(r.tau, r.narcs, a, T, &t0, &t1);
+        base_.span(r.tau, r.narcs, a, &t0, &t1);
         vpoly(r.S, r.tau, r.narcs, a, c, y, r.sa, r.nsa, V);
         const double hw = 0.5 * (t1 - t0);
         for (int g = 0; g < 4; ++g) {
-            const double t = t0 + hw * (SGX[g] + 1.0);
-            for (int j = 0; j < B.m_; ++j) v[j] = peval(V[j], t);
+            const double t = t0 + hw * (GL_X[g] + 1.0);
+            for (int j = 0; j < B.m_; ++j) v[j] = pval(V[j], 4, t);
             double s = 0.0;
             for (int j = 0; j < B.m_; ++j) s += v[j] * (B.rI_ ? v[j] : B.vR(j, v));
-            J += 0.5 * SGW[g] * hw * s;
+            J += 0.5 * GL_W[g] * hw * s;
         }
     }
     if (B.qf_) {
@@ -1630,7 +1607,7 @@ void StateSolver::eval_u(const StateResult& r, double t, double u[MAXM]) const {
     double c[MAXN], V[MAXM][4];
     cvec(r.y, c);
     vpoly(r.S, r.tau, r.narcs, a, c, r.y, r.sa, r.nsa, V);
-    for (int j = 0; j < base_.m_; ++j) u[j] = peval(V[j], t);
+    for (int j = 0; j < base_.m_; ++j) u[j] = pval(V[j], 4, t);
 }
 
 // exact: per arc, the chain states are Taylor-shifted and the cubic v integrated in closed form
@@ -1644,7 +1621,7 @@ void StateSolver::eval_x(const StateResult& r, double t, double x[MAXN]) const {
     cvec(r.y, c);
     for (int a = 0; a < r.narcs; ++a) {
         double t0, t1;
-        span_(r.tau, r.narcs, a, T, &t0, &t1);
+        base_.span(r.tau, r.narcs, a, &t0, &t1);
         if (t0 >= t) break;
         const double h = fmin(t1, t) - t0;
         vpoly(r.S, r.tau, r.narcs, a, c, r.y, r.sa, r.nsa, V);
@@ -1665,12 +1642,11 @@ void StateSolver::eval_x(const StateResult& r, double t, double x[MAXN]) const {
 
 bool StateSolver::mean_u(const StateResult& r, double t0, double t1, double u[MAXM]) const {
     if (r.narcs < 1 || !(t1 > t0)) return false;
-    const double T = base_.p_->T;
     double c[MAXN], V[MAXM][4], av[4], acc[MAXM] = {0.0, 0.0, 0.0, 0.0};
     cvec(r.y, c);
     for (int a = 0; a < r.narcs; ++a) {
         double a0, a1;
-        span_(r.tau, r.narcs, a, T, &a0, &a1);
+        base_.span(r.tau, r.narcs, a, &a0, &a1);
         const double lo = fmax(t0, a0), hi = fmin(t1, a1);
         if (!(hi > lo)) continue;
         vpoly(r.S, r.tau, r.narcs, a, c, r.y, r.sa, r.nsa, V);

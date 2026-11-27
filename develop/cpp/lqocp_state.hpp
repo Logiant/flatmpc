@@ -16,6 +16,7 @@
 
 namespace lqocp {
 
+static_assert(sizeof(real) == sizeof(double), "tier 2 (StateSolver) is double-only: build without LQOCP_FLOAT");
 constexpr int MAXSA = LQOCP_MAXSA;   // max boundary (state) arcs
 constexpr int NY = MAXN + MAXSA;     // dual unknowns: nu (or mu with Qf), then one Delta per arc
 
