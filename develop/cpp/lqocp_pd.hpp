@@ -49,6 +49,48 @@ struct Cross {
 };
 void crossings(const real* red, int len, int k, real L, real tol, Cross& o);
 
+// Tail of the event walks (tiers 1-3; the row detection before it is each tier's own). The events q < nev
+// (ev(q, &key, &root, &simple); false: row q has none) within gtol of the earliest s1 form the group, and
+// *zev = their rows less imm (rows already beyond tolerance there, not zero by construction). One simple event
+// toggles its row (control continuity) when ok(S ^ row); otherwise fb(S ^ group, *zev, &Snew) picks the set
+// (degenerate event). A new set is appended at tn (capacity cap: *capfail); the same set more than 3 times
+// in a row fails.
+template <class R, class Ev, class Ok, class Fb>
+bool walk_next(int nev, Ev ev, R s1, double gtol, uint16_t imm, Ok ok, Fb fb, uint16_t* zev, uint16_t& S,
+               uint16_t* seq, R* tau, R tn, int& ns, int cap, bool* capfail, int& stall) {
+    int ngroup = 0, gkey = -1;
+    bool gsimple = false;
+    uint16_t gmask = 0;
+    for (int q = 0; q < nev; ++q) {
+        int key;
+        R root;
+        bool simple;
+        if (ev(q, &key, &root, &simple) && root <= s1 + gtol) {
+            ++ngroup; gkey = key; gsimple = simple; gmask |= (uint16_t)(1u << key);
+        }
+    }
+    *zev = (uint16_t)(gmask & ~imm);
+    uint16_t Snew = 0xFFFFu;
+    if (ngroup == 1 && gsimple) {                    // add the row whose gap hit 0 / drop the row whose mu hit 0
+        const uint16_t cand = (uint16_t)(S ^ (1u << gkey));
+        if (ok(cand)) Snew = cand;
+    }
+    if (Snew == 0xFFFFu && !fb((uint16_t)(S ^ gmask), *zev, &Snew)) return false;
+    if (Snew != S) {
+        if (ns >= cap) {
+            if (capfail) *capfail = true;
+            return false;
+        }
+        tau[ns - 1] = tn;
+        seq[ns++] = Snew;
+        S = Snew;
+        stall = 0;
+    } else if (++stall > 3) {
+        return false;
+    }
+    return true;
+}
+
 }  // namespace pd
 }  // namespace lqocp
 

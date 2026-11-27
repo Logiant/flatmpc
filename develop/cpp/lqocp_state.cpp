@@ -391,32 +391,19 @@ bool StateSolver::walk(const double* c, const double* y, Ev& e) const {
                 }
             }
             if (s1 == HUGE_VAL || t + s1 >= tb - 1e-14 * T) break;
-            int ngroup = 0, gkey = -1;
-            bool gsimple = false;
-            uint16_t gmask = 0;
-            for (int key = 0; key < 2 * B.m_; ++key)
-                if (evk[key] && rootk[key] <= s1 + 1e-12 * T) {
-                    ++ngroup; gkey = key; gsimple = simplek[key]; gmask |= (uint16_t)(1u << key);
-                }
             t += s1;
-            zev = (uint16_t)(gmask & ~imm);
-            uint16_t Snew = 0xFFFFu;
-            if (ngroup == 1 && gsimple) {
-                const uint16_t cand = (uint16_t)(S ^ (1u << gkey));
-                if (B.valid_set(cand) && kkt(cand, Wc, Pv, Vv, phi, has, sig)) Snew = cand;
-            }
-            if (Snew == 0xFFFFu) {
-                if (!pset(Wc, pin, t, tb - t, zev, &Snew)) return false;
-            }
-            if (Snew != S) {
-                if (ns >= MAXARC_E) return false;
-                e.tau[ns - 1] = t;
-                e.S[ns++] = Snew;
-                S = Snew;
-                stall = 0;
-            } else if (++stall > 3) {
+            if (!walk_next(
+                    2 * B.m_,
+                    [&](int q, int* key, double* root, bool* simple) {
+                        if (!evk[q]) return false;
+                        *key = q; *root = rootk[q]; *simple = simplek[q];
+                        return true;
+                    },
+                    s1, 1e-12 * T, imm,
+                    [&](uint16_t cand) { return B.valid_set(cand) && kkt(cand, Wc, Pv, Vv, phi, has, sig); },
+                    [&](uint16_t, uint16_t zv, uint16_t* out) { return pset(Wc, pin, t, tb - t, zv, out); },
+                    &zev, S, e.S, e.tau, t, ns, MAXARC_E, nullptr, stall))
                 return false;
-            }
         }
     }
     e.narcs = ns;

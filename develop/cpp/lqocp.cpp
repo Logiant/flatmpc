@@ -927,35 +927,21 @@ bool Solver::walk(const real* c, Eval& e) {
             }
         }
         if (s1 == (real)HUGE_VAL || t + s1 >= T * (1 - 1e-14 * TS)) break;
-        int ngroup = 0, gkey = -1;
-        bool gsimple = false;
-        uint16_t gmask = 0;
-        for (int key = 0; key < 2 * m_; ++key)
-            if (evk[key] && rootk[key] <= s1 + 1e-12 * TS * T) {
-                ++ngroup; gkey = key; gsimple = simplek[key]; gmask |= (uint16_t)(1u << key);
-            }
         t += s1;
-        zev = (uint16_t)(gmask & ~imm);
-        uint16_t Snew = 0xFFFFu;
-        if (ngroup == 1 && gsimple) {
-            // control continuity: add the row whose gap hit 0 / drop the row whose mu hit 0
-            const uint16_t cand = (uint16_t)(S ^ (1u << gkey));
-            if (valid_set(cand)) Snew = cand;
-        }
-        if (Snew == 0xFFFFu) {                           // (b) degenerate event
-            ++e.ndeg;
-            const uint16_t guess = (uint16_t)(S ^ gmask);
-            if (!lex_set(c, t, zev, valid_set(guess) ? guess : 0xFFFFu, &Snew, phi, has)) return false;
-        }
-        if (Snew != S) {
-            if (ns >= MAXARC_E) { capfail_ = true; return false; }
-            e.tau[ns - 1] = t;
-            e.S[ns++] = Snew;
-            S = Snew;
-            stall = 0;
-        } else if (++stall > 3) {
+        if (!walk_next(
+                2 * m_,
+                [&](int q, int* key, real* root, bool* simple) {
+                    if (!evk[q]) return false;
+                    *key = q; *root = rootk[q]; *simple = simplek[q];
+                    return true;
+                },
+                s1, 1e-12 * TS * T, imm, [&](uint16_t cand) { return valid_set(cand); },
+                [&](uint16_t guess, uint16_t zv, uint16_t* out) {   // (b) degenerate event
+                    ++e.ndeg;
+                    return lex_set(c, t, zv, valid_set(guess) ? guess : 0xFFFFu, out, phi, has);
+                },
+                &zev, S, e.S, e.tau, t, ns, MAXARC_E, &capfail_, stall))
             return false;
-        }
     }
     e.narcs = ns;
     return sets_ok(e.S, ns);
@@ -1785,6 +1771,20 @@ bool GSolver::setup(const Problem& p, BasisFn fn, void* ctx) {
     for (int i = 0; i < n_; ++i) sig_[i] = fabs(p.xf[i]);
     double V[MAXM * ((1 << MAXM) + MAXM)];
     if (box_vertices(p, rhs_, finite_, V)) box_reach(p, V, sig_);
+    // clampu inverts M only when it is regular to rounding: kappa_inf(M) m EPS < 1 (box_vertices' rule)
+    double A[MAXM * MAXM], Mi[MAXM * MAXM], mn = 0.0, mi = 0.0;
+    for (int r = 0; r < m_; ++r) {
+        double s = 0.0;
+        for (int j = 0; j < m_; ++j) { A[r * MAXM + j] = p.M[r][j]; Mi[r * MAXM + j] = r == j; s += fabs(p.M[r][j]); }
+        mn = fmax(mn, s);
+    }
+    mreg_ = p.has_bounds && lu_solve(A, m_, MAXM, Mi, m_, MAXM);
+    for (int r = 0; mreg_ && r < m_; ++r) {
+        double s = 0.0;
+        for (int j = 0; j < m_; ++j) s += fabs(Mi[r * MAXM + j]);
+        mi = fmax(mi, s);
+    }
+    mreg_ = mreg_ && mn * mi * m_ * DBL_EPSILON < 1.0;
     nsets_ = 0;
     for_sets([&](uint16_t) { ++nsets_; return false; });
     return true;
@@ -2506,31 +2506,34 @@ void GSolver::rtaylor(const ArcFn& F, const double* G, double g0, double sig, do
     for (int k = 1; k < GN; ++k) { fk *= k; cs[k] /= fk; }
 }
 
-bool GSolver::glex_ok(uint16_t S, const ArcFn& F, double sig, double h, double* tol) const {
+// ev: rows of a walk event, zero at sig by construction (as in tiers 1 and 2): their sign is that of the derivatives
+bool GSolver::glex_ok(uint16_t S, const ArcFn& F, double sig, double h, double* tol, uint16_t ev) const {
     int keys[2 * MAXM], il;
     double G[2 * MAXM][MAXM], g0[2 * MAXM];
     const int nk = gphi(S, keys, G, g0);
     if (nk < 0) return false;
     for (int r = 0; r < nk; ++r)
-        if (lead(F, G[r], g0[r], sig, h, &tol[r], &il) > 0) return false;
+        if (lead(F, G[r], g0[r], sig, h, &tol[r], &il, (ev >> keys[r]) & 1u) > 0) return false;
     return true;
 }
 
 // the minimiser's set just right of sig; tol[r] gets the lead() tolerances of its rows
-bool GSolver::glex_set(const ArcFn& F, double sig, double h, uint16_t guess, uint16_t* out, double* tol) const {
-    if (guess != 0xFFFFu && valid_set(guess) && glex_ok(guess, F, sig, h, tol)) { *out = guess; return true; }
+bool GSolver::glex_set(const ArcFn& F, double sig, double h, uint16_t guess, uint16_t* out, double* tol,
+                       uint16_t ev) const {
+    if (guess != 0xFFFFu && valid_set(guess) && glex_ok(guess, F, sig, h, tol, ev)) { *out = guess; return true; }
     return for_sets([&](uint16_t S) {
-        if (!glex_ok(S, F, sig, h, tol)) return false;
+        if (!glex_ok(S, F, sig, h, tol, ev)) return false;
         *out = S;
         return true;
     });
 }
 
 // Leading Taylor coefficient at sig of the row g0 + G wt (coefficients that matter at scale h;
-// 0 if none), its order and the tolerance used
+// 0 if none), its order and the tolerance used; ev: the row is zero at sig by construction (a walk event), its
+// value there (a root's rounding, amplified by nearly dependent rows) is not used
 double GSolver::lead(const ArcFn& F, const double* G, double g0, double sig, double h, double* tolp,
-                     int* ilead) const {
-    {   // cheap case: f(sig) above a bound of the tolerance (sum_k |c_k| h^k <= this sum)
+                     int* ilead, bool ev) const {
+    if (!ev) {   // cheap case: f(sig) above a bound of the tolerance (sum_k |c_k| h^k <= this sum)
         RowFn f;
         rowfn(F, G, g0, f);
         const SetBasis& b = *F.b;
@@ -2551,6 +2554,7 @@ double GSolver::lead(const ArcFn& F, const double* G, double g0, double sig, dou
     }
     double cs[GN], tol = 0.0, hk = 1.0;
     rtaylor(F, G, g0, sig, cs);
+    if (ev) cs[0] = 0.0;
     for (int k = 0; k < GN; ++k) { tol += fabs(cs[k]) * hk; hk *= h; }
     tol = 1e-12 * (tol + R_);
     *tolp = tol;
@@ -2563,18 +2567,20 @@ double GSolver::lead(const ArcFn& F, const double* G, double g0, double sig, dou
 
 // Events of set S's switching rows on (sig, L] of the arc of F (a row whose leading Taylor
 // coefficient at sig is positive switches at sig; when glex_ok(S) at sig just passed, lexed holds
-// its row tolerances and none does): first root per row, *s1 the earliest.
+// its row tolerances and none does): first root per row, *s1 the earliest. ev: the rows of the event at sig
+// (lead()); *imm gets the rows already beyond tolerance at sig (order 0: not zero there).
 int GSolver::events(const ArcFn& F, uint16_t S, double sig, double h, double* rootk, bool* simplek,
-                    int* keyk, double* s1p, const double* lexed) {
+                    int* keyk, double* s1p, const double* lexed, uint16_t ev, uint16_t* imm) {
     int keys[2 * MAXM], nc = 0;
     double G[2 * MAXM][MAXM], g0[2 * MAXM], s1 = HUGE_VAL;
     const int nk = gphi(S, keys, G, g0);
     for (int r = 0; r < nk; ++r) {
         double tol = lexed ? lexed[r] : 0.0;           // lexed: glex_ok(S) at sig passed, no lead > 0
         int ilead;
-        if (!lexed && lead(F, G[r], g0[r], sig, h, &tol, &ilead) > 0) {
+        if (!lexed && lead(F, G[r], g0[r], sig, h, &tol, &ilead, (ev >> keys[r]) & 1u) > 0) {
             rootk[nc] = sig; simplek[nc] = (ilead == 1); keyk[nc++] = keys[r];
             if (sig < s1) s1 = sig;
+            if (ilead == 0) *imm |= (uint16_t)(1u << keys[r]);
             continue;
         }
         RowFn f;
@@ -2606,7 +2612,8 @@ bool GSolver::gwalk(const uint16_t* seq, int N, const double* tau, int* ndeg) {
         wn_ = 1;
         return true;
     }
-    uint16_t S = 0xFFFFu;
+    uint16_t S = 0xFFFFu, zev = 0;                   // zev: rows of the last event (at zt), zero there by construction
+    double zt = -1.0;
     ArcFn F;
     wthr_ = 0.0;
     for (int ka = 0; ka < N; ++ka) {
@@ -2618,49 +2625,37 @@ bool GSolver::gwalk(const uint16_t* seq, int N, const double* tau, int* ndeg) {
         double ltol[2 * MAXM];
         bool lexed = false;
         if (S == 0xFFFFu) {
-            if (!glex_set(F, 0.0, h, 0, &S, ltol)) return false;    // (a) initial set
+            if (!glex_set(F, 0.0, h, 0, &S, ltol, 0)) return false;    // (a) initial set
             wseq_[ns++] = S;
             lexed = true;
         }
         double sig = 0.0;
         int stall = 0;
+        if (zt != t0) zev = 0;                         // (an event at the junction keeps its rows)
         for (;;) {
             double rootk[2 * MAXM], s1 = HUGE_VAL;
             bool simplek[2 * MAXM];
             int keyk[2 * MAXM];
-            const int nc = events(F, S, sig, h, rootk, simplek, keyk, &s1, lexed ? ltol : nullptr);
+            uint16_t imm = 0;
+            const int nc = events(F, S, sig, h, rootk, simplek, keyk, &s1, lexed ? ltol : nullptr, zev, &imm);
             lexed = false;
             if (nc < 0) return false;
             if (nc == 0) break;
             if (t0 + s1 >= T * (1 - 1e-14)) break;
-            int ngroup = 0, gkey = -1;
-            bool gsimple = false;
-            uint16_t gmask = 0;
-            for (int q = 0; q < nc; ++q)
-                if (rootk[q] <= s1 + 1e-12 * T) {
-                    ++ngroup; gkey = keyk[q]; gsimple = simplek[q];
-                    gmask |= (uint16_t)(1u << keyk[q]);
-                }
-            uint16_t Snew = 0xFFFFu;
-            if (ngroup == 1 && gsimple) {
-                const uint16_t cand = (uint16_t)(S ^ (1u << gkey));
-                if (valid_set(cand)) Snew = cand;
-            }
-            if (Snew == 0xFFFFu) {
-                ++*ndeg;
-                const uint16_t guess = (uint16_t)(S ^ gmask);
-                if (!glex_set(F, s1, h, valid_set(guess) ? guess : 0xFFFFu, &Snew, ltol)) return false;
-                lexed = true;
-            }
-            if (Snew != S) {
-                if (ns >= NA) { capfail_ = true; return false; }
-                wtau_[ns - 1] = t0 + s1;
-                wseq_[ns++] = Snew;
-                S = Snew;
-                stall = 0;
-            } else if (++stall > 3) {
+            if (!walk_next(
+                    nc,
+                    [&](int q, int* key, double* root, bool* simple) {
+                        *key = keyk[q]; *root = rootk[q]; *simple = simplek[q];
+                        return true;
+                    },
+                    s1, 1e-12 * T, imm, [&](uint16_t cand) { return valid_set(cand); },
+                    [&](uint16_t guess, uint16_t zv, uint16_t* out) {
+                        ++*ndeg;
+                        return lexed = glex_set(F, s1, h, valid_set(guess) ? guess : 0xFFFFu, out, ltol, zv);
+                    },
+                    &zev, S, wseq_, wtau_, t0 + s1, ns, NA, &capfail_, stall))
                 return false;
-            }
+            zt = t0 + s1;
             sig = s1;
         }
     }
@@ -3116,6 +3111,40 @@ bool GSolver::terminal(int nb, double* zT, const double* zp) {
     return true;
 }
 
+// recover()'s end rows for refine(), in z units: W_s (E_s a - eta_s) = 0 for the rhs column (the defects it
+// corrects are z-space misfits; the modal rows weight them by W's column norms, up to 3e3 in TINY)
+void GSolver::zrows(const Arc& a, const double* eta) {
+    const SetBasis& b = *a.b;
+    const int n2 = 2 * n_, ns = b.ns;
+    double E[4], lr[N2];
+    for (int r = 0; r < n2; ++r) {
+        for (int i = 0; i < ns;) {
+            const int sz = mblk(b.re, b.im, i, a.L, E);
+            for (int m = 0; m < sz; ++m) {
+                double s = 0.0;
+                for (int l = 0; l < sz; ++l) s += b.W[r * n2 + i + l] * E[2 * l + m];
+                lr[i + m] = s;
+            }
+            i += sz;
+        }
+        double lc = 0.0;
+        for (int i = 0; i < ns; ++i) lc += b.W[r * n2 + i] * (eta[i] - a.yp[i]);
+        for (int j = 0; j < ns; ++j) {                // Givens: rotate the row into R row j
+            if (lr[j] == 0.0) continue;
+            const double rj = rel_[j][j], hh = sqrt(rj * rj + lr[j] * lr[j]);
+            const double cg = rj / hh, sg = lr[j] / hh;
+            for (int k = j; k < ns; ++k) {
+                const double u = rel_[j][k], w = lr[k];
+                rel_[j][k] = (cg * u + sg * w);
+                lr[k] = -sg * u + cg * w;
+            }
+            const double u = rel_[j][N2];
+            rel_[j][N2] = (cg * u + sg * lc);
+            lc = -sg * u + cg * lc;
+        }
+    }
+}
+
 // Backward step over arc a: given z(t1) (zb for the BVP column, Z_ for nb homogeneous
 // sensitivity columns) and the relation at t0 in rel_, solve for the arc coefficients
 // (-> xout for the BVP column) and replace the columns by z(t0).
@@ -3185,52 +3214,32 @@ bool GSolver::recover(const Arc& a, int nb, bool aff, double* xout, double* zb) 
             for (int r = k; r < n; ++r) rel_[r][c] = (rel_[r][c] - s * v[r]);
         }
     }
-    auto absorb = [&](double* lr, double* lc, int j0) {
-        for (int j = j0; j < ns; ++j) {               // Givens: rotate the row into R row j
-            if (lr[j] == 0.0) continue;
-            const double rj = rel_[j][j], hh = sqrt(rj * rj + lr[j] * lr[j]);
-            const double cg = rj / hh, sg = lr[j] / hh;
-            for (int k = j; k < ns; ++k) {
-                const double u = rel_[j][k], w = lr[k];
-                rel_[j][k] = (cg * u + sg * w);
-                lr[k] = -sg * u + cg * w;
-            }
-            for (int c = 0; c < ncols; ++c) {
-                const double u = rel_[j][c0 + c], w = lc[c];
-                rel_[j][c0 + c] = (cg * u + sg * w);
-                lc[c] = -sg * u + cg * w;
-            }
-        }
-    };
-    double lr[N2], lc[NB + 1];
-    if (hom_) {
-        // refine(): the end rows in z units, W_s (E_s a - eta_s) = 0 (the defects it corrects are z-space misfits;
-        // modal units weight them by W's column norms, up to 1e3 in TINY)
-        for (int r = 0; r < n2; ++r) {
-            for (int i = 0; i < ns;) {
-                const int sz = mblk(b.re, b.im, i, a.L, E);
-                for (int m = 0; m < sz; ++m) {
-                    double s = 0.0;
-                    for (int l = 0; l < sz; ++l) s += b.W[r * n2 + i + l] * E[2 * l + m];
-                    lr[i + m] = s;
-                }
-                i += sz;
-            }
-            double s = 0.0;                            // (aff only: refine's sweep has no sensitivity columns)
-            for (int i = 0; i < ns; ++i) s += b.W[r * n2 + i] * (zb[i] - a.yp[i]);
-            lc[0] = s;
-            absorb(lr, lc, 0);
-        }
-    } else
+    if (hom_) zrows(a, zb);
+    else
         for (int i = 0; i < ns;) {
             const int sz = mblk(b.re, b.im, i, a.L, E);
             for (int l = 0; l < sz; ++l) {
+                double lr[N2], lc[NB + 1];
                 for (int j = 0; j < ns; ++j) lr[j] = 0.0;
                 lr[i] = E[2 * l];
                 if (sz == 2) lr[i + 1] = E[2 * l + 1];
                 for (int c = 0; c < ncols; ++c)
                     lc[c] = aff ? zb[i + l] - a.yp[i + l] : (double)Z_[i + l][c];
-                absorb(lr, lc, i);
+                for (int j = i; j < ns; ++j) {        // Givens: rotate the row into R row j
+                    if (lr[j] == 0.0) continue;
+                    const double rj = rel_[j][j], hh = sqrt(rj * rj + lr[j] * lr[j]);
+                    const double cg = rj / hh, sg = lr[j] / hh;
+                    for (int k = j; k < ns; ++k) {
+                        const double u = rel_[j][k], w = lr[k];
+                        rel_[j][k] = (cg * u + sg * w);
+                        lr[k] = -sg * u + cg * w;
+                    }
+                    for (int c = 0; c < ncols; ++c) {
+                        const double u = rel_[j][c0 + c], w = lc[c];
+                        rel_[j][c0 + c] = (cg * u + sg * w);
+                        lc[c] = -sg * u + cg * w;
+                    }
+                }
             }
             i += sz;
         }
@@ -3472,7 +3481,7 @@ bool GSolver::newton_tau(uint16_t* seq, int* Np, double* tau, int* its) {
     while (nfresh < MAX_TAU_NEWTON && nchord < 2 * MAX_TAU_NEWTON && budget_ > 0) {
         const int nj = N - 1;
         if (rmax <= tol) { *Np = N; return true; }
-        if (rmax > 0.5 * prev && ++bad > 2) { *Np = N; return rmax <= 1e3 * tol; }
+        if (rmax > 0.5 * prev && ++bad > 2) { *Np = N; return false; }   // slow contraction: not converged (rmax > tol)
         // chord step (reuse the factored J) while the last step contracted well
         const bool chord = fact && rmax <= CHORD * prev;
         prev = rmax;
@@ -3583,7 +3592,7 @@ bool GSolver::newton_tau(uint16_t* seq, int* Np, double* tau, int* its) {
         if (!acc) {
             bvp(seq, N, tau);                         // restore the state of tau
             *Np = N;
-            return rmax <= 1e3 * tol;                 // round-off stall
+            return false;                             // line search failed (rmax > tol): no stall accept
         }
         for (int j = 0; j < nj; ++j) tau[j] = tn[j];
         for (int q = 0; q < nr; ++q) r[q] = rn[q];
@@ -3935,7 +3944,7 @@ void GSolver::clampu(double* u) const {
         w[r] = fmin(fmax(s, p_->lo[r]), p_->hi[r]);
         out = out || w[r] != s;
     }
-    if (out && lu_solve(A, m_, MAXM, w, 1, 1))
+    if (out && mreg_ && lu_solve(A, m_, MAXM, w, 1, 1))   // (M singular to rounding: u as projected)
         for (int j = 0; j < m_; ++j) u[j] = w[j];
 }
 

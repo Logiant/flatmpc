@@ -357,7 +357,8 @@ private:
     int budget_;                     // Newton iterations left (iteration cap)
     bool cert_;                      // the BVP solution in place was certified by the walk
     double wthr_;                    // largest switching-row level the walk certified
-    bool hom_ = false;               // refine()'s sweep: plan defects injected, particular parts off
+    bool mreg_;                      // M regular to rounding (clampu inverts it)
+    bool hom_ = false;              // refine()'s sweep: plan defects injected, particular parts off
     mutable uint16_t bkey_;          // basis key whose BasisFn lookup failed (0xFFFF: none)
     char why_[40];                   // failure text of bfail()
     GResult* R_out;
@@ -413,12 +414,14 @@ private:
     void rtaylor(const ArcFn& F, const double* G, double g0, double sig, double* cs) const;
     void gscale(double kap);
     void clampu(double* u) const;
-    bool glex_ok(uint16_t S, const ArcFn& F, double sig, double h, double* tol) const;
-    bool glex_set(const ArcFn& F, double sig, double h, uint16_t guess, uint16_t* out, double* tol) const;
+    bool glex_ok(uint16_t S, const ArcFn& F, double sig, double h, double* tol, uint16_t ev) const;
+    bool glex_set(const ArcFn& F, double sig, double h, uint16_t guess, uint16_t* out, double* tol,
+                  uint16_t ev) const;
     __attribute__((noinline)) double lead(const ArcFn& F, const double* G, double g0, double sig, double h,
-                                          double* tol, int* ilead) const;
+                                          double* tol, int* ilead, bool ev) const;
     __attribute__((noinline)) int events(const ArcFn& F, uint16_t S, double sig, double h, double* rootk,
-                                         bool* simplek, int* keyk, double* s1, const double* lexed);
+                                         bool* simplek, int* keyk, double* s1, const double* lexed, uint16_t ev,
+                                         uint16_t* imm);
     bool gwalk(const uint16_t* seq, int N, const double* tau, int* ndeg);
     double gverify(const uint16_t* seq, int N, const double* tau);
     __attribute__((noinline)) double gends(const uint16_t* seq, int N, const double* tau) const;
@@ -438,6 +441,7 @@ private:
     bool defect(const uint16_t* seq, int N, const double* tau, int k, double* d) const;
     bool hjump(const uint16_t* seq, int N, const double* tau, int k);
     void unforce(Arc& a) const;
+    void zrows(const Arc& a, const double* eta);
     bool refine(const uint16_t* seq, int N, const double* tau);
     __attribute__((noinline)) bool recover(const Arc& a, int nb, bool aff, double* xout, double* zb);
     bool bvp(const uint16_t* seq, int N, const double* tau);
