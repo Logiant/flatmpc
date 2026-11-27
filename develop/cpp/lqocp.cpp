@@ -1103,7 +1103,7 @@ real Solver::verify(const uint16_t* S, const real* tau, int n, const real* c, re
     // this bounds amp by the box acceptance. Float: not charged, its 1e-4 R_ is below
     // FLT_EPS amp for amp > 840 R_ (would reject 27% of the fscan float accepts)
     const real rnd = sizeof(real) == 4 ? 0.0 : EPS * a_max;
-    return box + rnd > (sizeof(real) == 4 ? 1e-4 : 1e-7) * R_ ? HUGE_VAL : worst;
+    return box + rnd > BOXTOL * R_ ? HUGE_VAL : worst;
 }
 
 // c(t) -> c(t + dt) per chain (exact Taylor shift); y = Lm^-1 c (nu), with Qf the mu of nu = Cf^T mu (Cf upper
@@ -1512,9 +1512,6 @@ const double CHORD = 0.1;           // Newton: reuse the factored J while the re
 const double GTOL = 1e-12;           // junction residual tolerance (relative to R)
 const double STOL = 1e-9;            // walked vs Newton junction times (relative to T)
 const double WRESET = 0.3;          // warm start: a capped plan violating PMP by > WRESET*R restarts cold
-const double VTOL = 1e-9;            // PMP verification tolerance (relative to R)
-// shortcut: VTOL is tuned. Per row 1e-12 (amplitude + R) (tier 1's vtol) loses 76 cap-5 closed-loop steps (r11:
-// 76 -> 0, t3_port2.md): T3's junction stop GTOL R does not make the rows that accurate. Derive with the stop.
 
 // exp and log without libm's lookup tables (a Teensy keeps those in RAM)
 double xexp(double x) {
@@ -2589,8 +2586,9 @@ int GSolver::events(const ArcFn& F, uint16_t S, double sig, double h, double* ro
         rowfn(F, G[r], g0[r], f);
         double root;
         bool simple;
-        const double thr = fmax(tol, 1e-12 * (f.scale + R_));
+        const double vt = 1e-12 * (f.scale + R_), thr = fmax(tol, vt);   // (vt: gverify's tolerance without noise)
         wthr_ = fmax(wthr_, thr);
+        wrat_ = fmax(wrat_, thr / vt);
         const double fb = (sig < F.L) ? bb(f, sig, F.L, thr, 0.0, true, &root, &simple) : 0.0;
         if (fb != fb) return -1;
         if (fb > 0) {
@@ -2617,7 +2615,7 @@ bool GSolver::gwalk(const uint16_t* seq, int N, const double* tau, int* ndeg) {
     uint16_t S = 0xFFFFu, zev = 0;                   // zev: rows of the last event (at zt), zero there by construction
     double zt = -1.0;
     ArcFn F;
-    wthr_ = 0.0;
+    wthr_ = wrat_ = 0.0;
     for (int ka = 0; ka < N; ++ka) {
         Arc& a = ac_;
         if (!arc(ka, seq, N, tau, a)) return false;
@@ -2665,12 +2663,49 @@ bool GSolver::gwalk(const uint16_t* seq, int N, const double* tau, int* ndeg) {
     return true;
 }
 
-// max over the trajectory of the switching rows of each arc's own set (<= 0 at a PMP point)
-double GSolver::gverify(const uint16_t* seq, int N, const double* tau) {
-    double worst = 0.0;
-    const double lv = 0.1 * VTOL * R_;
+// How well the plan's switching rows are determined, in row units: the larger of (a) the BVP noise D = max over the
+// junctions of |G (wt(lambda_L) - wt(lambda_R))| for the rows of both neighbouring sets (lambda is continuous: the two
+// arcs differ only by the BVP solution's error) and (b) the junction residuals the tau stop left (newton_tau's resid:
+// a row's value at its own junction, zero at the exact junction time; a stall leaves it at the noise, t3_port3.md).
+double GSolver::jnoise(const uint16_t* seq, int N, const double* tau) const {
+    double D = 0.0, zl[N2 + 1], zr[N2 + 1], wl[MAXM], wr[MAXM], G[2 * MAXM][MAXM], g0[2 * MAXM];
+    Arc al, ar;
+    for (int k = 1; k < N; ++k) {
+        if (!arc(k - 1, seq, N, tau, al) || !arc(k, seq, N, tau, ar)) return HUGE_VAL;
+        al.x = R_out->x[k - 1];
+        ar.x = R_out->x[k];
+        zat(al, al.L, zl);
+        zat(ar, 0.0, zr);
+        wt_of(zl + n_, wl);
+        wt_of(zr + n_, wr);
+        const uint16_t X = (uint16_t)(seq[k - 1] ^ seq[k]);
+        for (int sd = 0; sd < 2; ++sd) {
+            int keys[2 * MAXM];
+            const int nk = gphi(seq[k - sd], keys, G, g0);
+            for (int r = 0; r < nk; ++r) {
+                double v = 0.0, j = g0[r];
+                for (int c = 0; c < m_; ++c) { v += G[r][c] * (wl[c] - wr[c]); j += G[r][c] * wr[c]; }
+                if (v != v || j != j) return NAN;
+                D = fmax(D, fabs(v));
+                if ((X >> keys[r] & 1u) && !(seq[k - sd] >> keys[r] & 1u)) D = fmax(D, fabs(j));   // (b), as resid
+            }
+        }
+    }
+    return D;
+}
+
+// max over the trajectory of the switching rows of each arc's own set (<= 0 at a PMP point). Returns the largest ratio
+// of a row's max to its tolerance vt = 1e-12 (amplitude + R) + D (tier 1's vtol(amp), the walk's event tolerance,
+// plus D = jnoise: a row is not determined better than the two sides of a junction agree, nor than the tau stop left
+// it at its junction); a box row
+// (inactive: a gap in input units) is also held to BOXTOL R - D, so its true value is within the box acceptance.
+// bb's max is within its level of the true one, a tenth of vt. *worst = the largest row max
+double GSolver::gverify(const uint16_t* seq, int N, const double* tau, double D, double* worst) {
+    double q = 0.0;
     ArcFn F;
     RowFn f;
+    *worst = HUGE_VAL;
+    double w = 0.0;
     for (int ka = 0; ka < N; ++ka) {
         Arc& a = ac_;
         if (!arc(ka, seq, N, tau, a)) return HUGE_VAL;
@@ -2683,12 +2718,16 @@ double GSolver::gverify(const uint16_t* seq, int N, const double* tau) {
         if (!chan(a, F)) return HUGE_VAL;
         for (int r = 0; r < nk; ++r) {
             rowfn(F, G[r], g0[r], f);
-            const double v = bb(f, 0.0, a.L, lv, lv, false, nullptr, nullptr);
+            const double vt = 1e-12 * (f.scale + R_) + D;
+            const double v = bb(f, 0.0, a.L, 0.1 * vt, 0.1 * vt, false, nullptr, nullptr);
             if (v != v) return HUGE_VAL;
-            worst = fmax(worst, v);
+            w = fmax(w, v);
+            q = fmax(q, v / vt);
+            if (!(a.S >> keys[r] & 1u)) q = fmax(q, (v + D) / (BOXTOL * R_));
         }
     }
-    return worst;
+    *worst = w;
+    return (D <= BOXTOL * R_) ? q : HUGE_VAL;          // NaN fails
 }
 
 namespace {
@@ -3483,7 +3522,7 @@ bool GSolver::newton_tau(uint16_t* seq, int* Np, double* tau, int* its) {
     while (nfresh < MAX_TAU_NEWTON && nchord < 2 * MAX_TAU_NEWTON && budget_ > 0) {
         const int nj = N - 1;
         if (rmax <= tol) { *Np = N; return true; }
-        if (rmax > 0.5 * prev && ++bad > 2) { *Np = N; return rmax <= 1e3 * tol; }   // shortcut: tuned stall window, see below
+        if (rmax > 0.5 * prev && ++bad > 2) { *Np = N; return rmax <= BOXTOL * R_; }   // stall: see below
         // chord step (reuse the factored J) while the last step contracted well
         const bool chord = fact && rmax <= CHORD * prev;
         prev = rmax;
@@ -3594,12 +3633,14 @@ bool GSolver::newton_tau(uint16_t* seq, int* Np, double* tau, int* its) {
         if (!acc) {
             bvp(seq, N, tau);                         // restore the state of tau
             *Np = N;
-            // shortcut: tuned stall window (1e3 tol). Dropping it loses 8 of 22 cold accepts and 5 / 29 closed-loop steps
-            // (t3_port2.md); an EPS-terms floor of resid covers 1 of 121 stalls. Acceptance is gverify + gterm.
-            return rmax <= 1e3 * tol;                 // round-off stall
+            // Stall: the residual is at the BVP's noise (t3_port3.md: stalls at r ~ the rows' junction mismatch jnoise).
+            // A junction residual is the plan's switching-row value at the junction, so the plan can pass gverify only if
+            // it is within the loosest row tolerance (BOXTOL R): the walk and gverify decide, Newton cannot do better.
+            return rmax <= BOXTOL * R_;
         }
         for (int j = 0; j < nj; ++j) tau[j] = tn[j];
         for (int q = 0; q < nr; ++q) r[q] = rn[q];
+        if (diverged(false)) { *Np = N; return false; }
     }
     *Np = N;
     return rmax <= tol;
@@ -3635,7 +3676,7 @@ bool GSolver::correct(int* its, int* outer, int* ndeg, int rounds) {
         int k = 0;
         ok = newton_tau(seq, &N, tau, &k);
         *its += k;
-        if (!ok && (budget_ <= 0 || retry-- == 0 || (o > 0 && rounds <= 3))) break;
+        if (!ok && (infeas_ || budget_ <= 0 || retry-- == 0 || (o > 0 && rounds <= 3))) break;
         ok = propose(seq, N, tau, ndeg);
         if (!ok) break;
         bool same = (wn_ == N);
@@ -3662,16 +3703,6 @@ bool GSolver::correct(int* its, int* outer, int* ndeg, int rounds) {
     return false;
 }
 
-double GSolver::zmax(const uint16_t* seq, int N, const double* tau) const {
-    double m = 0.0, z[N2 + 1];
-    for (int k = 0; k < N; ++k) {
-        zstart(seq, N, tau, k, z);
-        for (int i = 0; i < 2 * n_; ++i) m = fmax(m, fabs(z[i]));
-    }
-    for (int i = 0; i < 2 * n_; ++i) m = fmax(m, fabs(zT_[i]));
-    return m;
-}
-
 void GSolver::begin(GResult& R, int max_its) {
     R_out = &R;
     R.iterations = R.outer_iterations = R.degenerate_events = 0;
@@ -3682,8 +3713,9 @@ void GSolver::begin(GResult& R, int max_its) {
     events_ = 0;
     capfail_ = false;
     budget_ = max_its;
-    cert_ = false;
-    wthr_ = 0.0;
+    cert_ = infeas_ = false;
+    wthr_ = wrat_ = 0.0;
+    free_bound();
     bkey_ = 0xFFFFu;
 }
 
@@ -3724,10 +3756,11 @@ bool GSolver::cold(GResult& R, int max_its) {
         if (!(ratio < HUGE_VAL)) { R.failure = LQOCP_STR("non-finite trajectory"); return false; }
         if (ratio <= 1.0 && propose(aseq_, 1, atau_, &ndeg))
             cert_ = conv = (wn_ == 1 && wseq_[0] == 0);
-        if (!conv) {
+        if (!conv && diverged(true))                 // (the plain solution is the PMP point of its own bound scale)
+            why = infeas_ ? LQOCP_STR("infeasible endpoint (no feasible input)") : LQOCP_STR("costate diverged (ill-conditioned: |x0| too large?)");
+        if (!conv && !why) {
             // homotopy in the bound scale kappa: exact collapse events inside
             // the tau-Newton, secant predictor, step halving on failure
-            const double z0 = zmax(aseq_, 1, atau_);
             double kap = 1.05 * fmax(ratio, 1.0);
             double dl = xlog(kap) * ((ratio <= KAP_PLAIN) ? 1.0 : 1.0 / 3.0);
             gscale(kap);
@@ -3737,10 +3770,10 @@ bool GSolver::cold(GResult& R, int max_its) {
             double stau[NA];
             for (;;) {
                 if (kap == 1.0) { conv = true; break; }
+                if (infeas_ || diverged(true)) { why = infeas_ ? LQOCP_STR("infeasible endpoint (no feasible input)") : LQOCP_STR("costate diverged (ill-conditioned: |x0| too large?)"); break; }
                 if (budget_ <= 0) { why = LQOCP_STR("iteration cap reached"); break; }
                 if (dl < DL_MIN) { why = p_->has_Qf ? LQOCP_STR("homotopy stalled at bound scale > 1 (ill-conditioned: |x0| too large?)")
                                                   : LQOCP_STR("homotopy stalled at bound scale > 1 (bounds infeasible?)"); break; }
-                if (zmax(aseq_, an_, atau_) > 1e8 * (1.0 + z0)) { why = p_->has_Qf ? LQOCP_STR("costate diverged (ill-conditioned: |x0| too large?)") : LQOCP_STR("costate diverged (bounds infeasible?)"); break; }
                 const int sn = an_;
                 for (int i = 0; i < sn; ++i) sseq[i] = aseq_[i];
                 for (int i = 0; i + 1 < sn; ++i) stau[i] = atau_[i];
@@ -3800,7 +3833,7 @@ bool GSolver::solve_warm(GResult& R, int max_its, double dt) {
     for (int k = 0; k < R.narcs; ++k) {
         const bool last = (k == R.narcs - 1);
         const double t1 = last ? T : R.t1[k] - dt;
-        if (!last && t1 <= 1e-9 * T) continue;         // this arc has ended
+        if (!last && t1 <= STOL * T) continue;         // this arc has ended (to the junction-time tolerance)
         aseq_[an_] = R.S[k];
         if (!last) atau_[an_] = t1;
         ++an_;
@@ -3808,6 +3841,7 @@ bool GSolver::solve_warm(GResult& R, int max_its, double dt) {
     begin(R, max_its);
     int its = 0, outer = 0, ndeg = 0;
     if (correct(&its, &outer, &ndeg, 12)) return finish(R, true, nullptr, its, 0, ndeg);
+    if (infeas_) return finish(R, false, LQOCP_STR("infeasible endpoint (no feasible input)"), its, 0, ndeg);
     if (budget_ > 0 && !capfail_) {                    // cold fallback with the iterations left
         const bool ok = cold(R, budget_);
         R.iterations += its;
@@ -3873,6 +3907,135 @@ double GSolver::gterm(double* jf) const {
     return r;
 }
 
+// Weak-duality infeasibility certificate for a fixed endpoint: tier 1's, on the same chains with Q ignored (the input
+// constraint alone decides feasibility). Any input with lo <= M u <= hi that reaches xf has
+// nu'(xf - e^{AT} x0) = int w'u dt <= int sum_r max(g_r hi_r, g_r lo_r) dt, w_j = sum_i nu_i (T - t)^(end_j - i) / (end_j - i)!
+// on chain j and g = M^-T w (polynomials of degree < MAXK, integrated exactly between their roots). A nu breaking this by
+// more than its rounding proves that no such input exists: exact, no threshold. nu = -+lambda(T) of the BVP solution in
+// place (an infeasible problem's costate runs off along a separating nu; any nu is valid, so both signs are tried).
+bool GSolver::infeasible() const {
+    static_assert(MAXK <= 4, "g' has degree <= 2");
+    if (p_->has_Qf || !p_->has_bounds || !mreg_) return false;
+    auto pv = [](const double* c, double x) { double v = 0.0; for (int k = MAXK - 1; k >= 0; --k) v = v * x + c[k]; return v; };
+    const int n = n_, m = m_, ldb = MAXK + MAXM;
+    const double T = p_->T;
+    double d[MAXN];
+    for (int j = 0; j < m; ++j)
+        for (int i = off_[j]; i <= end_[j]; ++i) {
+            double f = 0.0;
+            for (int l = i; l <= end_[j]; ++l) f += ipow(T, l - i) / fact(l - i) * x0_[l];
+            d[i] = p_->xf[i] - f;
+        }
+    for (int sg = -1; sg <= 1; sg += 2) {
+        double A[MAXM * MAXM], B[MAXM * (MAXK + MAXM)], val = 0.0, ab = 0.0, I = 0.0, abI = 0.0, mn = 0.0, mi = 0.0;
+        for (int i = 0; i < n; ++i) { const double t = sg * zT_[n + i] * d[i]; val += t; ab += fabs(t); }
+        for (int j = 0; j < m; ++j) {                  // A = M^T, B = [w_j coefficients in s = T - t | I]
+            for (int i = 0; i < m; ++i) A[j * MAXM + i] = p_->M[i][j];
+            for (int k = 0; k < ldb; ++k) B[j * ldb + k] = 0.0;
+            for (int k = 0; k <= end_[j] - off_[j]; ++k) B[j * ldb + k] = sg * zT_[n + end_[j] - k] / fact(k);
+            B[j * ldb + MAXK + j] = 1.0;
+        }
+        if (!lu_solve(A, m, MAXM, B, ldb, ldb)) return false;
+        for (int i = 0; i < m; ++i) {                  // kappa_inf(M^T): the solve's relative error is below kappa m EPS
+            double a = 0.0, b = 0.0;
+            for (int j = 0; j < m; ++j) { a += fabs(p_->M[j][i]); b += fabs(B[i * ldb + MAXK + j]); }
+            mn = fmax(mn, a);
+            mi = fmax(mi, b);
+        }
+        bool ok = true;
+        for (int r = 0; r < m && ok; ++r) {
+            const double* g = B + r * ldb;
+            double cr[2] = {0.0, 0.0}, pts[4];
+            int np = 0, nc = 0;
+            const double a2 = 3.0 * g[3], b1 = 2.0 * g[2], c0 = g[1], disc = b1 * b1 - 4.0 * a2 * c0;   // g' = 0
+            if (a2 != 0.0 && disc > 0.0) {
+                const double qq = -0.5 * (b1 + (b1 >= 0.0 ? sqrt(disc) : -sqrt(disc)));
+                cr[0] = qq / a2; cr[1] = (qq != 0.0) ? c0 / qq : 0.0; nc = 2;
+                if (cr[0] > cr[1]) { const double t = cr[0]; cr[0] = cr[1]; cr[1] = t; }
+            } else if (a2 == 0.0 && b1 != 0.0) {
+                cr[0] = -c0 / b1; nc = 1;
+            }
+            pts[np++] = 0.0;
+            for (int q = 0; q < nc; ++q) if (cr[q] > pts[np - 1] && cr[q] < T) pts[np++] = cr[q];
+            pts[np++] = T;
+            double a = 0.0;                            // pieces between sign changes (g monotone between pts)
+            for (int q = 1; q < np && ok; ++q) {
+                const double ga = pv(g, pts[q - 1]), gb = pv(g, pts[q]);
+                double z = pts[q];
+                if (ga * gb < 0.0)                     // the root of the monotone piece, bisected to rounding
+                    for (double lo = pts[q - 1], hi = pts[q];;) {
+                        const double mid = 0.5 * (lo + hi);
+                        if (!(mid > lo && mid < hi)) { z = mid; break; }
+                        if ((pv(g, mid) > 0.0) == (ga > 0.0)) lo = mid; else hi = mid;
+                    }
+                for (int h = 0; h < 2; ++h) {
+                    const double b = h ? pts[q] : z;
+                    if (!(b > a)) continue;
+                    const double gm = pv(g, 0.5 * (a + b));
+                    const double bnd = gm > 0.0 ? p_->hi[r] : p_->lo[r];
+                    double P = 0.0, Pa = 0.0;
+                    for (int k = 0; k < MAXK; ++k) {
+                        const double c = g[k] / (k + 1), e = ipow(b, k + 1) - ipow(a, k + 1);
+                        P += c * e;
+                        Pa += fabs(c) * e;
+                    }
+                    if (gm != 0.0 && !isfinite(bnd)) { ok = false; break; }   // the box is open along g: no bound
+                    if (gm != 0.0) { I += bnd * P; abI += fabs(bnd) * Pa; }
+                    a = b;
+                }
+            }
+        }
+        if (ok && val - I > DBL_EPSILON * ((n + 4 * m * (MAXK + 2) + 2) * (ab + abI) + m * mn * mi * abI)) return true;
+    }
+    return false;
+}
+
+// Divergence test of the BVP solution in place (cold homotopy, newton_tau, warm path). Fixed endpoint: the certificate
+// (sets infeas_: a proof, valid at any iterate). Qf, at a PMP point (pmp: the homotopy's accepted points) of any bound
+// scale >= 1: lambda(T) = Qf e and |Qf e|^2 <= tr(Qf) e'Qf e <= 2 tr(Qf) J* <= 2 tr(Qf) J0 (J0 = cost of u = 0, feasible
+// when 0 is in the box, so in every scaled box): a costate beyond that is not a PMP point, the BVP has diverged. Not a
+// test for Newton iterates (measured: they pass the bound by up to 190x on their way to an optimum; t3_port3.md).
+// shortcut: no test without a certificate (fixed endpoint, M singular) or with 0 outside the box (Qf, jbnd_ < 0): the
+// homotopy's step floor or the iteration cap ends a diverging run there; a feasible point's cost would be the upgrade.
+bool GSolver::diverged(bool pmp) {
+    if (!p_->has_Qf) return infeas_ = infeasible();
+    if (!pmp || !(jbnd_ >= 0.0)) return false;
+    double l2 = 0.0;
+    for (int i = 0; i < n_; ++i) l2 += zT_[n_ + i] * zT_[n_ + i];
+    return !(l2 <= jbnd_);                             // NaN: diverged
+}
+
+// jbnd_ = 2 tr(Qf) J0 (+ rounding), J0 = 1/2 int x'Qx + 1/2 e'Qf e of the free response x_i = sum_k x0_(i+k) t^k / k!
+void GSolver::free_bound() {
+    jbnd_ = -1.0;
+    for (int k = 0; k < 2 * m_; ++k)
+        if (finite_[k] && rhs0_[k] < 0.0) return;      // u = 0 infeasible
+    if (!p_->has_Qf) return;
+    const double T = p_->T;
+    double c[MAXN][MAXK], e[MAXN], J = 0.0, Ja = 0.0, tr = 0.0;
+    for (int j = 0; j < m_; ++j)
+        for (int i = off_[j]; i <= end_[j]; ++i) {
+            double f = 0.0;
+            for (int k = 0; k < MAXK; ++k) {
+                c[i][k] = (i + k <= end_[j]) ? x0_[i + k] / fact(k) : 0.0;
+                f += c[i][k] * ipow(T, k);
+            }
+            e[i] = f - p_->xf[i];
+        }
+    for (int i = 0; i < n_; ++i) {
+        tr += p_->Qf[i][i];
+        for (int j = 0; j < n_; ++j) {
+            double I = 0.0;
+            for (int k = 0; k < MAXK; ++k)
+                for (int l = 0; l < MAXK; ++l) I += c[i][k] * c[j][l] * ipow(T, k + l + 1) / (k + l + 1);
+            const double t = 0.5 * (p_->Q[i][j] * I + p_->Qf[i][j] * e[i] * e[j]);
+            J += t;
+            Ja += fabs(t);
+        }
+    }
+    jbnd_ = 2.0 * tr * (J + (n_ * n_ * MAXK * MAXK + 2) * DBL_EPSILON * Ja);
+}
+
 bool GSolver::finish(GResult& R, bool conv, const char* why, int its, int nsteps, int ndeg) {
     R.iterations = its;
     R.outer_iterations = nsteps;
@@ -3907,11 +4070,15 @@ bool GSolver::finish(GResult& R, bool conv, const char* why, int its, int nsteps
         }
         R.residual = gterm(&jf);
     }
-    // the walk's certificate suffices when its levels are below the verification tolerance
-    R.pmp_violation = (cert && !ref && wthr_ <= VTOL * R_) ? wthr_ : gverify(R.S, R.narcs, R.t1);
-    if (conv && !(R.pmp_violation <= VTOL * R_)) { conv = false; why = LQOCP_STR("optimality check failed"); }
+    // the walk's certificate suffices when each row's level was its verification tolerance without noise
+    double rat = wrat_;
+    R.pmp_violation = wthr_;
+    if (!(cert && !ref && wrat_ <= 1.0 && wthr_ <= BOXTOL * R_))
+        rat = gverify(R.S, R.narcs, R.t1, jnoise(R.S, R.narcs, R.t1), &R.pmp_violation);
+    if (conv && !(rat <= 1.0)) { conv = false; why = LQOCP_STR("optimality check failed"); }   // NaN fails
     if (conv && !(R.residual <= rtol)) { conv = false; why = LQOCP_STR("terminal condition check failed"); }
     R.cost = loose ? HUGE_VAL : gcost(R.S, R.narcs, R.t1, gends(R.S, R.narcs, R.t1)) + jf;
+    if (conv && !isfinite(R.cost)) { conv = false; why = LQOCP_STR("non-finite cost"); }
     R.converged = conv;
     R.failure = conv ? nullptr : bfail() ? bfail() : (why ? why : LQOCP_STR("not converged"));
     return conv;

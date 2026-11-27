@@ -30,6 +30,10 @@ constexpr real EPS = sizeof(real) == 4 ? FLT_EPSILON : DBL_EPSILON;
 #endif
 constexpr real TS = sizeof(real) == 4 ? LQOCP_FTOL * FLT_EPSILON / 1e-12 : 1.0;
 
+// Box acceptance in input units, relative to R (tier 1's verify): the validator's 1e-6 with a decade of margin
+// (float: its rounding). Also the loosest switching-row tolerance tier 3 accepts.
+constexpr real BOXTOL = sizeof(real) == 4 ? 1e-4 : 1e-7;
+
 extern const real GL_X[4], GL_W[4];   // 4-point Gauss-Legendre nodes / weights on [-1, 1]
 
 real fact(int k);

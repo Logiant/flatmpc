@@ -356,7 +356,10 @@ private:
     bool capfail_;                   // an arc/row capacity (NA, NR) was exceeded
     int budget_;                     // Newton iterations left (iteration cap)
     bool cert_;                      // the BVP solution in place was certified by the walk
+    bool infeas_;                    // diverged(): the weak-duality certificate proved the endpoint unreachable
+    double jbnd_;                    // diverged(): bound on |lambda(T)|^2 at a PMP point (Qf, 0 in the box), < 0: none
     double wthr_;                    // largest switching-row level the walk certified
+    double wrat_;                    // largest ratio of such a level to the row's verification tolerance (no noise)
     bool mreg_;                      // M regular to rounding (clampu inverts it)
     bool hom_ = false;              // refine()'s sweep: plan defects injected, particular parts off
     mutable uint16_t bkey_;          // basis key whose BasisFn lookup failed (0xFFFF: none)
@@ -423,7 +426,8 @@ private:
                                          bool* simplek, int* keyk, double* s1, const double* lexed, uint16_t ev,
                                          uint16_t* imm);
     bool gwalk(const uint16_t* seq, int N, const double* tau, int* ndeg);
-    double gverify(const uint16_t* seq, int N, const double* tau);
+    double jnoise(const uint16_t* seq, int N, const double* tau) const;
+    double gverify(const uint16_t* seq, int N, const double* tau, double D, double* worst);
     __attribute__((noinline)) double gends(const uint16_t* seq, int N, const double* tau) const;
     double gcost(const uint16_t* seq, int N, const double* tau, double ends);
     __attribute__((noinline)) double gterm(double* jf) const;
@@ -457,7 +461,9 @@ private:
     const char* bfail();
     bool cold(GResult& R, int max_its);
     bool finish(GResult& R, bool conv, const char* why, int its, int nsteps, int ndeg);
-    double zmax(const uint16_t* seq, int N, const double* tau) const;
+    bool infeasible() const;
+    bool diverged(bool pmp);
+    void free_bound();
 };
 
 // Host helper: computes SetBasis data on demand (staircase + sign function + modal blocks).
