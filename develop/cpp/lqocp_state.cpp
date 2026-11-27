@@ -1,4 +1,4 @@
-// Tier 2: thrust box + first-order state box, energy cost. See lqocp_state.hpp and NOTES.md 14.
+// Tier 2: thrust box + first-order state box, energy cost. See lqocp_state.hpp.
 #include "lqocp_state.hpp"
 
 #include "lqocp_cont.hpp"
@@ -402,7 +402,7 @@ bool StateSolver::walk(const double* c, const double* y, Ev& e) const {
                 int kk;
                 shift(phi[key], 4, t, b);
                 if ((zev >> key) & 1u) b[0] = 0.0;      // else a new multiplier's root error (amplified by nearly dependent rows) stalls
-                const double tol = 1e-12 * (pscale(b, 4, T) + B.R_);   // as the tier-1 walk (energy-float 71b3166)
+                const double tol = 1e-12 * (pscale(b, 4, T) + B.R_);   // as the tier-1 walk
                 const int rl = strip(b, 4, L, tol, red, &kk);
                 if (rl == 0) continue;
                 if (red[0] > 0) { evk[key] = true; rootk[key] = 0.0; simplek[key] = false; s1 = 0.0; if (!kk) imm |= (uint16_t)(1u << key); continue; }
@@ -568,7 +568,7 @@ __attribute__((noinline)) bool StateSolver::integrate(const double* c, const dou
     return true;
 }
 
-// Newton on the concave dual for fixed junction times (NOTES.md 7.2 / 13.1, plus the arcs' Delta)
+// Newton on the concave dual for fixed junction times (as tier 1, plus the arcs' Delta)
 bool StateSolver::inner(double* y, int max_its) {
     const int ny = base_.n_ + nsa_;
     int cur = 0;
@@ -581,8 +581,6 @@ bool StateSolver::inner(double* y, int max_its) {
         for (int i = 0; i < ny; ++i) { Fn = fmax(Fn, fabs(E.F[i])); ym = fmax(ym, fabs(y[i])); }
         // dual unbounded (infeasible): y diverges and scale (the size of F's terms) with it; tested before the stop
         if (ym > 1e6 * y0) { strcpy(why_, "dual diverges (infeasible)"); return false; }
-        // (no early "floor" stop between 1e-12 and 1e-9 scale: near T* a slow, not floored, Newton met it and the
-        // homotopy stalled on the inaccurate y; the floor is ~ny EPS scale, below the stop)
         if (Fn <= 1e-12 * E.scale) { if (cur) ev_[0] = ev_[1]; return true; }
         if (it >= max_its || its_ >= cap_) { if (cur) ev_[0] = ev_[1]; strcpy(why_, "iteration cap"); return false; }
         ++its_;
@@ -672,7 +670,7 @@ bool StateSolver::gres(const double* y, double* g, int* ng, double* vs, double* 
             }
             if (ab < 0 || bd > 1e-12 * T) return false;
             // control continuity: v_j(t1-) = 0, v_j(t2+) = 0 (v_j = 0 on the arc). This is dJ/dtj = 0
-            // when the thrust rows active at the junction do not change (NOTES.md 14.2).
+            // when the thrust rows active at the junction do not change.
             if (!J) {
                 g[k++] = arc(side == 0 ? ab : ab + 1) ? peval(Vv[j], tj) : 0.0;
                 continue;
@@ -1044,7 +1042,7 @@ static int crit3(const double* b, double L, double* pts) {
     return n;
 }
 
-// Sign check over the whole multiplier set (NOTES.md 14.12). dall: pinned pieces of ev_[0] whose active rows are
+// Sign check over the whole multiplier set. dall: pinned pieces of ev_[0] whose active rows are
 // dependent, dbad: those where the computed multipliers fail; tch[a]: the rows at their bound outside S.
 // With eta the state multiplier (a measure), side * sigma(t) = eta([t, T]) along each arc: nonincreasing, atoms >= 0 at
 // the entry -side (Delta + sigma(t1+)) (a costate jump; zero at a regular junction), between pieces, at the exit
@@ -1322,7 +1320,7 @@ bool StateSolver::run(StateResult& r) {
                 why = why_;
                 // stalled at a solved plan (collapsed_ == -2): a junction where the control jumps cannot zero its
                 // residual. That plan is still optimal if its multipliers, with atoms at the junctions, have valid
-                // signs (KKT; NOTES.md 14.12): the jump junction. lpsign then takes every arc
+                // signs (KKT): the jump junction. lpsign then takes every arc
                 if (collapsed_ != -2) break;
                 jump_ = true;
             }
@@ -1333,8 +1331,7 @@ bool StateSolver::run(StateResult& r) {
         r.state_violation = viol; r.sign_violation = ps; r.pmp_violation = pp;
         if (jump_) {
             jump_ = false;
-            // the endpoint and entry rows of F are not in check(): the inner solve must be at its 1e-12 stop, not at
-            // the 1e-9 rounding floor it may reach next to the jump (re-sim endpoint 1e-7, state on the arc 3e-8)
+            // the endpoint and entry rows of F are not in check(): the plan must meet the inner 1e-12 stop
             double Fn = 0.0;
             for (int i = 0; i < n + nsa_; ++i) Fn = fmax(Fn, fabs(ev_[0].F[i]));
             if (!(viol <= TOL_X && ps <= TOL_SIGN && pp <= 1e-9 && release_ < 0 && Fn <= 1e-12 * ev_[0].scale)) break;
@@ -1359,7 +1356,7 @@ bool StateSolver::run(StateResult& r) {
         const bool late = sq >= 0 && st >= 0.5 * (sa_[sq].t1 + sa_[sq].t2);
         if (cut_ && viol > TOL_X) ps = 0.0;            // fallback: the sign of an infeasible plan waits for the insertion
         if (cut_ && ps > TOL_SIGN && sq >= 0 && (late ? !sa_[sq].fix2 : !sa_[sq].fix1) && cuts++ < 2 * MAXSA) {
-            // eta < 0 at st (archive/tier2-newton): the arc holds the state on the bound where it would leave it.
+            // eta < 0 at st: the arc holds the state on the bound where it would leave it.
             // Cut it there on that side and solve the junctions again: they have more than one root, and the cut
             // starts Newton next to the one with eta >= 0
             StateArc& s = sa_[sq];
@@ -1551,7 +1548,7 @@ __attribute__((noinline)) void StateSolver::stalled(StateResult& r, double s) { 
     r.failure = why_;
 }
 
-// Continuation client (lqocp_cont.hpp) for the bound homotopy (NOTES.md 14.6): s = 0 is the arc-free (tier-1)
+// Continuation client (lqocp_cont.hpp) for the bound homotopy: s = 0 is the arc-free (tier-1)
 // solution in r.y, each violated bound starts at that plan's peak (start), b(s) = s target + (1 - s) peak.
 // correct = the junction solver (run: Newton corrector, arc insertion at new violations = births, collapse /
 // wrong sign = deaths) at b(s1); predict = the exact IFT tangent.

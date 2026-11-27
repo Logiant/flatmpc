@@ -69,7 +69,6 @@ Ac, Bc = continuous_model()
 # Rows of Bc for (D(wy), D(wx), D(vz), D(wz)) are Bc[[10, 9, 8, 11]], ordered to match (x, y, z, psi),
 # so v = S @ Bc[[10, 9, 8, 11]] @ u.
 # Motor thrust deviations are recovered as u = Umap @ v, Umap = inv(S @ Bc[[10, 9, 8, 11]]).
-# (Revision 4: fixed a row-ordering bug; Umap previously used Bc[8:12], i.e. the wrong rows.)
 
 CHAIN_ORDERS = (4, 4, 2, 2)
 
@@ -125,18 +124,18 @@ CASES = {
     # Unconstrained: the unconstrained optimum has max|u| ~ 0.043, far inside any thrust limit.
     "A": dict(x0=S0, xf=SF, T=2.0, Umap=None, u_min=None, u_max=None),
     # Thrust-constrained: unconstrained optimum has max|Umap v| ~ 0.85 > 0.5, so bounds activate.
-    # (Revision 4: bound changed from 0.3 to 0.5 after the Umap fix; 0.3 at T=1 is infeasible.)
+    # (|u| <= 0.3 at T=1 is infeasible.)
     "B": dict(x0=S0, xf=SF, T=1.0, Umap=Umap, u_min=-0.5 * np.ones(NU), u_max=0.5 * np.ones(NU)),
 }
 
 
-# ---- TinyMPC comparison case (Revision 3) ----
+# ---- TinyMPC comparison case (spec Revisions 3 and 5) ----
 # TinyMPC quadrotor_hovering example (20 Hz params): Q, R (physical coordinates, motor inputs),
 # input bounds |u| <= 0.5, x0 as above, hover target at the origin of the deviation coordinates,
-# horizon N = 10 knots at dt = 0.05 -> 9 inputs, T = 0.45 s (Revision 5).
+# horizon N = 10 knots at dt = 0.05 -> 9 inputs, T = 0.45 s.
 # Continuous-time cost used by BOTH solvers (scored the same way for both):
 #   J = 1/2 * integral_0^T ( x^T Q x + u^T R u ) dt + 1/2 * x(T)^T Qf x(T)
-# with Qf = QF_TINY_PHYS (TinyMPC's own terminal weight, Revision 5). QF_PHYS (CARE) is kept for reference.
+# with Qf = QF_TINY_PHYS (TinyMPC's own terminal weight). QF_PHYS (CARE) is for reference only.
 # The physical-to-flat map is linear, so the same cost is expressed exactly in flat coordinates:
 #   x = Tf2p s,  u = Umap v  ->  Q_flat = Tf2p^T Q Tf2p, R_flat = Umap^T R Umap, Qf_flat = Tf2p^T Qf Tf2p.
 from scipy.linalg import solve_continuous_are
@@ -153,7 +152,7 @@ TINY_DT = 0.05
 TINY_N = 10          # TinyMPC knot points: 10 states, 9 inputs -> horizon (N-1)*dt = 0.45 s
 TINY_RHO = 5.0       # rho in TinyMPC's quadrotor_hovering example
 
-# Revision 5 (formulation audit of the TinyMPC comparison): TinyMPC's terminal cost is its cached infinite-horizon
+# TinyMPC's terminal cost is its cached infinite-horizon
 # Pinf = DARE(Ad, Bd, Q + rho I, R + rho I), with effective terminal weight Pinf - rho I, in per-step units.
 # In our continuous cost units (TinyMPC's sum ~ (1/dt) * integral), the equivalent terminal weight is:
 from scipy.linalg import solve_discrete_are

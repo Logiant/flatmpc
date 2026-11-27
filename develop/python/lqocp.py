@@ -2,13 +2,12 @@
 
 Energy cost (Q=0, R=I, fixed endpoint): method "newton" (Newton on the 12 polynomial
 coefficients, exact cubic events). General LQ cost
-(Q, R, Qf; spec Revision 3): "newton" (default) = stable-basis motion primitives with Newton on
-the junction times (NOTES.md section 9); "riccati" = the earlier semismooth Newton (PDAS) with a
-Riccati-sweep linear BVP and continuation in the bound scale (NOTES.md section 8). For the energy
-cost "riccati" runs the "newton" polynomial path. See develop/NOTES.md.
+(Q, R, Qf): "newton" (default) = stable-basis motion primitives with Newton on
+the junction times; "riccati" = semismooth Newton (PDAS) with a
+Riccati-sweep linear BVP and continuation in the bound scale. For the energy
+cost "riccati" runs the "newton" polynomial path.
 
-Original description of the energy method:
-Indirect (motion-primitive) solver for energy-optimal, fixed-time, fixed-endpoint transfers of
+Energy method: energy-optimal, fixed-time, fixed-endpoint transfers of
 integrator chains with a polytopic input constraint  u_min <= Umap v <= u_max.
 
 Method (Beaver & Malikopoulos, arXiv 2103.03339; Beaver, arXiv 2310.00168), specialised to
@@ -27,11 +26,10 @@ P_A = I - A^T (A A^T)^-1 A,  q_A = A^T (A A^T)^-1 b,  mu = (A A^T)^-1 (A w - b) 
 Junction condition (Cor. 2: v continuous) for a row r that switches: on the side where r is
 inactive, a_r v(tau) = b_r.
 
-Algorithm: for fixed junction times and active-set sequence the boundary conditions are LINEAR
-in c (12x12 solve, P1 eq. (72)). An outer Gauss-Newton solves the scalar junction conditions
-for the junction times. The active-set sequence is found with the "solve, check violations,
-impose, repeat" heuristic of 2310.00168 Sec. IV-D, using the projection of the current w(t)
-onto the polytope (pointwise Hamiltonian minimisation) to read off the sequence.
+Algorithm: Newton on the coefficients c (the concave dual of the problem) with a line search.
+For each iterate c the active-set sequence and the junction times are read off exactly from the
+projection of w(t) onto the polytope (pointwise Hamiltonian minimisation; events are polynomial
+roots, no time grid); s(T) is then linear in c on that sequence (P1 eq. (72)).
 """
 import time
 import math
@@ -676,10 +674,10 @@ def _solve_newton(prob, maxit=50, rtol=1e-12):
 
 
 # =====================================================================================
-# General LQ cost (Revision 3):  J = 1/2 int (s'Qs + v'Rv) dt + 1/2 (s(T)-xf)' Qf (s(T)-xf)
+# General LQ cost, method "riccati":  J = 1/2 int (s'Qs + v'Rv) dt + 1/2 (s(T)-xf)' Qf (s(T)-xf)
 # Thm 2 primitives are exponential-polynomials (Hamiltonian matrix exponential), solved by
 # semismooth Newton (primal-dual active set) with a stable Riccati-sweep linear BVP solve and
-# grid-free Taylor/Bernstein event detection. See NOTES.md section 8.
+# grid-free Taylor/Bernstein event detection.
 # =====================================================================================
 from scipy.linalg import expm as _expm, cholesky as _cholesky, solve_triangular as _solve_tri
 
@@ -1174,14 +1172,14 @@ def _solve_general(A, B, x0, xf, T, M, lo, hi, Q, R, Qf, maxit=30):
 
 
 # =====================================================================================
-# General LQ cost, method "newton" (Revision 6): stable-basis motion primitives.
+# General LQ cost, method "newton": stable-basis motion primitives.
 # Per active set S the Hamiltonian system z' = H_S z + f_S (z = [s; lambda]) is split by the
 # matrix sign function into stable / centre / unstable invariant subspaces (dichotomy). On each
 # arc the solution is z = W_s e^{T_s (t-t_k)} a + W_c E_c(t-t_k)[c;1] + W_u e^{T_u (t-t_{k+1})} b
 # + particular part, so every exponential is bounded. For fixed junction times the boundary and
 # junction conditions are a block-bidiagonal linear system in (a, c, b); Newton runs on the
 # junction times with exact derivatives; active-set changes come from the exact event walk and from
-# exact arc-collapse events inside the Newton step. See NOTES.md section 9.
+# exact arc-collapse events inside the Newton step.
 # =====================================================================================
 _SIGN_MAXIT = 60
 _DELTA_FACTORS = (1.0, 0.5, 2.0)          # centre half-width candidates, times 1/T
@@ -1641,7 +1639,7 @@ def _zmax(ctx, sol):
 
 
 def _solve_stable(A, B, x0, xf, T, M, lo, hi, Q, R, Qf, time_limit=60.0, max_its=_MAX_ITS_STABLE):
-    """Stable-basis motion primitives + Newton on the junction times (NOTES.md section 9).
+    """Stable-basis motion primitives + Newton on the junction times.
     Globalisation: homotopy in the bound scale kappa with exact arc-collapse events and a
     secant predictor; a single step kappa0 -> 1 when the unconstrained violation is mild."""
     t0 = time.perf_counter()

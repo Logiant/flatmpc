@@ -1,5 +1,5 @@
 // BasisBuilder: per-active-set stable-basis primitives for GSolver, computed on demand (host,
-// or offline to generate a flash table, see gen_basis_table.cpp). NOTES.md sections 9.1, 10.
+// or offline to generate a flash table, see gen_basis_table.cpp).
 // H_S = W diag(Ls, Tc, Lu) W^-1: sign-function dichotomy (stable | centre | unstable), then
 // the stable and unstable blocks are diagonalised (real 2x2 blocks for complex pairs).
 #include "lqocp.hpp"

@@ -3,10 +3,10 @@
 `./run_compare.sh` creates `.venv` if needed (tinympc 0.0.8, osqp 1.1.3, numpy, scipy), builds
 `cpp/build/tiny_bench`, and runs `compare.py` twice:
 
-- `--model phys` writes `results/`. This is the main table, on the Crazyflie model `quad_problem.Ac, Bc`, with T = 0.45 s and Qf = `QF_TINY_PHYS` (spec Revision 5).
+- `--model phys` writes `results/`. This is the main table, on the Crazyflie model `quad_problem.Ac, Bc`, with T = 0.45 s and Qf = `QF_TINY_PHYS`.
 - `--model spec` writes `results/spec/`. This is the model implied by TINY_CASE (the flat model with `Umap` mapped to physical coordinates, and TINY_CASE's Qf). It must agree with phys, and it does: every non-ours row matches to 6e-5.
 
-The problem follows spec Revision 5, which came from `audit/AUDIT.md`:
+The problem follows `problem/spec.md` (from a formulation audit of the comparison):
 - TinyMPC's example, N = 10 knots (9 inputs, T = 0.45 s), per-step Q_PHYS and R_PHYS, rho = 5, and |u| <= 0.5.
 - Its continuous version with TinyMPC's own terminal weight, `QF_TINY_PHYS = 0.05·(DARE(Ad, Bd, Q+5I, R+5I) − 5I)`.
 - With these choices, TinyMPC-pub's QP is exactly the rectangle-rule/ZOH discretization of TINY_CASE. The terminal weights agree to 5e-13 relative.
@@ -18,12 +18,11 @@ and `traj_<row>.csv`. The CSV columns are `t, x0..x11` (physical state) and `u0.
 
 **Everything here runs on the x86 host (AMD Threadripper PRO 9955WX). None of these times are Teensy numbers.**
 
-## 0. Umap bug in problem/ (fixed in spec Revision 4)
+## 0. Model consistency
 
-The first round of this benchmark found that `quad_problem.Umap` paired the (x, y, z, psi) scalings with the Bc rows (vz, wx, wy, wz)
-in the wrong order. Revision 4 fixed it, and now `Tp2f Bc Umap = Bf` to 2.3e-6. The two scoring models now agree:
+`quad_problem.Umap` pairs the (x, y, z, psi) scalings with the Bc rows (wy, wx, vz, wz), and `Tp2f Bc Umap = Bf` to 2.3e-6
+(rounding in the 7-digit source data). The two scoring models agree:
 - B differs by 4.6e-6 and A by 5e-7.
-- The A and B residuals above are what remains after the fix.
 - Every non-ours row's J agrees between `results/` and `results/spec/` to 6e-5 or better.
 
 `compare.py` records these residuals in `notes`. It refuses to score ours on `phys` if they ever exceed 1e-4 again.
@@ -38,9 +37,9 @@ in `third_party/TinyMPC-0.0.8/` (citations below are to those files). The copy t
 |---|---|
 | Factor ½ | The x-update is an LQR Riccati recursion (`admm.cpp:13-32`, `tiny_api.cpp:266-290`) with ADMM linear terms `-rho(z-y)` and `-rho(v-g)` (`admm.cpp:217-239`). These are consistent with the objective `sum ½(x'Qx + u'Ru) + ½ x_N' P x_N` plus the penalty `(rho/2)‖·‖²`. A global factor does not change the argmin. |
 | Terminal cost | The user cannot set it. The terminal value is the cached `Pinf` (`admm.cpp:238-239`), which is the infinite-horizon Riccati solution of the **rho-augmented** Q and R (`tiny_api.cpp:254-286`, starting from `P = rho·I` and stopping when `max|ΔK| < 1e-5`). The forward pass uses the constant `Kinf` (`admm.cpp:25-32`). This is exact only because `Pinf` is a Riccati fixed point, so a user Qf cannot be put into this algorithm. The effective terminal weight is `Pinf − rho·I`. |
-| **Double rho (as shipped)** | `tiny_setup` stores `work->Q = (Q + rho I).diagonal()` (`tiny_api.cpp:107-108`) and passes that to `tiny_precompute_and_set_cache` (`:126`), which adds `rho I` again (`:254-255`). The ADMM linear terms compensate only one rho. As shipped, the solver therefore converges to the QP with **stage `(Q+rho I, R+rho I)` and terminal `P(Q+2rho I, R+2rho I) − rho I`**. I verified this numerically: unconstrained, it matches TinyMPC to 2.6e-6. This is a library bug: the paper's eq. 15 and the authors' firmware cache use a single rho (see `audit/AUDIT.md` §1). The rows are labelled **TinyMPC-pub**, meaning TinyMPC as published with a single rho. They use the wrapper's `compute_cache_terms()` (`interface.py:345-386`); `tiny_bench` instead re-calls the precompute with the original Q and R. The rows labelled **TinyMPC-lib2rho** are the 0.0.8 library as shipped. |
+| **Double rho (as shipped)** | `tiny_setup` stores `work->Q = (Q + rho I).diagonal()` (`tiny_api.cpp:107-108`) and passes that to `tiny_precompute_and_set_cache` (`:126`), which adds `rho I` again (`:254-255`). The ADMM linear terms compensate only one rho. As shipped, the solver therefore converges to the QP with **stage `(Q+rho I, R+rho I)` and terminal `P(Q+2rho I, R+2rho I) − rho I`**. I verified this numerically: unconstrained, it matches TinyMPC to 2.6e-6. This is a library bug: the paper's eq. 15 and the authors' firmware cache use a single rho. The rows are labelled **TinyMPC-pub**, meaning TinyMPC as published with a single rho. They use the wrapper's `compute_cache_terms()` (`interface.py:345-386`); `tiny_bench` instead re-calls the precompute with the original Q and R. The rows labelled **TinyMPC-lib2rho** are the 0.0.8 library as shipped. |
 | Diagonal Q, R | Required. Only the diagonals are used (`tiny_api.cpp:107-108`, `.diagonal()`). Docstring: `interface.py:91-92`. Cross terms are impossible. |
-| Horizon N | N is the number of **knot points**. There are N−1 inputs, and the terminal state is `x_{N-1}` (`tiny_api.cpp:41-42`, `interface.py:98-99`). The 20 Hz example's `NHORIZON 10` (`examples/quadrotor_hovering.cpp:18`) is therefore a 0.45 s horizon with 9 inputs. TINY_CASE now uses T = 0.45 s (Revision 5), and TinyMPC runs with N = 10 knots at dt = 0.05. |
+| Horizon N | N is the number of **knot points**. There are N−1 inputs, and the terminal state is `x_{N-1}` (`tiny_api.cpp:41-42`, `interface.py:98-99`). The 20 Hz example's `NHORIZON 10` (`examples/quadrotor_hovering.cpp:18`) is therefore a 0.45 s horizon with 9 inputs. TINY_CASE uses T = 0.45 s, and TinyMPC runs with N = 10 knots at dt = 0.05. |
 | Bounds | Box constraints only, set through `setup(u_min=, u_max=)` or `set_bound_constraints` (`interface.py:163-182`). Setting input bounds also enables state bounds at ±1e17 (`interface.py:177-182`), which is harmless. Linear and SOC constraints exist (`admm.cpp:101-173`). |
 | rho | `setup(rho=)`. The example uses 5.0 (`problem_data/quadrotor_20hz_params.hpp:5`). Adaptive rho is off by default (`tiny_api.cpp:226`). |
 | Tolerances | `abs_pri_tol` and `abs_dua_tol` are **absolute max-norm** primal and dual residuals of the slack consensus (`admm.cpp:253-271`). There is no relative and no objective tolerance. Defaults are 1e-3, 1e-3, `max_iter` 1000 and `check_termination` 1 (`tiny_api_constants.hpp`). The example uses these defaults with `max_iter = 100` (`quadrotor_hovering.cpp:54`). The paper's "1e-3 objective / 1e-4 constraint, 4000 max" belongs to its Teensy random-QP benchmark, so those rows are labelled `teensy-bench` (dua = 1e-3, pri = 1e-4). | |
@@ -54,7 +53,7 @@ in `third_party/TinyMPC-0.0.8/` (citations below are to those files). The copy t
 - **Model.** `phys` (main): `qp.Ac, qp.Bc`. `spec`: `A = Tf2p Af Tp2f`, `B = Tf2p Bf Umap^-1`. Both use T = 0.45 and QF_TINY_PHYS.
   Our solver works on the exact flat model, which differs from Ac/Bc by about 2e-6.
 - **Main table.** dt = 0.05, the example's only dt, which gives TinyMPC N = 10 knots and 9 ZOH intervals.
-  TinyMPC is given `Q_PHYS`, `R_PHYS` and rho = 5 per step, unchanged. There is no Q·dt scaling: it would change ρ/R and the terminal weight (`audit/AUDIT.md` §4).
+  TinyMPC is given `Q_PHYS`, `R_PHYS` and rho = 5 per step, unchanged. There is no Q·dt scaling: it would change ρ/R and the terminal weight.
   In J units, TinyMPC's discrete sum times dt is exactly the rectangle rule. It cannot take the exact ZOH cost discretization, because that has full matrices and x-u cross terms.
 - **TinyMPC rows** (both variants):
   - `example`: tolerance 1e-3/1e-3, a cold solve run to convergence.
@@ -93,13 +92,13 @@ Timing:
 
 ## 4. Why the comparison is not perfectly fair (read before quoting numbers)
 
-1. **Status of ours (develop/ is mid-rewrite).** In the final run, ours-python converged in 452 Newton iterations, with solve_time 13.8 s and 57 s wall time under load.
-   An earlier run the same day took 173 iterations and 11 s. Both gave J = 122.332754.
-   Ours-cpp is PENDING: `lqocp_cli TINY` still has the Revision 4 data (T = 0.5, CARE Qf, reported cost 110.76), and one call printed malformed JSON.
+1. **Status of ours in the stored results.** `results/` is the snapshot of one run made before the C++ solver had TINY_CASE's current data:
+   ours-python converged in 452 Newton iterations (solve_time 13.8 s, 57 s wall time under load), J = 122.332754; the ours-cpp row is PENDING
+   there. Rerun `./run_compare.sh` for a current ours-cpp row. The Teensy tables (`teensy/`) use the current solver.
 2. **Discrete vs continuous.** TinyMPC and OSQP optimize ZOH inputs. The best ZOH input loses 0.202 (0.165 %) at dt = 0.05 (`OSQP dt=0.05 exactZOH`). This is intrinsic to the parametrization.
-3. **Terminal cost.** This is now matched. QF_TINY_PHYS equals TinyMPC-pub's terminal weight at dt = 0.05 to 5e-13 relative, with x0 cost-to-go 118.5.
+3. **Terminal cost.** This is matched. QF_TINY_PHYS equals TinyMPC-pub's terminal weight at dt = 0.05 to 5e-13 relative, with x0 cost-to-go 118.5.
    - For lib2rho the terminal weight is 0.49 away in relative Frobenius norm, and its x0 cost-to-go is 142.2.
-   - For the CARE-based `QF_PHYS` used before Revision 5, the distance is 1.40 and the cost-to-go 81.9. This replaces the stale figures (1.11/2.05, 102/124 vs 63) that this section quoted in an earlier version.
+   - For the CARE-based `QF_PHYS` (kept for reference only), the distance is 1.40 and the cost-to-go 81.9.
    - TinyMPC-pub's remaining gap at tight tolerance, 0.272 (0.22 %), is the rectangle rule plus ZOH: OSQP on the same QP gives an identical J. The best ZOH input's 0.202 is part of it.
 4. **Double ρ (library bug).** TinyMPC-lib2rho effectively uses R + ρ = 9 instead of 4, and a different terminal weight. That adds about 0.78 at dt = 0.05.
 5. **Rectangle rule.** TinyMPC needs diagonal per-step weights, so its stage cost is the left-endpoint rule. The exact ZOH cost would need cross terms.
@@ -118,4 +117,4 @@ Timing:
    - Ours-python is pure Python and is not comparable to compiled code.
    - An "iteration" is one Newton step for ours and one ADMM sweep for TinyMPC.
    - None of this indicates Teensy 4.1 performance.
-8. **Inputs.** The example's ±0.5 box is symmetric. The physical box would be [−0.583, 0.417] around hover (`audit/AUDIT.md` §5). We copy the example.
+8. **Inputs.** The example's ±0.5 box is symmetric. The physical box would be [−0.583, 0.417] around hover. We copy the example.

@@ -1,6 +1,7 @@
 # Problem specification and solver interface
 
 The solver (`develop/`) and the validation suite (`validate/`) both use this file and `problem/quad_problem.py`.
+The sections "Revision 2" to "Revision 5" extend the base problem; the validator names its case families after them.
 
 ## Model
 Crazyflie quadrotor linearized about hover (TinyMPC 20 Hz model, `quadrotor_20hz_params.hpp`),
@@ -20,7 +21,7 @@ Motor thrust deviations are u = Umap @ v. Maps `phys_to_flat`, `flat_to_phys`, `
 
 Cases (`quad_problem.CASES`, all in flat coordinates):
 - "A": T = 2 s, no bounds.
-- "B": T = 1 s, motor bounds |u_i| <= 0.3, which become active (unconstrained peak is ~0.44).
+- "B": T = 1 s, motor bounds |u_i| <= 0.5, which become active (unconstrained peak is ~0.85).
   Note the bound is a polytope in v (Umap is dense, cond ~1.4e3), and it couples the four chains.
 
 ## Python interface: `develop/python/lqocp.py`
@@ -47,7 +48,8 @@ Python: `solve(..., method="newton")`, a keyword argument:
   exact polynomial-root event detection and no time grid.
 `info` must also contain "method".
 
-C++: `lqocp_cli <case> <out.csv> [method]`, where method is `newton` (default).
+C++: `lqocp_cli <case> <out.csv> [method]`, where method is `newton` (default) or `riccati` (energy cost:
+the same path as `newton`; the Riccati-sweep general-cost solver exists only in Python).
 `<case>` may be A, B, or a path to a problem file in this plain-text format
 (whitespace-separated numbers; `#` starts a comment line):
 
@@ -72,13 +74,11 @@ Generalized problem (flat coordinates, s' = Af s + Bf v):
                and s(T) = xf when Qf is None (fixed endpoint).
 
 Python: `solve(A, B, x0, xf, T, Umap=None, u_min=None, u_max=None, Q=None, R=None, Qf=None, method="newton")`.
-Q=None means 0, R=None means I, Qf=None means fixed endpoint. The old energy problem is Q=0, R=I, Qf=None,
-and its results must not change.
+Q=None means 0, R=None means I, Qf=None means fixed endpoint. The energy problem is Q=0, R=I, Qf=None.
 `cost` is J as defined above.
 
-New shared case `quad_problem.TINY_CASE`: the TinyMPC 20 Hz hover example's Q, R (mapped exactly to flat
-coordinates; R_flat is SPD but ill-conditioned, cond ~ 2e6), Qf = continuous-time ARE solution, |u| <= 0.5,
-T = 0.5 s (TinyMPC N = 10, dt = 0.05). [Superseded by Revision 5.]
+Shared case `quad_problem.TINY_CASE`: the TinyMPC 20 Hz hover example's Q, R (mapped exactly to flat
+coordinates; R_flat is SPD but ill-conditioned, cond ~ 2e6), |u| <= 0.5; T and Qf as in Revision 5.
 
 CLI: `<case>` may also be `TINY`. Problem file format, extended: after the existing fields, an optional block
 
@@ -86,18 +86,19 @@ CLI: `<case>` may also be `TINY`. Problem file format, extended: after the exist
     Q  (144 numbers, row-major)    R (16 numbers)    has_Qf (0 or 1)   Qf (144 numbers, if has_Qf = 1)
 
 If the block is absent, the problem is the energy problem (Q=0, R=I, fixed endpoint). The JSON line is unchanged.
+After the cost block, an optional state box selects tier 2 (C++ only): `has_xbox (0 or 1)`, then x_lo (12) and
+x_hi (12) on the physical state (+-inf: none); see `develop/cpp/lqocp_cli.cpp`.
 
-## Revision 4 (bug fix: Umap)
-`Umap` paired the scalings for (x, y, z, psi) with the Bc rows (vz, wx, wy, wz) in the wrong order. It is now
-`inv(S @ Bc[[10, 9, 8, 11]])`, and `Tp2f @ Bc @ Umap` equals `Bf` to 2e-6 (rounding in the 7-digit source data).
-Everything derived from Umap changes: case B's motor bounds, TINY_CASE's R_flat, Qf and bounds.
-Case B is now T = 1 s with |u_i| <= 0.5 (|u_i| <= 0.3 is infeasible with the correct Umap).
-The math of all earlier results is unaffected: they were correct solutions for the polytope given by the old Umap.
+## Revision 4 (Umap)
+`Umap = inv(S @ Bc[[10, 9, 8, 11]])` pairs the scalings for (x, y, z, psi) with the Bc rows (wy, wx, vz, wz), and
+`Tp2f @ Bc @ Umap` equals `Bf` to 2e-6 (rounding in the 7-digit source data).
+Case B is T = 1 s with |u_i| <= 0.5 (|u_i| <= 0.3 is infeasible).
+The validator's `*_old` case files keep an earlier, row-swapped Umap as a synthetic polytope.
 
 ## Revision 5 (TINY_CASE matches TinyMPC exactly; from a formulation audit of the TinyMPC comparison)
 - Horizon: TinyMPC's N counts knot points (N states, N-1 inputs), so N = 10 at dt = 0.05 is T = 0.45 s.
 - Terminal cost: TinyMPC always uses its cached Pinf. The equivalent continuous terminal weight is
   QF_TINY_PHYS = dt * (DARE(Ad, Bd, Q + rho I, R + rho I) - rho I), with rho = 5, mapped to flat coordinates.
-  The CARE-based QF_PHYS is kept for reference but is no longer used by TINY_CASE.
+  The CARE-based QF_PHYS is for reference only; TINY_CASE does not use it.
 - With these, TinyMPC (single-rho, as in its paper and firmware) solves exactly the ZOH discretization of TINY_CASE.
 - TinyMPC is given its example's per-step Q_PHYS, R_PHYS and rho = 5 unchanged (no dt scaling).

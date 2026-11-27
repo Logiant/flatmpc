@@ -2,16 +2,16 @@
 // polytopic input constraint lo <= M v <= hi. Port of develop/python/lqocp.py.
 //
 // Costs:
-//   energy  : Q = 0: J = 1/2 int v'Rv [+ 1/2 (s(T)-xf)'Qf(s(T)-xf)], else fixed endpoint
-//             (polynomial costate, NOTES.md sections 7 and 13)
+//   energy  : Q = 0: J = 1/2 int v'Rv [+ 1/2 |Cf (s(T)-xf)|^2, Qf = Cf'Cf], else fixed endpoint
+//             (polynomial costate)
 //   general : J = 1/2 int (s'Qs + v'Rv) + 1/2 (s(T)-xf)'Qf(s(T)-xf)  (or fixed endpoint)
 // Method: energy -> Newton on the 12 polynomial coefficients, exact cubic events, line search
 //   on the concave dual; general -> stable-basis motion primitives, Newton on the junction times
-//   with exact derivatives and exact collapse events, event-driven bound-scale homotopy (NOTES.md
-//   section 9); closed-form walk/cost and the MPC warm start GSolver::solve_warm (section 11).
+//   with exact derivatives and exact collapse events, event-driven bound-scale homotopy;
+//   closed-form walk/cost and the MPC warm start GSolver::solve_warm.
 //
 // Embedded-friendly core: fixed-size arrays only, no heap allocation, no exceptions, no STL.
-// Sizes are reported in NOTES.md. Declare Solver/Result static/global on a microcontroller.
+// Declare Solver/Result static/global on a microcontroller.
 #ifndef LQOCP_HPP
 #define LQOCP_HPP
 
@@ -19,9 +19,10 @@
 
 namespace lqocp {
 
-// Storage precision of the junction Jacobian and sensitivities of the general-cost solver
-// (-DLQOCP_FLOAT: float). Arithmetic, relations and arc coefficients are always double: TINY's
-// R (cond 2e6) amplifies float round-off in the costate beyond the junction tolerance.
+// Scalar type (-DLQOCP_FLOAT: float) of the energy-cost solver (tier 1) and of the general-cost
+// solver's junction Jacobian and sensitivities. The general-cost arithmetic, relations and arc
+// coefficients are always double: TINY's R (cond 2e6) amplifies float round-off in the costate
+// beyond the junction tolerance.
 #ifdef LQOCP_FLOAT
 typedef float real;
 #else
@@ -80,7 +81,7 @@ struct Result {
     uint16_t S[MAXARC_E];            // active signed rows: bit 2r = upper of row r, 2r+1 = lower
     real tau[MAXJ_E];              // switch times: arc a is [tau[a-1], tau[a]] (0 and T at the ends)
     real c[MAXN];                  // energy: coefficients of the switching polynomial w(t)
-    real mu[MAXN];                 // energy with Qf (newton): dual iterate, nu = Cf^T mu, c = Lm nu
+    real mu[MAXN];                 // energy with Qf: dual iterate, nu = Cf^T mu, c = Lm nu
     real cost;
     int iterations;                  // Newton iterations (warm: switch-time + dual Newton iterations)
     int newton_iterations;           // dual Newton iterations
@@ -102,7 +103,7 @@ public:
     const char* setup_failure() const { return sfail_; }   // why setup returned false
     // Returns r.converged. A general cost returns false (use GSolver).
     bool solve(Result& r);
-    // MPC warm start (newton) from the previous result r, converged or not, computed dt earlier (the time the
+    // MPC warm start from the previous result r, converged or not, computed dt earlier (the time the
     // horizon has moved; update x0 with set_x0 first). r is first shifted by dt: switch times -dt, ended arcs
     // dropped, the last arc stretched to T, the costate polynomial c (and mu) Taylor-shifted exactly; on
     // [T - dt, T] the guess is the natural extension of the costate polynomial. Then Newton on the switch
@@ -110,7 +111,7 @@ public:
     // else the dual Newton from the shifted r.c / r.mu with at most max_its iterations (then r is the
     // current iterate; its v = Proj(w) is feasible). dt = 0: no shift. MPC policy: see MpcPlan.
     bool solve_warm(Result& r, int max_its, double dt);
-    bool solve_warm(Result&, double, double) = delete;   // the old (r, dt, max_its) order: a compile error
+    bool solve_warm(Result&, double, double) = delete;   // a swapped (r, dt, max_its) call: a compile error
     bool set_x0(const double* x0);   // false if x0 is not finite
     // mean u on [t0, t1] (what a zero-order hold should apply); false: no plan
     bool mean_u(const Result& r, double t0, double t1, double u[MAXM]) const;
@@ -216,7 +217,7 @@ private:
 };
 
 // =====================================================================================
-// General LQ cost (NOTES.md sections 9 and 10): stable-basis motion primitives, Newton on the
+// General LQ cost: stable-basis motion primitives, Newton on the
 // junction times, bound-scale homotopy. Memory is sized by compile-time constants:
 //   LQOCP_NA  max arcs; LQOCP_NCK stored forward relations (fewer -> recomputed, O(N^2) time);
 //   LQOCP_NB  junction-sensitivity columns per sweep (fewer -> more sweeps).
@@ -247,7 +248,7 @@ static_assert(NB >= 1 && NCK >= 1, "LQOCP_NB and LQOCP_NCK must be >= 1");
 // channels, exactly nilpotent (staircase form, strictly block upper triangular, N^ni = 0); Ls holds
 // the slow modal blocks whose eigenvectors are too close to N's subspace to split off (re/im of
 // their columns are set), coupled to N by X. e^{Tc L} is then exact in closed form: a polynomial
-// in N plus the phi-functions of the slow eigenvalues (NOTES.md section 12). H_S depends only on WHICH rows are
+// in N plus the phi-functions of the slow eigenvalues. H_S depends only on WHICH rows are
 // active, not on the side, so one basis serves S and its mirror: key basis_key(S). Arrays may
 // live in flash.
 inline uint16_t basis_key(uint16_t S) { return (uint16_t)((S | (S >> 1)) & 0x5555u); }
@@ -290,7 +291,7 @@ public:
     // set_x0): junction times -dt, ended arcs dropped, the last arc stretched to T (the BVP recomputes the
     // costate); at most max_its Newton iterations (then r is the current iterate). MPC policy: see MpcPlan.
     bool solve_warm(GResult& r, int max_its, double dt);
-    bool solve_warm(GResult&, double, double) = delete;   // the old (r, dt, max_its) order: a compile error
+    bool solve_warm(GResult&, double, double) = delete;   // a swapped (r, dt, max_its) call: a compile error
     // (setup copies p.x0) false if x0 is not finite: the next solve then fails
     bool set_x0(const double* x0);
     // eval_u and mean_u (mean u on [t0, t1], what a zero-order hold should apply) saturate u to the
@@ -315,7 +316,7 @@ private:
         double yp[N2];               // particular part (modal); centre entries: forcing
         const double* x;
     };
-    struct ArcFn {                   // wt on one arc as exponential-polynomials (NOTES.md 11)
+    struct ArcFn {                   // wt on one arc as exponential-polynomials
         const SetBasis* b;
         double L;
         int m;                       // channels (rows j >= m are not filled)
@@ -469,7 +470,7 @@ private:
     bool build(uint16_t S, int slot);
 };
 
-// MPC step policy for any tier (S = Solver / StateSolver / GSolver, R = its result; NOTES.md 13.10):
+// MPC step policy for any tier (S = Solver / StateSolver / GSolver, R = its result):
 //   it   : the newest iterate. Each warm step continues from it, shifted by dt, converged or not, so N
 //          iterations per step over M steps act like M x N.
 //   plan : the last verified (converged) solution, and age the time since it was verified. The input applied

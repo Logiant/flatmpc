@@ -39,8 +39,8 @@ TIMEOUT_INFEAS = 120   # s; infeasible case must return within this.
 IMPLS = ["py", "cpp"]
 METHODS = ["newton"]
 CASES = ["A", "B", "S", "G", "M", "S_old", "G_old", "M_old"]   # energy cases
-# Revision 4: S/G/M/I use the corrected Umap; *_old are the earlier cases (pre-fix Umap embedded
-# numerically = a synthetic polytope), kept as hard tests. B now has |u|<=0.5 and its reference is
+# Revision 4: S/G/M/I use quad_problem.Umap; *_old embed a row-swapped Umap numerically (a synthetic
+# polytope), kept as hard tests. B has |u|<=0.5 and its reference is
 # the exact PMP-certified solution (cases.py), cross-checked by the QP study in reference.py.
 LQ_CASES = ["TINY", "L1", "L2"]            # Revision 3 general LQ cost
 TOL_TRAJ_TINY_SAFETY = 3.0                 # TINY: trajectory tol = 3x the QP reference's estimated error
@@ -74,7 +74,7 @@ def get_ref(refs, case):
         r.sw, r.arcs = [], [(0.0, T, [0, 0, 0, 0])]
         r.U, r.X = P.u(r.tgrid), P.x(r.tgrid)
         r.kind = "exact"
-    elif case == "B_qp":   # (legacy QP-node reference for B; B now uses the exact branch below)
+    elif case == "B_qp":   # QP-node reference for B (not in CASES: B uses the exact branch below)
         tn, Vn, Xn = refs["B_t"], refs["B_V"], refs["B_X"]
         r.tn, r.Vn, r.Xn = tn, Vn, Xn
         r.ufun = lambda tt: np.stack([np.interp(tt, tn, Vn[:, j]) for j in range(4)], 1)
@@ -150,7 +150,7 @@ def compare_switches(dev, r, tol):
 # ================================================================================================
 P_IMC = ([pytest.param(i, m, c, id=f"{i}-{m}-{c}") for i in IMPLS for m in METHODS for c in CASES]
          + [pytest.param(i, "newton", c, id=f"{i}-newton-{c}") for i in IMPLS for c in LQ_CASES]
-         # option C: method="riccati" (section-8 PDAS/Riccati solver) is Python-only for a general cost
+         # method="riccati" (PDAS/Riccati solver) is Python-only for a general cost
          + [pytest.param("py", "riccati", c, id=f"py-riccati-{c}") for c in LQ_CASES])
 
 

@@ -1,4 +1,4 @@
-// Solver core. See lqocp.hpp and develop/NOTES.md. No heap, no exceptions, no STL.
+// Solver core. See lqocp.hpp. No heap, no exceptions, no STL.
 #include "lqocp.hpp"
 
 #include <float.h>
@@ -10,7 +10,7 @@ namespace lqocp {
 namespace pd {   // polynomial/linear-algebra helpers, shared with lqocp_state.cpp
 
 // Round-off tolerances below are written for double as k * DBL_EPSILON; TS rescales them to
-// the scalar type (1 in double, 2^29 in float). see NOTES 13.6.
+// the scalar type (1 in double, LQOCP_FTOL FLT_EPSILON / 1e-12 in float).
 const real EPS = sizeof(real) == 4 ? FLT_EPSILON : DBL_EPSILON;
 #ifndef LQOCP_FTOL
 #define LQOCP_FTOL 32
@@ -252,7 +252,7 @@ bool Solver::setup_(const Problem& p) {
             if (ok && cnt == sz) sets_[nsets_++] = S;
         }
     }
-    // newton-mode data
+    // row norms; R_ = 1 + the largest finite bound
     R_ = 1.0;
     real mx = 0.0;
     for (int k = 0; k < 2 * m_; ++k) {
@@ -811,7 +811,7 @@ void Solver::row_polys(uint16_t S, const real* c, real phi[2 * MAXM][4],
     }
 }
 
-// ev: rows of a walk event, zero at t by construction (tier-2 walk, 41efa04): their sign is that of the derivatives
+// ev: rows of a walk event, zero at t by construction (as in the tier-2 walk): their sign is that of the derivatives
 bool Solver::lex_ok(uint16_t S, const real* c, real t, uint16_t ev, real phi[2 * MAXM][4], bool has[2 * MAXM]) const {
     real b[4];
     row_polys(S, c, phi, has);
@@ -1071,8 +1071,8 @@ real Solver::verify(const uint16_t* S, const real* tau, int n, const real* c, re
     // a box row's value is in input units: its violation may not grow with amp (cancelling huge polynomial terms,
     // e.g. tiny R: 1e-5 accepted); above 1e-7 R_ (float 1e-4 R_) the plan is rejected whatever vtol(amp) is.
     // Double: the plan's input is known only to EPS amp (one rounding of its largest term), charged to the box too;
-    // this bounds amp by the box acceptance (the old |c| <= 1e6 c0 role). Float: not charged, its 1e-4 R_ is below
-    // FLT_EPS amp for amp > 840 R_ (would reject 27% of the fscan float accepts): float acceptance needs its own spec
+    // this bounds amp by the box acceptance. Float: not charged, its 1e-4 R_ is below
+    // FLT_EPS amp for amp > 840 R_ (would reject 27% of the fscan float accepts)
     const real rnd = sizeof(real) == 4 ? 0.0 : EPS * a_max;
     return box + rnd > (sizeof(real) == 4 ? 1e-4 : 1e-7) * R_ ? HUGE_VAL : worst;
 }
@@ -1112,7 +1112,7 @@ void Solver::shift_warm(Result& R, real dt) {
 
 // warm_its < 0: cold start (unconstrained solution; mu = 0 with Qf), else from R.c / R.mu.
 bool Solver::solve_newton(Result& R, int warm_its) {
-    R.iterations = 0;                             // warm: first the previous pattern (NOTES 13.7)
+    R.iterations = 0;                             // warm: first the previous pattern
     if (warm_its >= 0 && try_reduced(R, warm_its < 4 ? warm_its : 4)) return true;
     R.newton_iterations = R.outer_iterations = 0;
     R.residual = HUGE_VAL;
@@ -1147,7 +1147,7 @@ bool Solver::solve_newton(Result& R, int warm_its) {
     int cur = 0;
     bool ok = evaluate(c, mu, ew_.ev[cur]);
     bool conv = false;
-    // float: stop at the round-off level of F's terms (scale); double keeps 1e-12
+    // float: stop at the round-off level of F's terms (scale); double: 1e-12 of it
     const real rtol = sizeof(real) == 4 ? EPS : 1e-12;
     int its = 0;
     real pv = HUGE_VAL, amp = 0.0, Fst = HUGE_VAL;
@@ -1468,7 +1468,7 @@ bool Solver::solve_reduced(Result& R, int max_its, int* its) {
 }
 
 // =====================================================================================
-// General LQ cost: GSolver (NOTES.md sections 9 and 10). R-scaled inputs vt = Lc^T v,
+// General LQ cost: GSolver. R-scaled inputs vt = Lc^T v,
 // Hamiltonian state z = (s, lambda). Arc solution in the set's basis W (modal stable/unstable
 // blocks, centre block Tc): z(t) = W y(t),
 //   y_s = e^{Ls (t - t0)} a + yp_s,  [y_c; 1] = e^{[Tc yp_c; 0 0](t - t0)} [c; 1],
@@ -2117,7 +2117,7 @@ int GSolver::gphi(uint16_t S, int keys[2 * MAXM], double G[2 * MAXM][MAXM], doub
     return nk;
 }
 
-// ---- wt on an arc as exponential-polynomials (NOTES.md section 11) ----
+// ---- wt on an arc as exponential-polynomials ----
 // Channel j: wt_j(sig) = c_j + sum_k p_jk sig^k + sum_i Re[A_ji e^{lam_i (sig - anc_i)}] with the
 // modal eigenvalues lam_i (stable: anchor 0, unstable: anchor L; a complex pair stores P, Q of
 // A = P - iQ in its two slots) and the centre part e^{M sig} [c; 1], M = [[Tc, yp_c], [0, 0]],
@@ -3639,7 +3639,7 @@ bool GSolver::cold(GResult& R, int max_its) {
         if (ratio <= 1.0 && propose(aseq_, 1, atau_, &ndeg))
             cert_ = conv = (wn_ == 1 && wseq_[0] == 0);
         if (!conv) {
-            // homotopy in the bound scale kappa (NOTES.md 9.4): exact collapse events inside
+            // homotopy in the bound scale kappa: exact collapse events inside
             // the tau-Newton, secant predictor, step halving on failure
             const double z0 = zmax(aseq_, 1, atau_);
             double kap = 1.05 * fmax(ratio, 1.0);
@@ -3697,7 +3697,7 @@ bool GSolver::cold(GResult& R, int max_its) {
     return finish(R, conv, why, its, nsteps, ndeg);
 }
 
-// MPC warm start (NOTES.md 11.4): R holds the previous solution of this problem; the Problem's x0
+// MPC warm start: R holds the previous solution of this problem; the Problem's x0
 // has been updated by the caller. The previous arc structure, with its junction times moved by
 // -dt (arcs that ended are dropped, the last arc is stretched to T), is corrected by Newton on
 // tau and the exact walk at the true bounds: no homotopy. If that fails with iterations left, the

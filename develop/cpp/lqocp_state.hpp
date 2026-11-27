@@ -1,5 +1,5 @@
 // Tier 2: energy cost (Q = 0, optional Qf), thrust box AND a box on first-order (relative degree 1)
-// states: the top state of each chain (x/y jerk = pitch/roll rate, z speed, yaw rate). NOTES.md 14.
+// states: the top state of each chain (x/y jerk = pitch/roll rate, z speed, yaw rate).
 //
 // A boundary arc [t1, t2] of chain j pins v_j = 0 (the top state stays at the bound b). Junction
 // conditions on states and controls: D_top_j(t1) = b, v_j(t1-) = 0, v_j(t2+) = 0 (control
@@ -50,7 +50,7 @@ public:
     // which fails with "unsupported constraint order" if one is violated. p must stay alive.
     bool setup(const Problem& p, const double* slo, const double* shi);
     const char* setup_failure() const { return sfail_; }
-    // cold solve by continuation in the state bounds (NOTES.md 14.6)
+    // cold solve by continuation in the state bounds
     bool solve(StateResult& r);
     // MPC: from the previous arcs and dual iterate, at most max_its inner Newton iterations in total. If that
     // structure fails (not by the cap), the bound continuation from the arc-free problem, in the same budget.
@@ -60,7 +60,7 @@ public:
     // dropped); the dual polynomial is Taylor-shifted exactly (as Solver::solve_warm; the Deltas move with
     // their entries). Update x0 with set_x0 first. MPC policy: see MpcPlan (lqocp.hpp).
     bool solve_warm(StateResult& r, int max_its, double dt);
-    bool solve_warm(StateResult&, double, double) = delete;   // the old (r, dt, max_its) order: a compile error
+    bool solve_warm(StateResult&, double, double) = delete;   // a swapped (r, dt, max_its) call: a compile error
     bool set_x0(const double* x0) { return base_.set_x0(x0); }
     double horizon() const { return base_.horizon(); }
     bool mean_u(const StateResult& r, double t0, double t1, double u[MAXM]) const;

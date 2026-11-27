@@ -1,4 +1,4 @@
-// Continuation driver (NOTES.md 14.7): follow a solved problem at s = 0 to the target at s = 1.
+// Continuation driver: follow a solved problem at s = 0 to the target at s = 1.
 // Step control only; the client owns the unknowns, the residual, its exact Jacobian and the events.
 // No heap, no virtuals: P is a plain struct whose calls inline. P provides, for its last accepted point:
 //   void back();                        working point := last accepted point

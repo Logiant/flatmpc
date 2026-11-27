@@ -1,4 +1,4 @@
-// Offline generator of the embedded bench data (NOTES.md section 10):
+// Offline generator of the embedded bench data:
 //   gen_basis_table <out.h>
 // writes the problems A, B, TINY and the stable-basis table of TINY as flash constants
 // (LQOCP_FLASH, e.g. PROGMEM on a Teensy): one basis per set of active rows (basis_key), which

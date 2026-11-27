@@ -16,8 +16,8 @@ polynomial roots. It does not discretize the problem in time. The goal is a solv
 | Tier | Problem | C++ class | Status |
 |---|---|---|---|
 | 1 | Energy cost + input box (Q = 0, terminal cost or fixed endpoint) | `lqocp::Solver` | Done. Dual Newton (cold) plus Newton on the switch times (warm MPC steps); double and float |
-| 2 | Tier 1 + first-order state box (rates, z speed) | `lqocp::StateSolver` | Works when it converges; robustness in progress (homotopy + Newton) |
-| 3 | General LQ cost (Q ≠ 0) | `lqocp::GSolver` | Works; slower than TinyMPC; fails for very small Q |
+| 2 | Tier 1 + first-order state box (rates, z speed) | `lqocp::StateSolver` | Works when it converges (bound homotopy + junction Newton); MPC needs a warm cap of about 100 iterations |
+| 3 | General LQ cost (Q ≠ 0) | `lqocp::GSolver` | Works; slower than TinyMPC; fails for very small Q; an ill-conditioned rank-deficient Qf can give a wrong cost |
 
 ## Tier 1 on a Teensy 4.1 (matched problem, 100-step MPC closed loop)
 Both solvers solve the same problem: TinyMPC's hover model with Q = 0, TinyMPC's own terminal weight, |u| ≤ 0.5 and
@@ -25,10 +25,13 @@ no state bounds.
 
 | | Cold solve | Median step | Mean step | Peak RAM | Code |
 |---|---|---|---|---|---|
-| Ours, double | 30 ms | 0.24 ms | 1.1 ms | ~10.3 kB | ~19 kB |
-| TinyMPC 0.0.8, double (max_iter 1000) | 351 ms | 1.95 ms | 37 ms | ~48 kB | ~89 kB |
-| Ours, float | 14 ms | 0.14 ms | 0.53 ms | ~5.6 kB | ~19 kB |
-| TinyMPC 0.0.8, float | 188 ms | 1.10 ms | 21 ms | | |
+| Ours, double | 30 ms | 0.24 ms | 1.2 ms | ~12.1 kB | ~24 kB |
+| TinyMPC 0.0.8, double (max_iter 1000) | 351 ms | 1.95 ms | 37 ms | ~56.8 kB | ~89 kB |
+| Ours, float | 24 ms | 0.15 ms | 0.71 ms | ~7.1 kB | ~23 kB |
+| TinyMPC 0.0.8, float | 188 ms | 1.10 ms | 21 ms | ~34.2 kB | ~88 kB |
+
+Peak RAM = static + measured stack (+ heap for TinyMPC; the bench's printf heap is left out). The float rows were
+measured with a slightly earlier solver revision than the double rows.
 
 Our closed loop converges at all 100 steps. TinyMPC converges at 84 and lets the applied input exceed the box slightly.
 Fairness: with Q = 0, TinyMPC's discrete problem is exactly ours restricted to zero-order-hold inputs, and its cold
@@ -40,7 +43,7 @@ solution matches the exact discrete optimum. Both closed loops use the same exac
 | `problem/` | Shared problem data (Crazyflie hover model from TinyMPC) and the interface spec |
 | `develop/` | Solver: Python reference (`python/`) and embeddable C++ (`cpp/`, no heap, fixed-size arrays) |
 | `validate/` | Independent validation suite (`run_all.sh`) |
-| `compare/` | Host benchmark against TinyMPC and OSQP on the same problem; `audit/` checks the formulation |
+| `compare/` | Host benchmark against TinyMPC and OSQP on the same problem |
 | `teensy/` | PlatformIO projects: `lqocp_bench` (ours; envs `energy`, `energy_float`, `tier2`, `tiny_*`), `tinympc_bench` (TinyMPC; matched envs `double_q0_nox`, `float_q0_nox`), `mpc_bench` (ideal-model closed loop and TinyMPC knot sweep), `size_xmcu` (size-only builds for Cortex-M0+/M4F), `tinympc_size` |
 
 ## How to run
