@@ -1511,7 +1511,6 @@ namespace {
 const double CHORD = 0.1;           // Newton: reuse the factored J while the residual contracts by this
 const double GTOL = 1e-12;           // junction residual tolerance (relative to R)
 const double STOL = 1e-9;            // walked vs Newton junction times (relative to T)
-const double WRESET = 0.3;          // warm start: a capped plan violating PMP by > WRESET*R restarts cold
 
 // exp and log without libm's lookup tables (a Teensy keeps those in RAM)
 double xexp(double x) {
@@ -3822,11 +3821,13 @@ bool GSolver::cold(GResult& R, int max_its) {
 // tau and the exact walk at the true bounds: no homotopy. If that fails with iterations left, the
 // cold solve (homotopy) takes over. At most max_its Newton iterations in all; when the cap is hit,
 // R is the current iterate (it satisfies the dynamics and both boundary conditions) with
-// converged = false. A previous plan that is not converged and violates PMP by more than WRESET*R
-// (a stale active set asking for inputs far outside the box) is not reused: cold restart.
+// converged = false. A previous plan that is not converged and violates PMP by more than the box scale R (a stale
+// active set asking for inputs outside the box by more than the box itself) is not reused: cold restart.
+// shortcut: R is a structural choice, not derived. Measured (t3_port3.md, closed loops cap 100 / 5): never reset 1963 /
+// 941, always reset 1956 / 1602, 0.3 R (round 2) 1966 / 1603, R 1966 / 1610; derive with a warm-start success model.
 bool GSolver::solve_warm(GResult& R, int max_its, double dt) {
     if (!isfinite(dt)) { R.converged = false; R.failure = LQOCP_STR("dt not finite"); return false; }
-    if (R.narcs < 1 || R.narcs > NA || !x0ok_ || (!R.converged && !(R.pmp_violation <= WRESET * R_)))
+    if (R.narcs < 1 || R.narcs > NA || !x0ok_ || (!R.converged && !(R.pmp_violation <= R_)))
         return cold(R, max_its);
     const double T = p_->T;
     an_ = 0;
