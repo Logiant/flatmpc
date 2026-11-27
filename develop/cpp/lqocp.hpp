@@ -357,7 +357,7 @@ private:
     int budget_;                     // Newton iterations left (iteration cap)
     bool cert_;                      // the BVP solution in place was certified by the walk
     bool infeas_;                    // diverged(): the weak-duality certificate proved the endpoint unreachable
-    double jbnd_;                    // diverged(): bound on |lambda(T)|^2 at a PMP point (Qf, 0 in the box), < 0: none
+    double jbnd_;                    // diverged(): bound on |lambda(T)|^2 at a PMP point (Qf, 0 in the box), < 0: none, NaN: not computed yet
     double wthr_;                    // largest switching-row level the walk certified
     double wrat_;                    // largest ratio of such a level to the row's verification tolerance (no noise)
     bool mreg_;                      // M regular to rounding (clampu inverts it)
