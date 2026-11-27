@@ -2700,9 +2700,8 @@ double GSolver::jnoise(const uint16_t* seq, int N, const double* tau) const {
 // max over the trajectory of the switching rows of each arc's own set (<= 0 at a PMP point). Returns the largest ratio
 // of a row's max to its tolerance vt = 1e-12 (amplitude + R) + D (tier 1's vtol(amp), the walk's event tolerance,
 // plus D = jnoise: a row is not determined better than the two sides of a junction agree, nor than the tau stop left
-// it at its junction); a box row
-// (inactive: a gap in input units) is also held to BOXTOL R - D, so its true value is within the box acceptance.
-// bb's max is within its level of the true one, a tenth of vt. *worst = the largest row max
+// it at its junction); a box row (inactive: a gap in input units) is also held to BOXTOL R - D, so its true value is
+// within the box acceptance. bb's max is within its level of the true one, a tenth of vt. *worst = the largest row max
 double GSolver::gverify(const uint16_t* seq, int N, const double* tau, double D, double* worst) {
     double q = 0.0;
     ArcFn F;
@@ -3917,7 +3916,7 @@ double GSolver::gterm(double* jf) const {
 // more than its rounding proves that no such input exists: exact, no threshold. nu = -+lambda(T) of the BVP solution in
 // place (an infeasible problem's costate runs off along a separating nu; any nu is valid, so both signs are tried).
 bool GSolver::infeasible() const {
-    static_assert(MAXK <= 4, "g' has degree <= 2");
+    static_assert(MAXK == 4, "g = g[0..3]: g' has degree <= 2");
     if (p_->has_Qf || !p_->has_bounds || !mreg_) return false;
     auto pv = [](const double* c, double x) { double v = 0.0; for (int k = MAXK - 1; k >= 0; --k) v = v * x + c[k]; return v; };
     const int n = n_, m = m_, ldb = MAXK + MAXM;
