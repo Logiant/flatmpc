@@ -2026,7 +2026,8 @@ void GSolver::cexp(const Arc& a, double L, double* y, bool row, bool aff) const 
 }
 
 // z (augmented, z[2n] = 1) at t0 + sig on arc a
-void GSolver::zat(const Arc& a, double sig, double* z) const {
+// za (optional): za_i = sum_j |W_ij y_j|, the terms of z_i (its scale and rounding)
+void GSolver::zat(const Arc& a, double sig, double* z, double* za) const {
     const SetBasis& b = *a.b;
     const int n2 = 2 * n_, ns = b.ns, nc = b.nc, s1 = ns + nc;
     const double* x = a.x;
@@ -2059,6 +2060,11 @@ void GSolver::zat(const Arc& a, double sig, double* z) const {
     }
     matvec(b.W, n2, n2, y, z);
     z[n2] = 1.0;
+    for (int i = 0; i < n2 && za; ++i) {
+        double s = 0.0;
+        for (int j = 0; j < n2; ++j) s += fabs(b.W[i * n2 + j] * y[j]);
+        za[i] = s;
+    }
 }
 
 void GSolver::zstart(const uint16_t* seq, int N, const double* tau, int k, double* z) const {
@@ -3709,24 +3715,25 @@ bool GSolver::solve_warm(GResult& R, int max_its, double dt) {
 // zT_, which meets the condition by construction; an ill-conditioned BVP shows only in the arcs.) Per state, as tier 1's
 // relative stop: fixed endpoint F_i = s_i(T) - xf_i, terms a_i = sig_i; Qf = Cf^T Cf: F = Cf e - mu with
 // Cf^T mu = lambda(T) (tier 1's transversality form, Cf units), terms a_i = |mu_i| + sum_j |Cf_ij| sig_j; a zero
-// pivot of the semidefinite Cf leaves lambda_i - (Cf^T mu)_i (lambda units), terms |lambda_i| + sum_k |Cf_ki| a_k.
-// sig_i = max(sig_, |free_i|, |s_i(T)|) (free = e^{AT} x0). Returns max_i |F_i| / a_i; *jf = 1/2 |Cf (s(T) - xf)|^2 at
+// pivot of the semidefinite Cf leaves lambda_i - (Cf^T mu)_i (lambda units), terms zl_i + sum_k |Cf_ki| a_k.
+// sig_i = max(sig_, |free_i|, zs_i) (free = e^{AT} x0; zs, zl: the modal terms of s_i(T), lambda_i(T), as tier 1's
+// terms of s(T)). Returns max_i |F_i| / a_i; *jf = 1/2 |Cf (s(T) - xf)|^2 at
 // zT_ (factored: e'Qf e cancels below 0 for an ill-conditioned Qf).
 double GSolver::gterm(double* jf) const {
     const GResult& R = *R_out;
     const int n = n_;
-    double z[N2 + 1], sg[MAXN], r = 0.0;
+    double z[N2 + 1], za[N2], sg[MAXN], r = 0.0;
     Arc a;
     if (R.narcs < 1 || !arc(R.narcs - 1, R.S, R.narcs, R.t1, a)) return HUGE_VAL;
     a.x = R.x[R.narcs - 1];
-    zat(a, a.L, z);
+    zat(a, a.L, z, za);
     for (int i = 0; i < 2 * n; ++i)
-        if (!isfinite(z[i])) return HUGE_VAL;
+        if (!isfinite(za[i])) return HUGE_VAL;
     for (int j = 0; j < m_; ++j)
         for (int i = off_[j]; i <= end_[j]; ++i) {   // e^{AT} x0 on chain j
             double f = 0.0;
             for (int l = i; l <= end_[j]; ++l) f += ipow(p_->T, l - i) / fact(l - i) * x0_[l];
-            sg[i] = fmax(sig_[i], fmax(fabs(f), fabs(z[i])));
+            sg[i] = fmax(sig_[i], fmax(fabs(f), za[i]));
         }
     *jf = 0.0;
     if (!p_->has_Qf) {
@@ -3739,7 +3746,7 @@ double GSolver::gterm(double* jf) const {
     double Cf[MAXN * MAXN], mu[MAXN], am[MAXN];
     if (!psd_factor(p_->Qf, n, Cf)) return HUGE_VAL;
     for (int i = 0; i < n; ++i) {                     // Cf^T mu = lambda (lower triangular), mu_i = 0 on a zero pivot
-        double s = z[n + i], b = fabs(z[n + i]);
+        double s = z[n + i], b = za[n + i];
         for (int k = 0; k < i; ++k) { s -= Cf[k * MAXN + i] * mu[k]; b += fabs(Cf[k * MAXN + i]) * am[k]; }
         double ce = 0.0, ct = 0.0, cm = 0.0;
         for (int j = i; j < n; ++j) {
@@ -3755,7 +3762,7 @@ double GSolver::gterm(double* jf) const {
             if (d > 0.0) r = fmax(r, d / am[i]);
         } else {
             mu[i] = am[i] = 0.0;
-            if (s != 0.0) r = fmax(r, fabs(s) / b);   // (b >= |lambda_i| + rounding of s)
+            if (s != 0.0) r = fmax(r, fabs(s) / b);   // (b >= |lambda_i|)
         }
     }
     return r;

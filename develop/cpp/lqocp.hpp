@@ -392,7 +392,7 @@ private:
     int gphi(uint16_t S, int keys[2 * MAXM], double G[2 * MAXM][MAXM], double g0[2 * MAXM]) const;
     bool rowphi(const uint16_t* seq, int q, double G[MAXM], double* g0) const;
     bool arc(int k, const uint16_t* seq, int N, const double* tau, Arc& a) const;
-    __attribute__((noinline)) void zat(const Arc& a, double sig, double* z) const;
+    __attribute__((noinline)) void zat(const Arc& a, double sig, double* z, double* za = nullptr) const;
     void zstart(const uint16_t* seq, int N, const double* tau, int k, double* z) const;
     void cexp(const Arc& a, double L, double* y, bool row, bool aff) const;
     bool chan(const Arc& a, ArcFn& F) const;
