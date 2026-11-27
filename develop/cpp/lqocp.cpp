@@ -1513,6 +1513,8 @@ const double GTOL = 1e-12;           // junction residual tolerance (relative to
 const double STOL = 1e-9;            // walked vs Newton junction times (relative to T)
 const double WRESET = 0.3;          // warm start: a capped plan violating PMP by > WRESET*R restarts cold
 const double VTOL = 1e-9;            // PMP verification tolerance (relative to R)
+// shortcut: VTOL is tuned. Per row 1e-12 (amplitude + R) (tier 1's vtol) loses 76 cap-5 closed-loop steps (r11:
+// 76 -> 0, t3_port2.md): T3's junction stop GTOL R does not make the rows that accurate. Derive with the stop.
 
 // exp and log without libm's lookup tables (a Teensy keeps those in RAM)
 double xexp(double x) {
@@ -3481,7 +3483,7 @@ bool GSolver::newton_tau(uint16_t* seq, int* Np, double* tau, int* its) {
     while (nfresh < MAX_TAU_NEWTON && nchord < 2 * MAX_TAU_NEWTON && budget_ > 0) {
         const int nj = N - 1;
         if (rmax <= tol) { *Np = N; return true; }
-        if (rmax > 0.5 * prev && ++bad > 2) { *Np = N; return false; }   // slow contraction: not converged (rmax > tol)
+        if (rmax > 0.5 * prev && ++bad > 2) { *Np = N; return rmax <= 1e3 * tol; }   // shortcut: tuned stall window, see below
         // chord step (reuse the factored J) while the last step contracted well
         const bool chord = fact && rmax <= CHORD * prev;
         prev = rmax;
@@ -3592,7 +3594,9 @@ bool GSolver::newton_tau(uint16_t* seq, int* Np, double* tau, int* its) {
         if (!acc) {
             bvp(seq, N, tau);                         // restore the state of tau
             *Np = N;
-            return false;                             // line search failed (rmax > tol): no stall accept
+            // shortcut: tuned stall window (1e3 tol). Dropping it loses 8 of 22 cold accepts and 5 / 29 closed-loop steps
+            // (t3_port2.md); an EPS-terms floor of resid covers 1 of 121 stalls. Acceptance is gverify + gterm.
+            return rmax <= 1e3 * tol;                 // round-off stall
         }
         for (int j = 0; j < nj; ++j) tau[j] = tn[j];
         for (int q = 0; q < nr; ++q) r[q] = rn[q];
