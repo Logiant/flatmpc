@@ -7,6 +7,18 @@
 
 #include "lqocp.hpp"
 
+// Failure texts in flash where const data is otherwise copied to RAM (Teensy 4 builds set LQOCP_FLASH; its flash is
+// memory-mapped, so the pointer reads as usual). One section per text: GCC rejects function-local statics of
+// different functions in one named section ("section type conflict").
+#ifdef LQOCP_FLASH
+#define LQOCP_SN2(k) #k
+#define LQOCP_SN(k) LQOCP_SN2(k)
+#define LQOCP_STR(s) \
+    ({ static const char lqocp_str_[] __attribute__((section(".progmem.lqocp" LQOCP_SN(__COUNTER__)))) = s; &lqocp_str_[0]; })
+#else
+#define LQOCP_STR(s) (s)
+#endif
+
 namespace lqocp {
 namespace pd {
 

@@ -117,48 +117,48 @@ bool symmetric(const double (*S)[MAXN], int n) {   // relative to |S_ij| <= sqrt
 
 // input checks at the trust boundary (tiers 1 and 3); nullptr if fine
 const char* check_problem(const Problem& p) {
-    if (p.m < 1 || p.m > MAXM) return "unsupported number of chains";
+    if (p.m < 1 || p.m > MAXM) return LQOCP_STR("unsupported number of chains");
     int n = 0;
     for (int j = 0; j < p.m; ++j) {
-        if (p.orders[j] < 1 || p.orders[j] > MAXK) return "unsupported chain order";
+        if (p.orders[j] < 1 || p.orders[j] > MAXK) return LQOCP_STR("unsupported chain order");
         n += p.orders[j];
     }
-    if (n > MAXN) return "too many states";
-    if (!(p.T > 0.0) || !isfinite(p.T)) return "T must be finite and > 0";
+    if (n > MAXN) return LQOCP_STR("too many states");
+    if (!(p.T > 0.0) || !isfinite(p.T)) return LQOCP_STR("T must be finite and > 0");
     for (int i = 0; i < n; ++i)
-        if (!isfinite(p.x0[i])) return "x0 not finite";
+        if (!isfinite(p.x0[i])) return LQOCP_STR("x0 not finite");
     for (int i = 0; i < n; ++i)
-        if (!isfinite(p.xf[i])) return "xf not finite";
+        if (!isfinite(p.xf[i])) return LQOCP_STR("xf not finite");
     if (p.has_bounds) {
         for (int r = 0; r < p.m; ++r) {
             for (int j = 0; j < p.m; ++j)
-                if (!isfinite(p.M[r][j])) return "Umap not finite";
+                if (!isfinite(p.M[r][j])) return LQOCP_STR("Umap not finite");
             // -inf lo / +inf hi disable a side (documented); NaN, +inf lo, -inf hi are errors
             if (isnan(p.lo[r]) || isnan(p.hi[r]) || p.lo[r] == HUGE_VAL || p.hi[r] == -HUGE_VAL)
-                return "bounds NaN or infinite on the wrong side";
-            if (p.lo[r] > p.hi[r]) return "bounds: lo > hi";
+                return LQOCP_STR("bounds NaN or infinite on the wrong side");
+            if (p.lo[r] > p.hi[r]) return LQOCP_STR("bounds: lo > hi");
         }
     }
     if (p.has_cost) {
         for (int i = 0; i < p.m; ++i)
             for (int j = 0; j < p.m; ++j) {
-                if (!isfinite(p.R[i][j])) return "R not finite";
+                if (!isfinite(p.R[i][j])) return LQOCP_STR("R not finite");
                 if (fabs(p.R[i][j] - p.R[j][i]) > 1e-12 * (fabs(p.R[i][j]) + fabs(p.R[j][i])))
-                    return "R not symmetric";       // (rounding-level asymmetry is accepted)
+                    return LQOCP_STR("R not symmetric");       // (rounding-level asymmetry is accepted)
             }
         bool q0 = true;
         for (int i = 0; i < n; ++i)
             for (int j = 0; j < n; ++j) {
-                if (!isfinite(p.Q[i][j])) return "Q not finite";
+                if (!isfinite(p.Q[i][j])) return LQOCP_STR("Q not finite");
                 q0 = q0 && p.Q[i][j] == 0.0;
             }
-        if (!q0 && !symmetric(p.Q, n)) return "Q not symmetric";
-        if (!q0 && !psd_ok(p.Q, n)) return "Q not PSD";   // (Qf: by each solver's own factor)
+        if (!q0 && !symmetric(p.Q, n)) return LQOCP_STR("Q not symmetric");
+        if (!q0 && !psd_ok(p.Q, n)) return LQOCP_STR("Q not PSD");   // (Qf: by each solver's own factor)
         if (p.has_Qf) {
             for (int i = 0; i < n; ++i)
                 for (int j = 0; j < n; ++j)
-                    if (!isfinite(p.Qf[i][j])) return "Qf not finite";
-            if (!symmetric(p.Qf, n)) return "Qf not symmetric";
+                    if (!isfinite(p.Qf[i][j])) return LQOCP_STR("Qf not finite");
+            if (!symmetric(p.Qf, n)) return LQOCP_STR("Qf not symmetric");
         }
     }
     return nullptr;
@@ -193,7 +193,7 @@ const char* build_rows(const Problem& p, const T (*Mrow)[MAXM], T (*rows)[MAXM],
             const T lo = finite[a > 0.0 ? 2 * r + 1 : 2 * r] ? (a > 0.0 ? -rhs[2 * r + 1] : rhs[2 * r]) / a : -HUGE_VAL;
             if (isfinite(hi) && (!finite[2 * q] || hi < rhs[2 * q])) { rhs[2 * q] = hi; finite[2 * q] = true; }
             if (isfinite(lo) && (!finite[2 * q + 1] || -lo < rhs[2 * q + 1])) { rhs[2 * q + 1] = -lo; finite[2 * q + 1] = true; }
-            if (finite[2 * q] && finite[2 * q + 1] && rhs[2 * q] < -rhs[2 * q + 1]) return "bounds: lo > hi";
+            if (finite[2 * q] && finite[2 * q + 1] && rhs[2 * q] < -rhs[2 * q + 1]) return LQOCP_STR("bounds: lo > hi");
             finite[2 * r] = finite[2 * r + 1] = false;
         }
     T mx = 0.0;
@@ -323,7 +323,7 @@ bool Solver::setup_(const Problem& p) {
         for (int j = 0; j < m_; ++j) {
             real d = p.R[j][j];
             for (int k = 0; k < j; ++k) d -= Lc_[j][k] * Lc_[j][k];
-            if (!(d > 0.0)) { sfail_ = "R not SPD"; return false; }
+            if (!(d > 0.0)) { sfail_ = LQOCP_STR("R not SPD"); return false; }
             Lc_[j][j] = sqrt(d);
             for (int i = j + 1; i < m_; ++i) {
                 real s = p.R[i][j];
@@ -347,7 +347,7 @@ bool Solver::setup_(const Problem& p) {
         }
     // Qf = Cf^T Cf (scale-free semidefinite factor, psd_factor)
     for (int i = 0; i < MAXN * MAXN; ++i) Cf_[i] = 0.0;
-    if (qf_ && !psd_factor(p.Qf, n_, Cf_)) { sfail_ = "Qf not PSD"; return false; }
+    if (qf_ && !psd_factor(p.Qf, n_, Cf_)) { sfail_ = LQOCP_STR("Qf not PSD"); return false; }
     if ((sfail_ = build_rows(p, Mrow, rows_, rhs_, finite_, rownorm2_, &R_))) return false;
     // candidate active sets, sorted by size
     nsets_ = 0;
@@ -403,7 +403,7 @@ bool Solver::setup_(const Problem& p) {
         real A[MAXN * MAXN];
         for (int i = 0; i < MAXN * MAXN; ++i) A[i] = Lm_[i];
         for (int i = 0; i < n_; ++i) Linv_[i * MAXN + i] = 1.0;
-        if (!lu_solve(A, n_, MAXN, Linv_, n_, MAXN)) { sfail_ = "internal: Lm singular"; return false; }
+        if (!lu_solve(A, n_, MAXN, Linv_, n_, MAXN)) { sfail_ = LQOCP_STR("internal: Lm singular"); return false; }
     }
     return set_x0(p.x0);
 }
@@ -590,14 +590,14 @@ static const char* const INFEAS = "infeasible endpoint (no feasible input)";
 
 bool Solver::solve(Result& R) { return start(R, -1); }
 bool Solver::solve_warm(Result& R, int max_its, double dt) {
-    if (!isfinite(dt)) { R.converged = false; R.failure = "dt not finite"; return false; }
+    if (!isfinite(dt)) { R.converged = false; R.failure = LQOCP_STR("dt not finite"); return false; }
     if (dt != 0.0 && !general_) shift_warm(R, (real)dt);
     return start(R, max_its);
 }
 
 bool Solver::start(Result& R, int warm_its) {
     R.converged = false;
-    R.failure = "general cost: use GSolver";
+    R.failure = LQOCP_STR("general cost: use GSolver");
     if (general_) return false;                       // general cost: use GSolver
     R.backtracks = 0;
     R.degenerate_events = 0;
@@ -1162,7 +1162,7 @@ bool Solver::solve_newton(Result& R, int warm_its) {
     R.pmp_violation = HUGE_VAL;
     R.box_fast_path = identity_;
     R.narcs = 0;
-    R.failure = "unconstrained start failed";
+    R.failure = LQOCP_STR("unconstrained start failed");
     real* const c = R.c;                          // the iterate lives in R
     real* const mu = R.mu;
     const int max_its = warm_its < 0 ? MAX_NEWTON : warm_its;
@@ -1186,7 +1186,7 @@ bool Solver::solve_newton(Result& R, int warm_its) {
         const uint16_t S0 = 0;                      // unconstrained start
         if (!solve_c(&S0, nullptr, 1, c)) return false;
     }
-    const char* why = "event walk failed";
+    const char* why = LQOCP_STR("event walk failed");
     int cur = 0;
     bool ok = evaluate(c, mu, ew_.ev[cur]);
     bool conv = false;
@@ -1217,7 +1217,7 @@ bool Solver::solve_newton(Result& R, int warm_its) {
             if (pv <= vtol(amp) || !(Fn < Fst) || its >= max_its) { conv = true; break; }
             Fst = Fn;
         }
-        if (its >= max_its) { why = "iteration cap"; break; }
+        if (its >= max_its) { why = LQOCP_STR("iteration cap"); break; }
         ++its;
         // (J Lm) d_nu = -F, J Lm = int K P K^T dt symmetric PSD; d_c = Lm d_nu
         // workspace: E's ds(T)/dc in G_ -> H in W_; X and A reuse G_ (evaluate refills it)
@@ -1260,7 +1260,7 @@ bool Solver::solve_newton(Result& R, int warm_its) {
             solved = lu_solve(A, n_, MAXN, dnu, 1, 1);
             rho = (rho == 0.0) ? 1e-12 * TS * hmax : 10.0 * rho;
         }
-        if (!solved) { why = "singular Newton matrix"; break; }
+        if (!solved) { why = LQOCP_STR("singular Newton matrix"); break; }
         // H is dead: the step and the trial point live in W_
         real* const dmu = W_, * const d = W_ + MAXN, * const cn = W_ + 2 * MAXN, * const mun = W_ + 3 * MAXN;
         real slope = 0.0;
@@ -1294,7 +1294,7 @@ bool Solver::solve_newton(Result& R, int warm_its) {
             alpha *= 0.5;
             ++R.backtracks;
         }
-        if (!accepted) { why = "line search failed"; break; }
+        if (!accepted) { why = LQOCP_STR("line search failed"); break; }
         for (int i = 0; i < n_; ++i) { c[i] = cn[i]; if (qf_) mu[i] = mun[i]; }
         cur = nxt;
     }
@@ -1312,7 +1312,7 @@ bool Solver::solve_newton(Result& R, int warm_its) {
     R.residual = Fn;
     R.degenerate_events = E.ndeg;
     R.pmp_violation = conv ? pv : verify(R.S, R.tau, R.narcs, R.c, &amp);   // conv: verified at the stop
-    if (conv && !(R.pmp_violation <= vtol(amp))) { conv = false; why = "PMP verification failed"; }   // NaN fails
+    if (conv && !(R.pmp_violation <= vtol(amp))) { conv = false; why = LQOCP_STR("PMP verification failed"); }   // NaN fails
     R.cost = cost(R.S, R.tau, R.narcs, R.c);
     R.converged = conv;
     R.failure = conv ? nullptr : capfail_ ? CAPFAIL : why;
@@ -1730,7 +1730,7 @@ void matvec(const double* M, int n, int ld, const double* v, double* t) {
 
 bool GSolver::setup(const Problem& p, BasisFn fn, void* ctx) {
     mt_.b = nullptr;
-    setup_failure = fn ? check_problem(p) : "no BasisFn";
+    setup_failure = fn ? check_problem(p) : LQOCP_STR("no BasisFn");
     if (setup_failure) return false;
     p_ = &p;
     bfn_ = fn;
@@ -1742,16 +1742,16 @@ bool GSolver::setup(const Problem& p, BasisFn fn, void* ctx) {
         n_ += p.orders[j];
         end_[j] = n_ - 1;
     }
-    setup_failure = "non-finite problem data";        // (check_problem skips R, Q, Qf with has_cost = 0, M without bounds)
+    setup_failure = LQOCP_STR("non-finite problem data");        // (check_problem skips R, Q, Qf with has_cost = 0, M without bounds)
     bool fin = true;
     for (int i = 0; i < n_; ++i)
         for (int j = 0; j < n_; ++j) fin = fin && isfinite(p.Q[i][j]) && (!p.has_Qf || isfinite(p.Qf[i][j]));
     for (int r = 0; r < m_; ++r)
         for (int j = 0; j < m_; ++j) fin = fin && isfinite(p.R[r][j]) && isfinite(p.M[r][j]);
     if (!fin) return false;
-    setup_failure = "Qf not PSD";
+    setup_failure = LQOCP_STR("Qf not PSD");
     if (p.has_Qf && !psd_ok(p.Qf, n_)) return false;
-    setup_failure = "R not SPD";
+    setup_failure = LQOCP_STR("R not SPD");
     set_x0(p.x0);
     // Cholesky R = Lc Lc^T (symmetrised)
     for (int i = 0; i < m_; ++i)
@@ -3693,22 +3693,22 @@ bool GSolver::solve(GResult& R) { return cold(R, MAX_GEN_ITS); }
 bool GSolver::cold(GResult& R, int max_its) {
     begin(R, max_its);
     R.narcs = 0;
-    if (!x0ok_) { R.failure = "non-finite x0"; return false; }
+    if (!x0ok_) { R.failure = LQOCP_STR("non-finite x0"); return false; }
     int its = 0, outer = 0, ndeg = 0, nsteps = 0;
     an_ = 1;
     aseq_[0] = 0;
     bool conv = false;
     const char* why = nullptr;
     if (!bvp(aseq_, 1, atau_)) {
-        R.failure = bfail() ? bfail() : p_->has_Qf ? "linear BVP singular (ill-conditioned data?)"
-                                                   : "linear BVP singular (infeasible endpoint?)";
+        R.failure = bfail() ? bfail() : p_->has_Qf ? LQOCP_STR("linear BVP singular (ill-conditioned data?)")
+                                                   : LQOCP_STR("linear BVP singular (infeasible endpoint?)");
         return false;
     }
     if (!p_->has_bounds) {
         cert_ = conv = true;
     } else {
         const double ratio = gmax_ratio(aseq_, 1, atau_);
-        if (!(ratio < HUGE_VAL)) { R.failure = "non-finite trajectory"; return false; }
+        if (!(ratio < HUGE_VAL)) { R.failure = LQOCP_STR("non-finite trajectory"); return false; }
         if (ratio <= 1.0 && propose(aseq_, 1, atau_, &ndeg))
             cert_ = conv = (wn_ == 1 && wseq_[0] == 0);
         if (!conv) {
@@ -3718,16 +3718,16 @@ bool GSolver::cold(GResult& R, int max_its) {
             double kap = 1.05 * fmax(ratio, 1.0);
             double dl = xlog(kap) * ((ratio <= KAP_PLAIN) ? 1.0 : 1.0 / 3.0);
             gscale(kap);
-            if (!bvp(aseq_, 1, atau_)) { R.failure = "linear BVP failed"; return false; }
+            if (!bvp(aseq_, 1, atau_)) { R.failure = LQOCP_STR("linear BVP failed"); return false; }
             hn_ = 0;
             uint16_t sseq[NA];
             double stau[NA];
             for (;;) {
                 if (kap == 1.0) { conv = true; break; }
-                if (budget_ <= 0) { why = "iteration cap reached"; break; }
-                if (dl < DL_MIN) { why = p_->has_Qf ? "homotopy stalled at bound scale > 1 (ill-conditioned: |x0| too large?)"
-                                                  : "homotopy stalled at bound scale > 1 (bounds infeasible?)"; break; }
-                if (zmax(aseq_, an_, atau_) > 1e8 * (1.0 + z0)) { why = p_->has_Qf ? "costate diverged (ill-conditioned: |x0| too large?)" : "costate diverged (bounds infeasible?)"; break; }
+                if (budget_ <= 0) { why = LQOCP_STR("iteration cap reached"); break; }
+                if (dl < DL_MIN) { why = p_->has_Qf ? LQOCP_STR("homotopy stalled at bound scale > 1 (ill-conditioned: |x0| too large?)")
+                                                  : LQOCP_STR("homotopy stalled at bound scale > 1 (bounds infeasible?)"); break; }
+                if (zmax(aseq_, an_, atau_) > 1e8 * (1.0 + z0)) { why = p_->has_Qf ? LQOCP_STR("costate diverged (ill-conditioned: |x0| too large?)") : LQOCP_STR("costate diverged (bounds infeasible?)"); break; }
                 const int sn = an_;
                 for (int i = 0; i < sn; ++i) sseq[i] = aseq_[i];
                 for (int i = 0; i + 1 < sn; ++i) stau[i] = atau_[i];
@@ -3756,13 +3756,13 @@ bool GSolver::cold(GResult& R, int max_its) {
                     kap = kt;
                     dl *= 1.5;
                 } else {
-                    if (capfail_) { why = "arc capacity NA exceeded"; break; }
+                    if (capfail_) { why = LQOCP_STR("arc capacity NA exceeded"); break; }
                     dl *= 0.5;
                     gscale(kap);
                     an_ = sn;
                     for (int i = 0; i < sn; ++i) aseq_[i] = sseq[i];
                     for (int i = 0; i + 1 < sn; ++i) atau_[i] = stau[i];
-                    if (!bvp(aseq_, an_, atau_)) { why = "linear BVP failed (bounds infeasible?)"; break; }
+                    if (!bvp(aseq_, an_, atau_)) { why = LQOCP_STR("linear BVP failed (bounds infeasible?)"); break; }
                 }
             }
         }
@@ -3779,7 +3779,7 @@ bool GSolver::cold(GResult& R, int max_its) {
 // converged = false. A previous plan that is not converged and violates PMP by more than WRESET*R
 // (a stale active set asking for inputs far outside the box) is not reused: cold restart.
 bool GSolver::solve_warm(GResult& R, int max_its, double dt) {
-    if (!isfinite(dt)) { R.converged = false; R.failure = "dt not finite"; return false; }
+    if (!isfinite(dt)) { R.converged = false; R.failure = LQOCP_STR("dt not finite"); return false; }
     if (R.narcs < 1 || R.narcs > NA || !x0ok_ || (!R.converged && !(R.pmp_violation <= WRESET * R_)))
         return cold(R, max_its);
     const double T = p_->T;
@@ -3800,7 +3800,7 @@ bool GSolver::solve_warm(GResult& R, int max_its, double dt) {
         R.iterations += its;
         return ok;
     }
-    return finish(R, false, capfail_ ? "arc capacity NA exceeded" : "iteration cap reached", its, 0, ndeg);
+    return finish(R, false, capfail_ ? LQOCP_STR("arc capacity NA exceeded") : LQOCP_STR("iteration cap reached"), its, 0, ndeg);
 }
 
 // Terminal condition of the plan the arcs represent: z(T) of the last arc. (The BVP recovers the arcs backward from
@@ -3871,7 +3871,7 @@ bool GSolver::finish(GResult& R, bool conv, const char* why, int its, int nsteps
     const bool cert = conv && cert_ && !loose;
     if (!cert && !bvp(aseq_, an_, atau_)) {
         R.narcs = 0;                                   // R.x is not a plan
-        R.failure = why ? why : "linear BVP failed";
+        R.failure = why ? why : LQOCP_STR("linear BVP failed");
         return false;
     }
     R.narcs = an_;
@@ -3888,7 +3888,7 @@ bool GSolver::finish(GResult& R, bool conv, const char* why, int its, int nsteps
     for (double r0 = HUGE_VAL; conv && budget_ > 0 && !(R.residual <= rtol) && R.residual < r0; --budget_) {
         r0 = R.residual;
         if (!refine(R.S, R.narcs, R.t1)) {
-            if (!bvp(aseq_, an_, atau_)) { R.narcs = 0; R.failure = "linear BVP failed"; return false; }
+            if (!bvp(aseq_, an_, atau_)) { R.narcs = 0; R.failure = LQOCP_STR("linear BVP failed"); return false; }
             R.residual = gterm(&jf);
             break;
         }
@@ -3896,11 +3896,11 @@ bool GSolver::finish(GResult& R, bool conv, const char* why, int its, int nsteps
     }
     // the walk's certificate suffices when its levels are below the verification tolerance
     R.pmp_violation = (cert && !ref && wthr_ <= VTOL * R_) ? wthr_ : gverify(R.S, R.narcs, R.t1);
-    if (conv && !(R.pmp_violation <= VTOL * R_)) { conv = false; why = "optimality check failed"; }
-    if (conv && !(R.residual <= rtol)) { conv = false; why = "terminal condition check failed"; }
+    if (conv && !(R.pmp_violation <= VTOL * R_)) { conv = false; why = LQOCP_STR("optimality check failed"); }
+    if (conv && !(R.residual <= rtol)) { conv = false; why = LQOCP_STR("terminal condition check failed"); }
     R.cost = loose ? HUGE_VAL : gcost(R.S, R.narcs, R.t1, gends(R.S, R.narcs, R.t1)) + jf;
     R.converged = conv;
-    R.failure = conv ? nullptr : bfail() ? bfail() : (why ? why : "not converged");
+    R.failure = conv ? nullptr : bfail() ? bfail() : (why ? why : LQOCP_STR("not converged"));
     return conv;
 }
 
